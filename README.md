@@ -1,58 +1,60 @@
 # ctf-mcp
 
-ChatGPT（Daybreak 系モデル）から、ホームラボ内の隔離 VM で動く CTF 用 MCP ツール群を安全に使うための全体設計です。
+日本語版: [README.ja.md](README.ja.md)
 
-## 1. はじめに
+This repository holds the overall design for letting ChatGPT (Daybreak-series models) safely use CTF-oriented MCP tools running in an isolated VM in the home lab.
 
-モルクは CTF を ChatGPT の Daybreak 系モデル（セキュリティ特化、Windows 側で利用）で解いています。本プロジェクトは、その ChatGPT が呼び出せる MCP（Model Context Protocol）ツール群を整備するための設計リポジトリです。今回は設計のみで、コード実装は行いません。
+## 1. Introduction
 
-方針は「既存の OSS MCP サーバーをかき集めて選定し、自作は不足分の補完に留める」ことです。自作補完コンポーネントの設計素材として、Gemini に下調べさせたマスタープロンプト（ツール仕様・設計原則）を引き継いでいます。
+Moruku solves CTF challenges with ChatGPT's Daybreak-series models (security-specialized, used on the Windows side). This project is a design repository for building the set of MCP (Model Context Protocol) tools that this ChatGPT can call. This round is design only; no code is implemented.
 
-## 2. 全体像
+The approach is to "gather existing OSS MCP servers, evaluate them, and limit in-house development to filling the gaps." As design material for the in-house gap-filling components, we carry over the master prompt (tool specifications and design principles) that was researched in advance with Gemini.
 
-MCP の実行場所は Windows ではありません。Windows 上ではセキュリティソフトが反応してツール群を動かせないため、ホームラボ（Intel NUC）内の QEMU/KVM セキュリティ解析ゲストで実行します。
+## 2. Overview
 
-経路は「Windows 上の ChatGPT →（公開 HTTPS）→ NUC ホスト上のゲートウェイ →（隔離セグメント）→ 解析ゲスト内の MCP サーバー群 → CTF ターゲット」です。ここに大きな前提変更があります。現行の解析ゲストには仮想 NIC がなく、ネットワークから完全に分離されているため、このままでは ChatGPT から到達できません。接続経路の設計が本プロジェクトの核心です（詳細は docs/04）。
+The MCP execution location is not Windows. Because security software on Windows reacts and prevents the tool set from running, execution happens in a QEMU/KVM security-analysis guest inside the home lab (Intel NUC).
 
-## 3. 構成要素
+The path is: "ChatGPT on Windows → (public HTTPS) → gateway on the NUC host → (isolated segment) → MCP servers inside the analysis guest → CTF targets." There is one major change of premise here: the current analysis guest has no virtual NIC and is completely separated from the network, so as-is it cannot be reached from ChatGPT. Designing the connectivity path is the core of this project (details in docs/04).
 
-- **既存資産（第一候補）**: ゲスト内に配置済みの OSS Vulnerability Workbench MCP（自作）と REA 6.7.0 + Ghidra 12.1.4。Workbench は基本的な MCP 通信を確認済み、REA → Ghidra の解析能力は受入れ未完了です。
-- **追加の OSS MCP サーバー**: GhidraMCP（導入済み Ghidra とバージョン一致）、radare2 公式の radare2-mcp、Burp Suite 公式 MCP 拡張などを実在確認のうえで選定しました（docs/03）。
-- **自作補完「ctf-mcp core」**: OSS で埋まらない crypto / encoding ヘルパーと、出力トランケート等の共通基盤を担う FastMCP 製サーバーです（docs/02）。
-- **ゲートウェイ**: NUC ホスト上に置き、認証・許可リスト・監査ログを一手に担います。ゲスト側に公開面を持たせないための要です。
+## 3. Components
 
-## 4. 接続経路
+- **Existing assets (first candidates)**: The OSS Vulnerability Workbench MCP (in-house) and REA 6.7.0 + Ghidra 12.1.4, already placed inside the guest. The Workbench's basic MCP communication has been verified; the REA → Ghidra analysis capability has not yet completed acceptance.
+- **Additional OSS MCP servers**: GhidraMCP (version-matched to the installed Ghidra), the official radare2-mcp, the official Burp Suite MCP extension, and others, selected after confirming they exist (docs/03).
+- **In-house gap-filler "ctf-mcp core"**: A FastMCP-based server that covers crypto / encoding helpers and shared foundations such as output truncation, which OSS does not cover (docs/02).
+- **Gateway**: Placed on the NUC host, it single-handedly handles authentication, allowlists, and audit logging. It is the key to not giving the guest side any exposed surface.
 
-ChatGPT のカスタム MCP コネクターは、公開 HTTPS エンドポイント（Streamable HTTP）と OAuth 認証を要求する想定です（OpenAI 公式ドキュメント自体での確認は未了のため「未確認」とし、確認方法を docs/06 に明記）。
+## 4. Connectivity Path
 
-推奨は、ホストから Cloudflare Tunnel で公開し、ゲストには隔離セグメント専用の vNIC を 1 枚だけ追加する案です。インバウンドはホスト側ゲートウェイ経由のみ、アウトバウンドは CTF ターゲット向けのみ許可し、家庭 LAN 側へは到達不可とするファイアウォールを前提にします。あわせて、Windows 側ローカルクライアント（Codex 等）から Tailscale 経由で使うフォールバック経路も用意します。
+ChatGPT's custom MCP connector is assumed to require a public HTTPS endpoint (Streamable HTTP) and OAuth authentication (this is marked "unverified" because confirmation in OpenAI's official documentation itself is not yet complete; the verification method is stated in docs/06).
 
-## 5. 使い方の想定
+The recommendation is to publish from the host via Cloudflare Tunnel, and to add exactly one vNIC, dedicated to the isolated segment, to the guest. This is premised on a firewall where inbound traffic is only via the host-side gateway, outbound traffic is permitted only toward CTF targets, and the home LAN side is unreachable. In addition, a fallback path is provided for using the tools from local clients on the Windows side (such as Codex) via Tailscale.
 
-競技中は、ChatGPT の会話から解析ゲスト内のツールを呼び、バイナリの構造検査・逆アセンブル・暗号演算・HTTP 検査などを行います。ツールは「観測・解析・決定論的ヘルパー」に限定し、任意のシェルコマンド実行ツールは原則として用意しません。これは安全性のためであると同時に、モデルのガードレールによる拒否を避けるためでもあります。
+## 5. Intended Usage
 
-資材（問題ファイル）の搬入は、従来どおり読み取り専用 ISO の経路を維持します。競技後はゲストをスナップショットへ巻き戻し、平時はネットワーク発信系ツールを無効化しておきます。
+During a competition, tools inside the analysis guest are called from the ChatGPT conversation to perform binary structure inspection, disassembly, cryptographic operations, HTTP inspection, and similar tasks. Tools are limited to "observation, analysis, and deterministic helpers"; as a rule, no arbitrary shell-command execution tool is provided. This is for safety, and also to avoid refusals by the model's guardrails.
 
-## 6. 注意点
+Intake of materials (challenge files) continues to use the existing read-only ISO path. After a competition, the guest is rolled back to a snapshot, and network-emitting tools are kept disabled in normal times.
 
-- 現行ゲスト（2 vCPU / 4 GiB / 20 GiB）では、Kali ツール群 + Ghidra + 複数 MCP サーバーの常駐はリソース不足の見込みです。増強は判断ポイントです（docs/06）。
-- vNIC の追加は、現行の隔離モデル（仮想 NIC なし）に対する変更です。スコープ A の条件付き受入れは「NIC なし」が前提のため、追加の可否はモルクの判断を要します。
-- CTF ターゲットから返る出力は、そのまま LLM への入力になります。ツール出力は常に「データ」として扱い、出力内の指示には従わない運用が前提です。
-- 大会ごとに AI・自動化ツールの利用可否は規約が異なります。競技前に参加大会の規約確認が必要です。
+## 6. Caveats
 
-## 7. 未決事項
+- With the current guest (2 vCPU / 4 GiB / 20 GiB), keeping the Kali tool set + Ghidra + multiple MCP servers resident is expected to run short on resources. Expansion is a decision point (docs/06).
+- Adding a vNIC is a change to the current isolation model (no virtual NIC). Because the conditional acceptance of Scope A is premised on "no NIC," whether to add one requires Moruku's decision.
+- Output returned from CTF targets becomes input to the LLM as-is. The operating premise is that tool output is always treated as "data" and instructions contained in output are not followed.
+- Whether AI and automation tools may be used differs by competition rules. The rules of each competition must be checked before participating.
 
-モルクの判断・確認が必要な点は docs/06 に集約しています。2026-11-02 に主な判断は済みました：自作は最小限、公開方式はセキュア優先（Secure MCP Tunnel の可否を先に確認）、ゲストへの vNIC 追加は実施する、リソース増強は使用状況を見て行う。残るは Burp MCP の配置と REA の扱い（いずれも保留）、ChatGPT 側コネクター仕様の確認です。
+## 7. Open Items
 
-## ドキュメント構成
+Points requiring Moruku's decision or confirmation are collected in docs/06. The main decisions were made on 2026-11-02: keep in-house development to a minimum; for the publication method, prioritize security (first check whether Secure MCP Tunnel is usable); the vNIC addition to the guest will be carried out; resource expansion will be done based on observed usage. What remains is the Burp MCP placement and the handling of REA (both on hold), and confirmation of the connector specification on the ChatGPT side.
 
-- [docs/01-requirements.md](docs/01-requirements.md) — 要件・前提・未確認事項
-- [docs/02-architecture.md](docs/02-architecture.md) — 全体構成と ctf-mcp core の設計
-- [docs/03-mcp-selection.md](docs/03-mcp-selection.md) — MCP サーバー選定表と根拠
-- [docs/04-connectivity.md](docs/04-connectivity.md) — 接続経路設計（選択肢比較と推奨）
-- [docs/05-security.md](docs/05-security.md) — セキュリティ設計
-- [docs/06-roadmap.md](docs/06-roadmap.md) — フェーズ計画・判断ポイント
+## Document Structure
 
-## ライセンス・秘密情報について
+- [docs/01-requirements.md](docs/01-requirements.md) — Requirements, premises, and unverified items
+- [docs/02-architecture.md](docs/02-architecture.md) — Overall architecture and the ctf-mcp core design
+- [docs/03-mcp-selection.md](docs/03-mcp-selection.md) — MCP server selection table and rationale
+- [docs/04-connectivity.md](docs/04-connectivity.md) — Connectivity path design (option comparison and recommendation)
+- [docs/05-security.md](docs/05-security.md) — Security design
+- [docs/06-roadmap.md](docs/06-roadmap.md) — Phase plan and decision points
 
-本リポジトリには秘密情報（トークン、鍵、実ネットワークアドレス等）を置きません。認証情報はホスト側の秘密管理に置き、リポジトリには設定例（プレースホルダ）のみを置く方針です。
+## About Licensing and Secrets
+
+This repository contains no secrets (tokens, keys, real network addresses, etc.). Credentials are kept in secret management on the host side, and the policy is to place only configuration examples (placeholders) in the repository.

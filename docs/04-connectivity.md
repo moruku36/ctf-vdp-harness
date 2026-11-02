@@ -1,73 +1,75 @@
-# 04 接続経路設計
+# 04 Connectivity Path Design
 
-## 1. 核心問題
+日本語版: [04-connectivity.ja.md](04-connectivity.ja.md)
 
-現行の解析ゲストには仮想 NIC がない。ホストのシリアルコンソールとループバック限定 VNC しかアクセス経路がなく、ネットワーク経由では ChatGPT からも Windows からも到達できない。
+## 1. The Core Problem
 
-一方で ChatGPT は OpenAI のクラウド側から接続する。二次情報の範囲では、カスタム MCP コネクターは「公開 HTTPS エンドポイント（Streamable HTTP、または SSE）＋ OAuth 認証」を要求し、stdio のローカルサーバーは直接登録できないとされている（OpenAI 公式ドキュメントでの直接確認は未了＝未確認。確認方法は docs/06）。
+The current analysis guest has no virtual NIC. The only access paths are the host's serial console and loopback-only VNC, and it cannot be reached over the network from either ChatGPT or Windows.
 
-つまり本設計は、次の 2 つの変更を正面から扱わなければならない。
+Meanwhile, ChatGPT connects from OpenAI's cloud side. Within the range of secondary information, the custom MCP connector is said to require a "public HTTPS endpoint (Streamable HTTP, or SSE) + OAuth authentication," and a local stdio server cannot be registered directly (direct confirmation in OpenAI's official documentation is not yet complete = unverified. The verification method is in docs/06).
 
-1. ゲスト（またはその代理となるホスト上の終端）へ、ネットワーク到達経路を新設すること。
-2. その経路を、家庭 LAN を晒さず、隔離の趣旨を壊さない形に制御すること。
+In other words, this design must squarely address the following two changes.
 
-## 2. 選択肢の比較
+1. Newly establishing a network reachability path to the guest (or a host-side termination point acting on its behalf).
+2. Controlling that path in a way that does not expose the home LAN and does not break the intent of isolation.
 
-| 案 | 経路 | ChatGPT から到達 | 隔離の維持 | 実装コスト | 備考 |
+## 2. Comparison of Options
+
+| Option | Path | Reachable from ChatGPT | Isolation preserved | Implementation cost | Notes |
 |---|---|---|---|---|---|
-| A. 公開 HTTPS（Tunnel）＋隔離セグメント vNIC | ChatGPT → Cloudflare Tunnel → ホスト GW → 隔離セグメント → ゲスト | 可（コネクター仕様を満たす想定） | vNIC 追加が前提。FW 設計次第で維持可能 | 中 | **推奨（本線）**。Tunnel はホストからの外向き接続で成立し、ホストに公開ポートを開けない |
-| B. vNIC なし＋ホストプロキシ（vsock 中継） | ChatGPT → Tunnel → ホスト GW → virtio-vsock → ゲスト内サーバー | 可（公開終端は A と同じ） | 最も忠実（ゲストに IP ネットワークを持たせない） | 高 | ゲスト内サーバー側に vsock 対応か中継（socat 等）が要る。stdio 型サーバーの中継は相性が良いが、HTTP 型・複数サーバーの集約はゲートウェイ側の工夫が要る |
-| C. SSH トンネル経由 stdio | ローカルクライアント → SSH → ゲスト内で stdio サーバー起動 | 不可（ChatGPT はクラウド側のため） | vNIC なしでもホスト経由の管理経路で成立しうる | 低 | Gemini 資料が想定した方式。Windows のローカルクライアント（Codex 等）専用の開発・検証経路として有効 |
-| D. Tailscale 経由 | ローカルクライアント → tailnet → NUC ホスト GW → ゲスト | 不可（OpenAI クラウドは tailnet 非参加） | ホストは Tailscale 参加済みで新設コストが小さい | 低 | フォールバック経路の本命。ChatGPT の代替にはならない |
-| E. OpenAI Secure MCP Tunnel | ChatGPT → OpenAI のトンネル機構 → ローカル側 | 未確認 | 公開エンドポイントを持たずに済む可能性がある | 未確認 | 公式のプライベート接続手段として二次情報がある。モルクの Daybreak 環境で使えるか未確認のため、確認が取れるまでは当てにしない |
+| A. Public HTTPS (Tunnel) + isolated-segment vNIC | ChatGPT → Cloudflare Tunnel → host GW → isolated segment → guest | Yes (assumed to satisfy the connector specification) | Premised on adding a vNIC. Preservable depending on FW design | Medium | **Recommended (main line)**. The Tunnel is established by outbound connections from the host, so no public ports are opened on the host |
+| B. No vNIC + host proxy (vsock relay) | ChatGPT → Tunnel → host GW → virtio-vsock → in-guest server | Yes (the public termination is the same as A) | Most faithful (the guest is given no IP network) | High | The in-guest server side needs vsock support or a relay (socat, etc.). Relaying stdio-type servers works well, but aggregating HTTP-type and multiple servers requires ingenuity on the gateway side |
+| C. stdio via SSH tunnel | Local client → SSH → stdio server started inside the guest | No (because ChatGPT is on the cloud side) | Can be established via the host management path even without a vNIC | Low | The method the Gemini material assumed. Effective as a development/verification path dedicated to local clients on Windows (Codex, etc.) |
+| D. Via Tailscale | Local client → tailnet → NUC host GW → guest | No (the OpenAI cloud does not participate in the tailnet) | The host already participates in Tailscale, so new setup cost is small | Low | The main choice for the fallback path. Not a substitute for ChatGPT |
+| E. OpenAI Secure MCP Tunnel | ChatGPT → OpenAI's tunnel mechanism → local side | Unverified | May avoid having a public endpoint | Unverified | Secondary information exists that this is an official private connectivity method. Whether it can be used in Moruku's Daybreak environment is unverified, so it is not relied on until confirmed |
 
-## 3. 推奨案
+## 3. Recommended Option
 
-**本線は A、検証とフォールバックに C・D を併用する。** B は「vNIC を絶対に追加しない」判断になった場合の代替案として残す。E は確認が取れれば A の公開部分を置き換え得る。
+**The main line is A, with C and D used together for verification and fallback.** B is kept as the alternative if the decision becomes "absolutely do not add a vNIC." If E is confirmed usable, it could replace the public part of A.
 
-段階導入とする理由は、公開経路（A）は認証・許可リスト・ファイアウォールが揃って初めて安全になるためである。まず C・D でローカルクライアントからツール群の疎通と挙動を検証し、制御が固まってから A で公開する（docs/06）。
+The reason for staged introduction is that the public path (A) only becomes safe once authentication, allowlists, and the firewall are all in place. First, verify connectivity and behavior of the tool set from local clients via C and D, and open A only after the controls are solidified (docs/06).
 
-## 4. 推奨案の詳細（A）
+## 4. Details of the Recommended Option (A)
 
-### 4.1 ゲスト側ネットワーク追加
+### 4.1 Guest-Side Network Addition
 
-- ゲストに vNIC を 1 枚だけ追加し、隔離セグメント専用のホストブリッジに接続する。このブリッジは家庭 LAN のセグメントとは分離し、ルーティングも持たせない。
-- ゲストが通信できる相手は、原則としてホスト上のゲートウェイのみとする。CTF ターゲット向けの通信は、ゲートウェイ側（またはホストの FW）で中継・制御する形を基本とし、ゲストからインターネットへの直接到達は既定で持たせない。
+- Add exactly one vNIC to the guest and connect it to a host bridge dedicated to the isolated segment. This bridge is separated from the home LAN segment and is given no routing.
+- As a rule, the only party the guest can communicate with is the gateway on the host. Communication toward CTF targets is basically relayed and controlled on the gateway side (or by the host's FW), and the guest is not given direct reachability to the Internet by default.
 
-### 4.2 ファイアウォール方針（既定は全拒否）
+### 4.2 Firewall Policy (default: deny all)
 
-| 方向 | 送信元 → 宛先 | ポリシー |
+| Direction | Source → Destination | Policy |
 |---|---|---|
-| inbound | ゲートウェイ → ゲストの MCP ポート | 許可（この経路のみ） |
-| inbound | その他すべて → ゲスト | 拒否 |
-| lateral | ゲスト → 家庭 LAN セグメント | **全拒否**（到達経路を作らない） |
-| lateral | ゲスト → ホストの管理面（SSH、コンソール等） | 拒否 |
-| outbound | ゲスト／中継 → CTF ターゲット（主催者提供の接続先） | 競技中のみ許可。接続先と時刻をログに残す |
-| outbound | ゲスト → インターネット一般 | 既定拒否。ツール取得等のため必要な場合は、競技外の保守時間帯に限定して一時許可する運用とする |
+| inbound | Gateway → guest's MCP ports | Allow (only this path) |
+| inbound | Everything else → guest | Deny |
+| lateral | Guest → home LAN segment | **Deny all** (create no reachability path) |
+| lateral | Guest → host's management plane (SSH, console, etc.) | Deny |
+| outbound | Guest / relay → CTF targets (organizer-provided endpoints) | Allow only during competitions. Log destinations and times |
+| outbound | Guest → general Internet | Deny by default. If needed for tool acquisition, etc., operate with temporary allowance limited to maintenance windows outside competitions |
 
-- DNS も制御対象とし、ゲストが任意の名前解決で外部と通信する経路を塞ぐ（解決はホスト側で中継するか、競技中のみ許可）。
-- アドレス等の具体値は設計・実装フェーズで決め、本書には書かない。
+- DNS is also subject to control, closing paths by which the guest communicates externally via arbitrary name resolution (resolution is relayed on the host side, or allowed only during competitions).
+- Concrete values such as addresses are decided in the design/implementation phase and are not written in this document.
 
-### 4.3 公開側（ホスト → ChatGPT）
+### 4.3 Public Side (Host → ChatGPT)
 
-- Cloudflare Tunnel（cloudflared）は NUC ホスト上で動かし、公開 HTTPS エンドポイントからホストのゲートウェイへ外向き接続で中継する。ルーターやホストにインバウンドの公開ポートは開けない。
-- 認証は 2 段構えとする。Tunnel 側のアクセス制御（Cloudflare Access 等）に加え、ゲートウェイで MCP の認証（OAuth 2.1、または Bearer トークン）を検証する。ChatGPT 側コネクターが要求する認証方式は未確認のため、確定は仕様確認後（docs/06）。
-- 公開するのはゲートウェイの MCP エンドポイントのみとし、管理画面やホストの他サービスは同じ経路で公開しない。
+- Cloudflare Tunnel (cloudflared) runs on the NUC host and relays from the public HTTPS endpoint to the host's gateway over an outbound connection. No inbound public ports are opened on the router or the host.
+- Authentication is two-layered. In addition to access control on the Tunnel side (Cloudflare Access, etc.), the gateway verifies MCP authentication (OAuth 2.1, or Bearer tokens). Because the authentication method required by the ChatGPT-side connector is unverified, finalization comes after specification confirmation (docs/06).
+- Only the gateway's MCP endpoint is published; the management console and other host services are not published over the same path.
 
-## 5. フォールバック経路（C・D）
+## 5. Fallback Paths (C and D)
 
-- Windows のローカルクライアント（Codex 等）からは、Tailscale 経由でホストのゲートウェイに接続する経路を用意する。ホストは Tailscale 参加済みのため、追加の公開は不要である。
-- stdio 型の MCP サーバー（radare2-mcp、GhidraMCP ブリッジ等）は、SSH トンネル経由で stdio を中継する方式（C）でも利用できる。開発・デバッグ時はこの経路が最も単純である。
-- フォールバック経路でも認証と許可リストはゲートウェイ／サーバー側で同一に効かせる。経路によって制御を弱めない。
+- From local clients on Windows (Codex, etc.), a path connecting to the host's gateway via Tailscale is provided. Because the host already participates in Tailscale, no additional publication is needed.
+- stdio-type MCP servers (radare2-mcp, the GhidraMCP bridge, etc.) can also be used via the method of relaying stdio over an SSH tunnel (C). This path is the simplest during development and debugging.
+- On the fallback paths as well, authentication and allowlists are enforced identically on the gateway/server side. Controls are not weakened depending on the path.
 
-## 6. CTF ターゲットへの到達
+## 6. Reaching CTF Targets
 
-多くの CTF では、主催者が提供するインスタンス（接続先ホストとポート）へ能動的に接続する必要がある。このため outbound は不可欠だが、無制限の egress にはしない。
+In many CTFs, it is necessary to actively connect to instances provided by the organizer (endpoint host and port). Outbound is therefore essential, but it is not made unlimited egress.
 
-- 競技開始時にモルクが有効化し、終了時に無効化する「競技モード」を運用の単位とする。
-- 接続先は監査ログに残し、競技後にレビューできるようにする。
-- 問題ファイルのダウンロード等、主催者サイトへのアクセスも同じ制御下に置く。
+- "Competition mode," which Moruku enables at the start of a competition and disables at the end, is the unit of operation.
+- Destinations are recorded in the audit log so they can be reviewed after the competition.
+- Access to organizer sites, such as downloading challenge files, is placed under the same controls.
 
-## 7. 資材搬入の経路（変更しない）
+## 7. Material Intake Path (unchanged)
 
-問題ファイル等の搬入は、従来の読み取り専用 ISO 経路を維持する。ネットワーク経路ができた後も、解析対象の搬入をネットワーク経由に寄せない。これにより「解析対象は常にオフラインで持ち込む」という現行の運用原則を保つ。
+Intake of challenge files and similar materials maintains the existing read-only ISO path. Even after a network path exists, intake of analysis targets is not shifted to the network. This preserves the current operating principle that "analysis targets are always brought in offline."

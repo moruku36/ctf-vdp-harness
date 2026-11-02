@@ -1,110 +1,112 @@
-# 02 全体構成
+# 02 Overall Architecture
 
-## 1. 構成の考え方
+日本語版: [02-architecture.ja.md](02-architecture.ja.md)
 
-公開面は NUC ホスト上のゲートウェイに集約し、解析ゲストは「ゲートウェイからのみ到達できる隔離セグメントの内側」に置く。MCP サーバー群はゲスト内で動かし、ゲスト自身はインターネットにも家庭 LAN にも直接の公開面を持たない。
+## 1. Architectural Approach
+
+The exposed surface is consolidated at a gateway on the NUC host, and the analysis guest is placed "inside an isolated segment reachable only from the gateway." The MCP servers run inside the guest, and the guest itself has no direct exposed surface to either the Internet or the home LAN.
 
 ```mermaid
 flowchart LR
-    subgraph cloud [OpenAI クラウド]
-        GPT[ChatGPT<br/>Daybreak 系モデル]
+    subgraph cloud [OpenAI cloud]
+        GPT[ChatGPT<br/>Daybreak-series model]
     end
     subgraph win [Windows PC]
-        GPTW[ChatGPT 利用画面]
-        CODEX[ローカルクライアント<br/>Codex 等]
+        GPTW[ChatGPT client screen]
+        CODEX[Local client<br/>Codex, etc.]
     end
     GPTW --- GPT
-    GPT -->|HTTPS / Streamable HTTP<br/>OAuth 認証| CF[Cloudflare Tunnel<br/>公開エンドポイント]
+    GPT -->|HTTPS / Streamable HTTP<br/>OAuth authentication| CF[Cloudflare Tunnel<br/>public endpoint]
     CF --> GW
-    CODEX -->|Tailscale 経由<br/>フォールバック| GW
-    subgraph nuc [ホームラボ NUC ホスト]
-        GW[MCP ゲートウェイ<br/>認証 / 許可リスト / 監査ログ]
-        ISO[読み取り専用 ISO<br/>資材搬入]
+    CODEX -->|via Tailscale<br/>fallback| GW
+    subgraph nuc [Home lab NUC host]
+        GW[MCP gateway<br/>authentication / allowlist / audit log]
+        ISO[Read-only ISO<br/>material intake]
     end
-    GW -->|隔離セグメント<br/>ゲートウェイ経由のみ| VM
-    ISO -.->|従来経路を維持| VM
-    subgraph guest [QEMU/KVM 解析ゲスト]
-        VM[MCP サーバー群]
-        WB[Workbench MCP<br/>既存資産]
+    GW -->|Isolated segment<br/>via gateway only| VM
+    ISO -.->|Existing path retained| VM
+    subgraph guest [QEMU/KVM analysis guest]
+        VM[MCP server set]
+        WB[Workbench MCP<br/>existing asset]
         REA[REA + Ghidra 12.1.4<br/>+ GhidraMCP]
         R2[radare2-mcp]
-        CORE[ctf-mcp core<br/>自作補完]
-        KALI[Kali 系ツール群<br/>コンテナ内]
+        CORE[ctf-mcp core<br/>in-house gap-filler]
+        KALI[Kali tool set<br/>in container]
         VM --- WB
         VM --- REA
         VM --- R2
         VM --- CORE
         CORE --- KALI
     end
-    VM -->|egress 制御<br/>CTF ターゲット向けのみ| CTF[CTF ターゲット<br/>主催者提供の接続先]
+    VM -->|egress control<br/>toward CTF targets only| CTF[CTF target<br/>organizer-provided endpoint]
 ```
 
-## 2. レイヤー構成
+## 2. Layer Structure
 
-| レイヤー | 配置 | 役割 |
+| Layer | Placement | Role |
 |---|---|---|
-| クライアント層 | OpenAI クラウド / Windows | ChatGPT が MCP ツールを呼び出す。本線はクラウド側コネクター、フォールバックは Windows のローカルクライアント |
-| 公開層 | Cloudflare Tunnel（ホスト発信） | 公開 HTTPS エンドポイントを提供する。ホストにインバウンドの公開ポートは開けない |
-| ゲートウェイ層 | NUC ホスト | 認証検証、ツール許可リスト、監査ログ、ゲストへの中継。ホスト上の既存 mcp-server（読み取り専用レポート用）とは別系統として構築する |
-| 実行層 | QEMU/KVM 解析ゲスト | MCP サーバー群と解析ツール群。隔離セグメントに vNIC を 1 枚だけ持ち、到達はゲートウェイ経由のみ |
-| 対象層 | 外部 | CTF ターゲット。ゲストからの egress はファイアウォールで制御する |
+| Client layer | OpenAI cloud / Windows | ChatGPT calls the MCP tools. The main path is the cloud-side connector; the fallback is a local client on Windows |
+| Publication layer | Cloudflare Tunnel (outbound from host) | Provides the public HTTPS endpoint. No inbound public ports are opened on the host |
+| Gateway layer | NUC host | Authentication verification, tool allowlist, audit logging, relay to the guest. Built as a separate system from the existing mcp-server on the host (for read-only reports) |
+| Execution layer | QEMU/KVM analysis guest | The MCP server set and analysis tool set. Has exactly one vNIC on the isolated segment, reachable only via the gateway |
+| Target layer | External | CTF targets. Egress from the guest is controlled by a firewall |
 
-## 3. ゲスト内の MCP サーバー群
+## 3. MCP Server Set Inside the Guest
 
-選定の詳細は docs/03。役割分担は次のとおりとし、重複する機能は本家 OSS に寄せて自作を減らす。
+Selection details are in docs/03. The division of roles is as follows; overlapping functionality is delegated to the upstream OSS to reduce in-house development.
 
-- **Workbench MCP（既存）**: 依存関係・静的解析等の土台。基本通信は確認済み。
-- **REA + GhidraMCP**: REA は既存配置を活かす。Ghidra 本体への MCP 接続は、導入済み Ghidra 12.1.4 に対応する GhidraMCP を第一候補とする。REA → Ghidra の解析能力は受入れ未完了である点を引き継ぐ。
-- **radare2-mcp**: radare2 公式の MCP サーバー。Gemini 資料が想定していた radare2 系ツール（関数一覧、逆アセンブル等）は、原則としてこちらに寄せる。
-- **ctf-mcp core（自作補完）**: OSS で埋まらない部分のみ。次節。
-- **Burp MCP（PortSwigger 公式拡張）**: Web カテゴリの候補。Burp 本体の配置場所が未決のため、ゲスト内常駐とは別枠で扱う（docs/03、docs/06）。
+- **Workbench MCP (existing)**: The foundation for dependency and static analysis, etc. Basic communication has been verified.
+- **REA + GhidraMCP**: REA uses the existing placement. For MCP connection to the Ghidra core, GhidraMCP, which supports the installed Ghidra 12.1.4, is the first candidate. The fact that the REA → Ghidra analysis capability has not completed acceptance is carried over.
+- **radare2-mcp**: The official radare2 MCP server. The radare2-type tools the Gemini material assumed (function listing, disassembly, etc.) are in principle delegated to this.
+- **ctf-mcp core (in-house gap-filler)**: Only the parts OSS does not cover. See the next section.
+- **Burp MCP (official PortSwigger extension)**: A candidate for the web category. Because the placement of the Burp core is undecided, it is handled separately from residency inside the guest (docs/03, docs/06).
 
-## 4. ctf-mcp core（自作補完コンポーネント）
+## 4. ctf-mcp core (In-House Gap-Filling Component)
 
-Gemini 下調べ資料のツール仕様を「ctf-mcp core」として引き継ぐ。OSS と重なる部分（radare2 系、Ghidra 系）は本家に寄せ、core は次に絞る。
+The tool specifications of the Gemini advance-research material are carried over as "ctf-mcp core." Parts that overlap with OSS (radare2-type, Ghidra-type) are delegated upstream, and core is narrowed to the following.
 
-### 4.1 担当範囲
+### 4.1 Scope
 
-- **Crypto / Encoding ヘルパー**: エンコード変換（Base64 / Hex / URL / ROT13）、ハッシュ識別、単一バイト XOR 総当たり、RSA 系の決定論的演算補助（pycryptodome、sympy 等）。
-- **軽量な観測ツール**: ファイルメタデータ・埋め込み検出（exiftool / binwalk のラッパー）、HTTP エンドポイント検査（httpx ラッパー）など、OSS MCP サーバーが薄い領域。
-- **共通基盤**: 出力トランケート、パス検証、サブプロセス実行ラッパー、タイムアウト、構造化レスポンス。これらは core 内の全ツールに一律適用する。
+- **Crypto / Encoding helpers**: Encoding conversions (Base64 / Hex / URL / ROT13), hash identification, single-byte XOR brute force, deterministic RSA-type arithmetic assistance (pycryptodome, sympy, etc.).
+- **Lightweight observation tools**: File metadata and embedded-content detection (wrappers around exiftool / binwalk), HTTP endpoint inspection (httpx wrapper), and other areas where OSS MCP servers are thin.
+- **Shared foundation**: Output truncation, path validation, subprocess execution wrapper, timeouts, structured responses. These apply uniformly to all tools in core.
 
-### 4.2 技術スタック（資料の指定を引き継ぐ）
+### 4.2 Technology Stack (carried over from the material's specification)
 
-- Python 3.12+ / uv、MCP フレームワークは FastMCP（PrefectHQ/fastmcp）。
-- 実行環境は Kali Linux（kalilinux/kali-rolling）または Ubuntu 24.04 ベースのコンテナ。ゲスト内にコンテナ基盤があるかは未確認（docs/01 U4）のため、配置方法はフェーズ計画で確定する。
-- トランスポートは環境変数で stdio / Streamable HTTP を切り替え可能にし、HTTP 時は Bearer トークン認証を有効化できる構成とする。ただし公開面の終端はゲートウェイ側であり、core 単体を直接公開しない。
+- Python 3.12+ / uv; the MCP framework is FastMCP (PrefectHQ/fastmcp).
+- The execution environment is a container based on Kali Linux (kalilinux/kali-rolling) or Ubuntu 24.04. Whether a container platform exists inside the guest is unverified (docs/01 U4), so the placement method is finalized in the phase plan.
+- The transport can be switched between stdio and Streamable HTTP via environment variables, with Bearer token authentication enableable over HTTP. However, the exposed surface terminates at the gateway side; core alone is never published directly.
 
-### 4.3 リポジトリ構成（計画）
+### 4.3 Repository Structure (Planned)
 
-資料のディレクトリ構成を基に、名称を `ctf-mcp` に統一する。
+Based on the directory structure in the material, with names unified to `ctf-mcp`.
 
 ```text
 ctf-mcp/
 ├── README.md
-├── docs/            # 本設計ドキュメント一式
-├── compose.yaml     # ゲスト内コンテナ構成（計画）
+├── docs/            # This design document set
+├── compose.yaml     # Container configuration inside the guest (planned)
 ├── pyproject.toml
-├── .env.example     # プレースホルダのみ。実値は置かない
+├── .env.example     # Placeholders only. No real values
 ├── src/
 │   └── ctf_mcp/
-│       ├── server.py    # FastMCP エントリポイント、ツール登録
-│       ├── config.py    # 環境変数、ワークスペース、タイムアウト
+│       ├── server.py    # FastMCP entry point, tool registration
+│       ├── config.py    # Environment variables, workspace, timeouts
 │       ├── utils/
-│       │   ├── security.py  # パス検証、出力トランケート
-│       │   └── runner.py    # shell=False の非同期サブプロセス実行
+│       │   ├── security.py  # Path validation, output truncation
+│       │   └── runner.py    # Asynchronous subprocess execution with shell=False
 │       └── tools/
 │           ├── crypto.py
 │           ├── forensics.py
-│           └── web_audit.py   # 軽量な観測ツールのみ
+│           └── web_audit.py   # Lightweight observation tools only
 └── tests/
 ```
 
-## 5. リソース計画
+## 5. Resource Plan
 
-現行ゲスト（2 vCPU / 4 GiB RAM / 20 GiB qcow2）は、現行の Workbench + REA/Ghidra のオフライン配置を前提とした規模である。ここに Kali ツール群（メタパッケージ構成では数十 GiB 規模になり得る）と複数 MCP サーバーの常駐、Ghidra の解析処理を加えると、ディスク・メモリともに不足する見込みが強い。
+The current guest (2 vCPU / 4 GiB RAM / 20 GiB qcow2) is sized on the premise of the current offline placement of the Workbench + REA/Ghidra. Adding the Kali tool set (which, depending on metapackage composition, can reach tens of GiB), residency of multiple MCP servers, and Ghidra's analysis processing on top of that is strongly expected to exceed both disk and memory.
 
-- ディスク: 20 GiB はツール群の展開だけで逼迫する。増強の第一候補。
-- メモリ: Ghidra の解析は単体でも GiB 単位を消費する。複数サーバー常駐との競合が起きる。
-- 増強案のたたき台: 4 vCPU / 8〜16 GiB RAM / 60〜100 GiB。ただしホスト（NUC）の総リソースと他サービス（Docker Compose 群）の使用状況が未確認のため、規模は判断ポイントとして docs/06 に置く。
-- 対策の併用: MCP サーバーは全常駐とせず、カテゴリ単位でオンデマンド起動する設計とし、常駐メモリを抑える。
+- Disk: 20 GiB is strained just by deploying the tool set. The first candidate for expansion.
+- Memory: Ghidra's analysis alone consumes GiB-scale memory. Contention with multiple resident servers will occur.
+- Draft expansion proposal: 4 vCPU / 8–16 GiB RAM / 60–100 GiB. However, because the host (NUC)'s total resources and the usage of other services (the Docker Compose set) are unverified, the scale is left as a decision point in docs/06.
+- Combined countermeasure: MCP servers are not all kept resident; the design starts them on demand per category to keep resident memory down.

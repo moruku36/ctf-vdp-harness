@@ -1,67 +1,69 @@
-# 01 要件・前提・未確認事項
+# 01 Requirements, Premises, and Unverified Items
 
-## 1. 目的
+日本語版: [01-requirements.ja.md](01-requirements.ja.md)
 
-ChatGPT（Daybreak 系モデル）が CTF の競技中に呼び出せる MCP ツール群を、ホームラボ内の隔離環境に整備する。本書はその要件と前提を定める。対象は設計までとし、実装は次フェーズ以降の作業とする。
+## 1. Purpose
 
-## 2. 機能要件
+Build, in an isolated environment in the home lab, a set of MCP tools that ChatGPT (Daybreak-series models) can call during CTF competitions. This document defines the requirements and premises. The scope covers design only; implementation is work for later phases.
 
-| # | 要件 |
+## 2. Functional Requirements
+
+| # | Requirement |
 |---|---|
-| F1 | ChatGPT（Windows 側で利用）から MCP ツールを呼び出せること |
-| F2 | バイナリ解析（構造検査、関数一覧、逆アセンブル／デコンパイル、文字列抽出、ROP ガジェット探索）ができること |
-| F3 | ソースコード静的解析（semgrep 等）と HTTP エンドポイント検査ができること |
-| F4 | 暗号・エンコード演算（各種変換、ハッシュ識別、単一バイト XOR 総当たり等）ができること |
-| F5 | フォレンジック補助（メタデータ抽出、埋め込みファイル検出）ができること |
-| F6 | CTF ターゲット（主催者が提供する接続先）へゲスト内から通信できること |
-| F7 | Windows 側ローカルクライアント（Codex 等）からも同じツール群を使えること（フォールバック経路） |
-| F8 | 問題ファイル等の資材を、従来の読み取り専用 ISO 経路でゲストへ搬入できること |
+| F1 | MCP tools can be called from ChatGPT (used on the Windows side) |
+| F2 | Binary analysis is possible (structure inspection, function listing, disassembly/decompilation, string extraction, ROP gadget search) |
+| F3 | Source code static analysis (semgrep, etc.) and HTTP endpoint inspection are possible |
+| F4 | Cryptographic and encoding operations are possible (various conversions, hash identification, single-byte XOR brute force, etc.) |
+| F5 | Forensics assistance is possible (metadata extraction, embedded file detection) |
+| F6 | Communication with CTF targets (connection endpoints provided by the organizer) is possible from inside the guest |
+| F7 | The same tool set can also be used from local clients on the Windows side (Codex, etc.) (fallback path) |
+| F8 | Materials such as challenge files can be brought into the guest via the existing read-only ISO path |
 
-## 3. 非機能要件（設計原則）
+## 3. Non-Functional Requirements (Design Principles)
 
-Gemini 下調べ資料（マスタープロンプト）の設計原則を引き継ぐ。
+These carry over the design principles of the Gemini advance-research material (master prompt).
 
-| # | 原則 | 理由 |
+| # | Principle | Reason |
 |---|---|---|
-| N1 | 任意のシェルコマンド実行ツール（`exec_shell` 等）は原則として実装・採用しない | モデルのガードレールによる拒否（Refusal）を誘発しやすく、安全性も低い |
-| N2 | 全ツールは「観測・静的解析・決定論的ヘルパー」として細粒度に定義し、入出力スキーマを明示する | 解析精度の向上と、ツールの誤用防止 |
-| N3 | 全ツールに出力トランケート（`max_lines` / `max_chars`、既定は 4,000 文字程度）を設け、構造化レスポンス（JSON）で返す | コンテキストウィンドウの保護 |
-| N4 | ファイルパスを受け取るツールはワークスペース配下であることを強制検証し、パストラバーサルを遮断する | ゲスト内でのアクセス範囲の限定 |
-| N5 | サブプロセス実行は `shell=False` 相当の方式とし、全コマンドにタイムアウト（既定 60 秒・設定可能）を設ける | コマンドインジェクション防止と暴走防止 |
-| N6 | HTTP 系トランスポートでは認証（Bearer / OAuth）を必須とする | 公開経路を前提とした防御 |
-| N7 | ツールはカテゴリ単位で有効化・無効化できること。ネットワーク発信系は競技中のみ有効化する | 平時の攻撃面削減 |
+| N1 | As a rule, do not implement or adopt an arbitrary shell-command execution tool (such as `exec_shell`) | It easily triggers refusals by the model's guardrails, and is also less safe |
+| N2 | Define all tools at a fine granularity as "observation, static analysis, and deterministic helpers," with explicit input/output schemas | Improves analysis accuracy and prevents tool misuse |
+| N3 | Provide output truncation on all tools (`max_lines` / `max_chars`, default around 4,000 characters) and return structured responses (JSON) | Protects the context window |
+| N4 | For tools that accept file paths, forcibly verify that the path is under the workspace, and block path traversal | Limits the access scope within the guest |
+| N5 | Execute subprocesses in a `shell=False`-equivalent manner, and set a timeout on all commands (default 60 seconds, configurable) | Prevents command injection and runaway execution |
+| N6 | Require authentication (Bearer / OAuth) on HTTP-based transports | Defense premised on a public path |
+| N7 | Tools can be enabled/disabled per category. Network-emitting tools are enabled only during competitions | Reduces the attack surface in normal times |
 
-## 4. 前提（確認済みの事実）
+## 4. Premises (Confirmed Facts)
 
-ホームラボの現行構成は home-ai-engineering-lab リポジトリの文書（README、`docs/security-analysis-vm.md`、2026-10-20 更新）に基づく。
+The current home lab configuration is based on the documents in the home-ai-engineering-lab repository (README, `docs/security-analysis-vm.md`, updated 2026-10-20).
 
-- ホストは Intel NUC（Ubuntu Server）で、Docker Compose サービス群と、独立した QEMU/KVM セキュリティ解析ゲストが稼働している。
-- 解析ゲストの現行スペックは 2 vCPU / 4 GiB RAM / 20 GiB qcow2。
-- ゲストには仮想 NIC がなく、ネットワークから完全に分離されている。アクセスはホストのシリアルコンソール（UNIX ソケット）と、ループバック限定の VNC のみ。
-- 資材搬入は読み取り専用 ISO（ゲスト側は `noexec,nosuid,nodev` でマウント）。
-- ゲスト内には OSS Vulnerability Workbench MCP（自作、moruku36/oss-vulnerability-workbench-mcp）と REA 6.7.0 + Ghidra 12.1.4 がオフライン配置済み。
-- Workbench は基本的な MCP 通信（ツール列挙等）を確認済み。ただし実スキャナーの実行や実対象の診断は未検証。
-- REA → Ghidra の解析能力は受入れ未完了（スコープ B 未受入れ）。スコープ A（基盤・基本操作）は条件付き受入れ済みだが、その前提は「仮想 NIC なし」の構成である。
-- ホストへは Tailscale 経由でアクセス可能。ホスト上には既存の mcp-server（読み取り専用レポート用）も稼働している。
-- Windows 上ではセキュリティソフトが反応し、セキュリティツール群を実質的に動かせない（モルクの実体験に基づく配置制約）。
+- The host is an Intel NUC (Ubuntu Server) running a set of Docker Compose services and an independent QEMU/KVM security-analysis guest.
+- The analysis guest's current specifications are 2 vCPU / 4 GiB RAM / 20 GiB qcow2.
+- The guest has no virtual NIC and is completely separated from the network. Access is only via the host's serial console (UNIX socket) and loopback-only VNC.
+- Material intake is via read-only ISO (mounted in the guest with `noexec,nosuid,nodev`).
+- Inside the guest, the OSS Vulnerability Workbench MCP (in-house, moruku36/oss-vulnerability-workbench-mcp) and REA 6.7.0 + Ghidra 12.1.4 have been placed offline.
+- The Workbench's basic MCP communication (tool listing, etc.) has been verified. However, actually running real scanners or diagnosing real targets is unverified.
+- The REA → Ghidra analysis capability has not completed acceptance (Scope B not accepted). Scope A (foundation and basic operations) has been conditionally accepted, but its premise is the "no virtual NIC" configuration.
+- The host can be accessed via Tailscale. An existing mcp-server (for read-only reports) also runs on the host.
+- On Windows, security software reacts and security tool sets effectively cannot run (a placement constraint based on Moruku's actual experience).
 
-## 5. 制約
+## 5. Constraints
 
-- MCP の実行場所は Windows ではなく、ホームラボ側に限る。
-- ゲストの隔離性は維持する。経路追加にあたっても、家庭 LAN 側への到達経路は作らない。
-- 秘密情報（トークン、鍵、実ネットワークアドレス等）はリポジトリ・設計文書に書かない。
-- 採用する OSS は、実在とライセンスを確認できたものに限る（docs/03）。
+- The MCP execution location is limited to the home lab side, not Windows.
+- The guest's isolation is maintained. Even when adding paths, no reachability path toward the home LAN side is created.
+- Secrets (tokens, keys, real network addresses, etc.) are not written in the repository or design documents.
+- Adopted OSS is limited to items whose existence and license have been confirmed (docs/03).
 
-## 6. 未確認事項
+## 6. Unverified Items
 
-以下は本設計時点で確認できておらず、断定していない。確認方法は docs/06 に記す。
+The following could not be confirmed as of this design and are not asserted. Verification methods are given in docs/06.
 
-| # | 未確認事項 | 影響 |
+| # | Unverified item | Impact |
 |---|---|---|
-| U1 | ChatGPT のカスタム MCP コネクターの正確な仕様（公開 HTTPS + Streamable HTTP + OAuth が必須か）。二次情報では概ね一致するが、OpenAI 公式ドキュメントでの直接確認は未了 | 公開経路の方式確定 |
-| U2 | モルクの利用プラン（Daybreak 系）でコネクター追加が可能か、また書き込み系（action）ツールが許可されるか。二次情報に「Plus/Pro は読み取り専用のみ」と「開発者モードで書き込み可」の両説がある | ツール公開範囲の設計 |
-| U3 | OpenAI の Secure MCP Tunnel がモルクの環境で使えるか | 公開方式の代替案の成否 |
-| U4 | 現行ゲストに Docker 等のコンテナ基盤が導入済みか | ctf-mcp core の配置方法 |
-| U5 | ホスト（NUC）の総リソースと空き容量（ゲスト増強の上限） | 増強案の規模 |
-| U6 | REA のトランスポート種別・ライセンス等の詳細 | 接続設計への組み込み方 |
-| U7 | 各 CTF 大会の規約における AI・自動化ツールの利用可否 | 運用可否（大会ごとに確認） |
+| U1 | The exact specification of ChatGPT's custom MCP connector (whether public HTTPS + Streamable HTTP + OAuth is mandatory). Secondary information is broadly consistent, but direct confirmation in OpenAI's official documentation is not yet complete | Finalizing the publication path method |
+| U2 | Whether connectors can be added under Moruku's plan (Daybreak series), and whether write-type (action) tools are permitted. Secondary information contains both claims: "Plus/Pro are read-only only" and "writing is possible in developer mode" | Design of the tool exposure scope |
+| U3 | Whether OpenAI's Secure MCP Tunnel can be used in Moruku's environment | Whether the alternative publication method works |
+| U4 | Whether a container platform such as Docker is already installed in the current guest | How ctf-mcp core is placed |
+| U5 | The host (NUC)'s total resources and free capacity (the ceiling for guest expansion) | Scale of the expansion proposal |
+| U6 | Details of REA's transport type, license, etc. | How it is incorporated into the connectivity design |
+| U7 | Whether AI and automation tools may be used under each CTF competition's rules | Operational feasibility (checked per competition) |

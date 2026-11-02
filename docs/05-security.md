@@ -1,66 +1,68 @@
-# 05 セキュリティ設計
+# 05 Security Design
 
-## 1. 基本方針
+日本語版: [05-security.ja.md](05-security.ja.md)
 
-- 隔離が主、利便性は従。公開経路を持っても「ゲストは隔離セグメントの内側」という構造は変えない。
-- 防御は多層化する。ネットワーク（FW）、ゲートウェイ（認証・許可リスト・監査）、サーバー（ツール設計）、運用（スナップショット・競技モード）の各層で独立に効かせる。
-- 失敗時は閉じる側（fail closed）に倒す。認証・許可リストの判定ができない場合はツールを実行しない。
+## 1. Basic Policy
 
-## 2. 隔離の維持
+- Isolation is primary, convenience secondary. Even with a public path, the structure "the guest is inside the isolated segment" does not change.
+- Defense is layered. It is enforced independently at each layer: network (FW), gateway (authentication, allowlist, auditing), server (tool design), and operations (snapshots, competition mode).
+- On failure, fall to the closed side (fail closed). If authentication or allowlist judgment cannot be made, tools are not executed.
 
-- ゲストの vNIC は隔離セグメント専用ブリッジにのみ接続し、家庭 LAN セグメントへのルーティングは持たせない（docs/04）。
-- インバウンドはホスト側ゲートウェイ経由の MCP 通信のみ。アウトバウンドは CTF ターゲット向けを競技中のみ許可し、既定は全拒否。
-- ゲストからホストの管理面（SSH、シリアルコンソール、VNC）へは到達できないようにする。管理経路は従来どおりホスト側からの一方向のみ。
-- 資材搬入は読み取り専用 ISO（`noexec,nosuid,nodev`）の従来経路を維持する。
+## 2. Maintaining Isolation
 
-## 3. 認証
+- The guest's vNIC connects only to the isolated-segment-dedicated bridge, and no routing to the home LAN segment is provided (docs/04).
+- Inbound is only MCP communication via the host-side gateway. Outbound is permitted toward CTF targets only during competitions; the default is deny all.
+- The host's management plane (SSH, serial console, VNC) is made unreachable from the guest. Management paths remain one-directional from the host side, as before.
+- Material intake maintains the existing read-only ISO path (`noexec,nosuid,nodev`).
 
-| 経路 | 認証方式 | 備考 |
+## 3. Authentication
+
+| Path | Authentication method | Notes |
 |---|---|---|
-| 公開経路（ChatGPT） | OAuth 2.1 を第一候補とする。加えて Tunnel 側のアクセス制御を併用する | ChatGPT 側コネクターの要求仕様が未確認のため、方式の確定は仕様確認後。Bearer トークンのみで公開することはしない |
-| フォールバック（Tailscale） | Tailscale の認証に加え、ゲートウェイで Bearer トークンを検証する | 経路が変わっても認証を弱めない |
-| フォールバック（SSH トンネル） | SSH 鍵認証＋サーバー側トークン | stdio 中継でもトークン検証はサーバー側で効かせる |
+| Public path (ChatGPT) | OAuth 2.1 is the first candidate. In addition, access control on the Tunnel side is used together | Because the specification required by the ChatGPT-side connector is unverified, the method is finalized after specification confirmation. It will not be published with Bearer tokens alone |
+| Fallback (Tailscale) | In addition to Tailscale's authentication, a Bearer token is verified at the gateway | Authentication is not weakened even when the path changes |
+| Fallback (SSH tunnel) | SSH key authentication + server-side token | Even for stdio relay, token verification is enforced on the server side |
 
-- トークン・鍵はゲスト内とホスト側の秘密管理にのみ置き、リポジトリには置かない。設定ファイルにはプレースホルダのみを記す。
-- 認証情報のローテーション手順（発行・差し替え・失効）を運用手順に含める。
+- Tokens and keys are placed only in secret management inside the guest and on the host side, never in the repository. Configuration files record placeholders only.
+- Credential rotation procedures (issuance, replacement, revocation) are included in the operating procedures.
 
-## 4. 許可リスト（ツールの公開範囲）
+## 4. Allowlist (Tool Exposure Scope)
 
-- ゲートウェイと各 MCP サーバーで、ツール単位の許可リストを二重に管理する。許可リストにないツールは、存在自体をクライアントへ見せない（tools/list から除外する）ことを原則とする。
-- 既定の許可範囲は「観測・解析・決定論的ヘルパー」のみとする。
-  - 許可（既定）: 構造検査、関数一覧、逆アセンブル／デコンパイル結果の取得、文字列抽出、静的解析、暗号・エンコード演算、メタデータ抽出。
-  - 競技中のみ: CTF ターゲットへの HTTP 検査、ターゲット接続を伴うツール。
-  - 常時禁止: 任意シェル実行、raw コマンド実行（radare2-mcp の raw 実行等は無効化）、ホスト・家庭 LAN 向けの通信を伴うツール、ゲスト外へのファイル書き出し。
-- 採用 OSS に「raw 実行」「スクリプト実行」系のツールが含まれる場合は、有効化前に棚卸しし、既定で無効化する（docs/03 の再確認リスト）。
+- Tool-unit allowlists are managed doubly, at the gateway and at each MCP server. The principle is that tools not on the allowlist are not even shown to the client (excluded from tools/list).
+- The default allowed scope is limited to "observation, analysis, and deterministic helpers."
+  - Allowed (default): Structure inspection, function listing, obtaining disassembly/decompilation results, string extraction, static analysis, crypto/encoding operations, metadata extraction.
+  - During competitions only: HTTP inspection of CTF targets, tools involving target connections.
+  - Always prohibited: Arbitrary shell execution, raw command execution (raw execution in radare2-mcp, etc. is disabled), tools involving communication toward the host or home LAN, file writes outside the guest.
+- If adopted OSS includes "raw execution" or "script execution" type tools, they are inventoried before enablement and disabled by default (the re-confirmation list in docs/03).
 
-## 5. ツール実行時の防御（サーバー側）
+## 5. Defenses at Tool Execution Time (Server Side)
 
-Gemini 資料の原則を全サーバー共通の要求とする。
+The Gemini material's principles are required of all servers in common.
 
-- ファイルパスはワークスペース配下であることを強制検証し、パストラバーサルを遮断する。
-- サブプロセスは `shell=False` 相当で実行し、引数は配列で渡す。全実行にタイムアウト（既定 60 秒）を設ける。
-- 出力にはトランケート（既定 4,000 文字程度）を適用し、巨大な出力をそのまま返さない。
-- 実行ユーザー権限は最小化し、ゲスト内でも root では動かさない。
+- File paths are forcibly verified to be under the workspace, and path traversal is blocked.
+- Subprocesses are executed in a `shell=False`-equivalent manner, with arguments passed as arrays. A timeout (default 60 seconds) is set on all executions.
+- Truncation (default around 4,000 characters) is applied to output; huge output is not returned as-is.
+- The execution user's privileges are minimized; tools do not run as root even inside the guest.
 
-## 6. 監査ログ
+## 6. Audit Logs
 
-- ゲートウェイで全ツール呼出しを記録する。記録項目は、時刻、認証主体、ツール名、引数の要約、成否、出力サイズ、outbound の接続先とする（引数や出力の全文は残さない。フラグ等の競技情報が混入し得るため）。
-- ログはゲスト内だけに置かず、ホスト側へ転送して保管する。ゲストが侵害されてもログが改ざんできない配置とする。
-- 競技後にモルクがレビューできる形（日次サマリ等）を運用に含める。
+- All tool invocations are recorded at the gateway. Recorded items are: time, authenticated principal, tool name, argument summary, success/failure, output size, and outbound destinations (full arguments and output are not retained, because competition information such as flags could be mixed in).
+- Logs are not kept only inside the guest; they are forwarded to and stored on the host side, in an arrangement where the logs cannot be tampered with even if the guest is compromised.
+- A form Moruku can review after a competition (daily summaries, etc.) is included in operations.
 
-## 7. スナップショットとロールバック
+## 7. Snapshots and Rollback
 
-- 競技開始前にゲストのスナップショット（qcow2 のスナップショット／クローン）を取得し、競技後は原則としてその状態へ巻き戻す。
-- ツール群の更新や構成変更も、変更前スナップショットを取ってから行い、問題があれば巻き戻せるようにする。
-- 解析対象ファイルは巻き戻しで消える前提とし、成果物（解析メモ等）はゲスト外（ホスト側の管理領域）へ退避する手順を運用に含める。
+- Before a competition starts, a snapshot of the guest (qcow2 snapshot / clone) is taken, and after the competition the guest is in principle rolled back to that state.
+- Updates to the tool set and configuration changes are also made only after taking a pre-change snapshot, so that rollback is possible if problems occur.
+- Analysis target files are premised on disappearing upon rollback; deliverables (analysis notes, etc.) are included in operations as a procedure to evacuate outside the guest (to a management area on the host side).
 
-## 8. プロンプトインジェクションへの注意
+## 8. Caution on Prompt Injection
 
-- CTF ターゲットや解析対象ファイルから返る出力は、そのまま LLM への入力になる。出力内に「指示」が含まれていても、それはデータであり、ツール利用の方針を変える根拠にはしない、という運用を前提とする。
-- 特に、ツール出力を契機に許可リスト外のツールを呼ぶ、外部へ送信する、といった連鎖は行わない。ゲートウェイの許可リストは、この観点でも最終防衛線となる。
+- Output returned from CTF targets and analysis target files becomes input to the LLM as-is. The operating premise is that even if "instructions" are contained in output, they are data and are not grounds for changing the tool-use policy.
+- In particular, no chain is performed in which tool output triggers calling tools outside the allowlist or sending data externally. The gateway's allowlist is the final line of defense from this standpoint as well.
 
-## 9. 秘密情報の取り扱い
+## 9. Handling of Secrets
 
-- リポジトリ・設計文書に、トークン、鍵、実ネットワークアドレス、個人情報を書かない。
-- 競技のアカウント情報やフラグは、監査ログにも残さない（上記のとおり要約のみ）。
-- 本設計で参照するラボ文書の流儀（未確認事項は「未確認」と明記する）に従う。
+- Tokens, keys, real network addresses, and personal information are not written in the repository or design documents.
+- Competition account information and flags are not retained in audit logs either (summaries only, as above).
+- The convention of the lab documents referenced by this design (mark unverified items explicitly as "unverified") is followed.

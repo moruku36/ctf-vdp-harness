@@ -1,51 +1,53 @@
-# 06 フェーズ計画・判断ポイント
+# 06 Phase Plan and Decision Points
 
-## 1. フェーズ計画
+日本語版: [06-roadmap.ja.md](06-roadmap.ja.md)
 
-公開は最後に行う。まずローカル経路で検証し、制御（認証・許可リスト・FW）が固まってから公開経路を開く。
+## 1. Phase Plan
 
-| フェーズ | 内容 | 完了条件 |
+Publication is done last. First verify over local paths, and open the public path only after the controls (authentication, allowlist, FW) are solidified.
+
+| Phase | Content | Completion criteria |
 |---|---|---|
-| Phase 0: 判断と確認 | 下記「判断ポイント」の確定。ChatGPT 側コネクター仕様の確認（J5）を含む | 判断ポイント J1〜J5 がすべて決まっている |
-| Phase 1: ローカル経路での疎通検証 | フォールバック経路（Tailscale / SSH トンネル経由 stdio）で、既存資産（Workbench、REA）と第一候補（GhidraMCP、radare2-mcp）を Windows のローカルクライアントから呼び出す。ツール棚卸しと許可リストの初版を作る | 主要ツールがローカル経路で呼べ、許可リスト初版がある |
-| Phase 2: ctf-mcp core の実装 | 自作補完（crypto / encoding、軽量観測ツール、共通基盤）を実装する。配置方法（コンテナ基盤の有無、U4）に合わせてゲストへオフライン搬入する | core のツールが Phase 1 の経路で呼べ、トランケート・パス検証・タイムアウトが効いている |
-| Phase 3: 隔離ネットワークの構築 | ゲストへ隔離セグメントの vNIC を追加し（J2 で可とされた場合）、ブリッジ、ゲートウェイ、ファイアウォールを構築する。vsock 案（B）を採る場合はその中継を構築する | FW の各ポリシー（docs/04）が検証でき、家庭 LAN への到達不可を確認できる |
-| Phase 4: 公開経路と ChatGPT 接続 | Cloudflare Tunnel（または Secure MCP Tunnel、J1）で公開し、認証（OAuth 等）を有効化して ChatGPT から接続する | ChatGPT から許可リスト内のツールのみが呼べ、監査ログに記録が残る |
-| Phase 5: 運用 | 競技モード（開始前のスナップショット、egress 有効化、終了後の巻き戻しと無効化）、監査ログのレビュー、ツール・許可リストの見直しを定常運用とする | 競技 1 回分をこの手順で回し切れる |
+| Phase 0: Decisions and confirmations | Finalizing the "decision points" below. Includes confirming the ChatGPT-side connector specification (J5) | Decision points J1–J5 are all decided |
+| Phase 1: Connectivity verification over local paths | Over the fallback paths (stdio via Tailscale / SSH tunnel), call the existing assets (Workbench, REA) and first candidates (GhidraMCP, radare2-mcp) from a local client on Windows. Perform a tool inventory and create the first version of the allowlist | Main tools can be called over local paths, and a first-version allowlist exists |
+| Phase 2: Implementation of ctf-mcp core | Implement the in-house gap-fillers (crypto / encoding, lightweight observation tools, shared foundation). Bring them into the guest offline, according to the placement method (whether a container platform exists, U4) | Core's tools can be called over the Phase 1 paths, and truncation, path validation, and timeouts are effective |
+| Phase 3: Isolated network construction | Add an isolated-segment vNIC to the guest (if J2 decided it is acceptable), and build the bridge, gateway, and firewall. If option B (vsock) is adopted, build that relay instead | Each FW policy (docs/04) can be verified, and unreachability to the home LAN can be confirmed |
+| Phase 4: Public path and ChatGPT connection | Publish via Cloudflare Tunnel (or Secure MCP Tunnel, J1), enable authentication (OAuth, etc.), and connect from ChatGPT | Only tools on the allowlist can be called from ChatGPT, and records remain in the audit log |
+| Phase 5: Operations | Make competition mode (pre-start snapshot, egress enablement, post-end rollback and disablement), audit log review, and tool/allowlist review part of regular operations | One full competition can be run through with these procedures |
 
-リソース増強（J3）は、Phase 1 の検証結果（現行スペックでの不足の実測）を見てから規模を確定し、Phase 3 までに実施する。
+Resource expansion (J3): after seeing the Phase 1 verification results (measured shortfalls against the current specifications), the scale is finalized and it is carried out by Phase 3.
 
-## 2. 判断ポイント（モルクの判断が必要）
+## 2. Decision Points (Moruku's decision required)
 
-| # | 判断事項 | 選択肢・論点 | 影響するフェーズ |
+| # | Decision item | Options / issues | Affected phase |
 |---|---|---|---|
-| J1 | 公開経路の方式 | Cloudflare Tunnel（ホスト発信で公開 HTTPS 化）か、OpenAI Secure MCP Tunnel（使えることが確認できた場合）か。Tunnel 方式では Cloudflare アカウントと、場合により独自ドメインの用意が要る | Phase 4 |
-| J2 | ゲストへの vNIC 追加の可否 | 現行の隔離モデルは「仮想 NIC なし」がスコープ A 受入れの前提だった。隔離セグメント限定で 1 枚追加するか、vNIC なしの vsock 中継案（B）に寄せるか。追加する場合は、受入れ記録（ラボ文書）側の扱いもあわせて決める | Phase 3 |
-| J3 | リソース増強の可否と規模 | 現行 2 vCPU / 4 GiB / 20 GiB は不足の見込み。たたき台は 4 vCPU / 8〜16 GiB / 60〜100 GiB。ホスト（NUC）の総リソースと他サービスの使用状況が未確認のため、上限の確認が先 | Phase 1〜3 |
-| J4 | Burp MCP の配置 | ゲスト内に Burp Suite を常駐させるか、Windows 側に置くか、採用自体を見送るか。Windows 側配置は「MCP 実行場所は Windows に置かない」方針との整理が要る（Burp は対話的解析ツールであり、セキュリティソフトに阻害されるツール群とは性質が異なる） | Phase 1〜2 |
-| J5 | REA の扱い | REA → Ghidra の解析能力は受入れ未完了（スコープ B）。CTF 用途で先行利用するか、受入れを先に済ませてから組み込むか | Phase 1 |
+| J1 | Publication path method | Cloudflare Tunnel (publishing HTTPS outbound from the host) or OpenAI Secure MCP Tunnel (if confirmed usable). The Tunnel method requires a Cloudflare account and possibly a custom domain | Phase 4 |
+| J2 | Whether the guest may get a vNIC | The current isolation model was premised on "no virtual NIC" for Scope A acceptance. Add exactly one, limited to the isolated segment, or lean toward option B, the vsock relay with no vNIC? If adding, also decide how the acceptance records (lab documents) side is handled | Phase 3 |
+| J3 | Whether to expand resources, and the scale | The current 2 vCPU / 4 GiB / 20 GiB is expected to be insufficient. The draft proposal is 4 vCPU / 8–16 GiB / 60–100 GiB. Because the host (NUC)'s total resources and other services' usage are unverified, confirming the ceiling comes first | Phase 1–3 |
+| J4 | Burp MCP placement | Keep Burp Suite resident inside the guest, place it on the Windows side, or pass on adoption itself? The Windows-side placement needs to be reconciled with the policy "the MCP execution location is not placed on Windows" (Burp is an interactive analysis tool and differs in nature from the tool sets blocked by security software) | Phase 1–2 |
+| J5 | Handling of REA | The REA → Ghidra analysis capability has not completed acceptance (Scope B). Use it ahead for CTF purposes, or complete acceptance first and then incorporate it? | Phase 1 |
 
-### 判断の記録（2026-11-02、モルク）
+### Decision Record (2026-11-02, Moruku)
 
-- **基本方針**: 自作は最小限に留める（確定）。OSS の組み合わせを本線とする。
-- **J1 公開方式**: セキュアな方を優先する（決定）。まず OpenAI Secure MCP Tunnel の利用可否（C3）を確認し、使える場合はそれを採用する。使えない場合は Cloudflare Tunnel ＋ Access ＋ MCP 認証とする。
-- **J2 vNIC 追加**: **追加する（決定）**。vNIC は論理的な設定のみで追加でき、物理機材が不要であることを確認したうえでの判断。これにより接続経路は案 A（docs/04）が本線として確定し、vsock 中継案（B）は不採用とする。ラボ側の受入れ記録（スコープ A は「NIC なし」が前提）との整合・記録更新は、実装フェーズの作業に含める。
-- **J3 リソース増強**: 増強する方向で進める（決定）。現行 VM とホストの使用状況（C5）を確認し、空きを KVM ゲスト側へ切り出す。ゲストの作り直しも選択肢に含む。具体的な規模は実測のうえで確定する。
-- **J4 Burp 配置／J5 REA の扱い**: 保留（モルク考え中）。後日あらためて判断する。
+- **Basic policy**: Keep in-house development to a minimum (finalized). The main line is a combination of OSS.
+- **J1 Publication method**: Prioritize the more secure option (decided). First confirm whether OpenAI Secure MCP Tunnel is usable (C3); if usable, adopt it. If not usable, use Cloudflare Tunnel + Access + MCP authentication.
+- **J2 vNIC addition**: **Add it (decided)**. This decision was made after confirming that a vNIC can be added by logical configuration only and requires no physical equipment. With this, the connectivity path is finalized with option A (docs/04) as the main line, and the vsock relay option (B) is not adopted. Reconciling and updating the lab-side acceptance records (Scope A is premised on "no NIC") is included in the implementation phase's work.
+- **J3 Resource expansion**: Proceed in the direction of expanding (decided). Check the current VM and host usage (C5) and carve out free capacity for the KVM guest side. Rebuilding the guest is also among the options. The concrete scale is finalized after measurement.
+- **J4 Burp placement / J5 Handling of REA**: On hold (Moruku still considering). To be decided again later.
 
-## 3. 確認が必要な事項と、その方法
+## 3. Items Requiring Confirmation, and How
 
-| # | 確認事項 | 確認方法 |
+| # | Item to confirm | Confirmation method |
 |---|---|---|
-| C1 | ChatGPT カスタム MCP コネクターの正確な仕様（公開 HTTPS / Streamable HTTP / OAuth の要否） | OpenAI 公式ドキュメント（開発者向けコネクター／Apps SDK のデプロイ要件）を直接確認する。本設計では二次情報のみで断定していない |
-| C2 | モルクの利用プラン（Daybreak 系）でコネクター追加と書き込み系ツールが使えるか | モルクの ChatGPT の設定画面で、コネクター追加の導線と開発者モード相当の設定の有無を確認する。二次情報には「Plus/Pro は読み取り専用」と「開発者モードで書き込み可」の両説がある |
-| C3 | OpenAI Secure MCP Tunnel がモルクの環境で使えるか | 公式ドキュメントと、実際の設定画面でのトンネル選択肢の有無を確認する |
-| C4 | 現行ゲストにコンテナ基盤（Docker 等）があるか | ホストのシリアルコンソール経由でゲスト内を確認する（従来の管理経路で実施可能） |
-| C5 | ホスト（NUC）の総リソースと現在の使用状況 | ホスト上で確認する（既存の運用情報の範囲） |
-| C6 | 参加する CTF 大会の規約で AI・自動化ツールの利用が許されるか | 大会ごとに公式規約を確認する。競技のたびに必要な確認であり、設計では代替できない |
+| C1 | The exact specification of the ChatGPT custom MCP connector (public HTTPS / Streamable HTTP / whether OAuth is required) | Check OpenAI's official documentation (developer connectors / Apps SDK deployment requirements) directly. This design does not assert it based on secondary information alone |
+| C2 | Whether connectors can be added and write-type tools used under Moruku's plan (Daybreak series) | In Moruku's ChatGPT settings screen, check the flow for adding connectors and whether developer-mode-equivalent settings exist. Secondary information contains both claims: "Plus/Pro are read-only" and "writing is possible in developer mode" |
+| C3 | Whether OpenAI Secure MCP Tunnel can be used in Moruku's environment | Check the official documentation and whether a tunnel option exists in the actual settings screen |
+| C4 | Whether the current guest has a container platform (Docker, etc.) | Check inside the guest via the host's serial console (possible with the existing management path) |
+| C5 | The host (NUC)'s total resources and current usage | Check on the host (within the scope of existing operational information) |
+| C6 | Whether AI / automation tools may be used under the rules of the CTF competition being entered | Check the official rules for each competition. This confirmation is needed for every competition and cannot be substituted by design |
 
-## 4. リスクと留保
+## 4. Risks and Reservations
 
-- ChatGPT 側の仕様（C1・C2）の結果次第では、公開経路の設計が変わる。特に「書き込み系ツール不可」となった場合、ツールの公開範囲を読み取り・解析系に寄せる再設計が要る（その場合でも Phase 1〜3 の資産はフォールバック経路で活きる）。
-- vNIC 追加は、ラボ側の受入れ記録（スコープ A の前提）と整合させる必要がある。設計文書だけでなく、home-ai-engineering-lab 側の記録の更新も作業に含める。
-- OSS 候補の状況（ライセンス、更新、ツールの内訳）は導入時点の再確認を前提とする（docs/03）。
+- Depending on the results for the ChatGPT-side specifications (C1, C2), the public path design may change. In particular, if it turns out that "write-type tools are not allowed," the tool exposure scope needs redesign toward read-only and analysis types (even in that case, the Phase 1–3 assets remain useful on the fallback paths).
+- The vNIC addition must be reconciled with the lab-side acceptance records (Scope A premises). Updating the records on the home-ai-engineering-lab side, not only the design documents, is included in the work.
+- The state of the OSS candidates (licenses, updates, tool contents) is premised on re-confirmation at introduction time (docs/03).

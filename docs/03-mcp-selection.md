@@ -1,50 +1,52 @@
-# 03 MCP サーバー選定
+# 03 MCP Server Selection
 
-## 1. 選定方針
+日本語版: [03-mcp-selection.ja.md](03-mcp-selection.ja.md)
 
-- 既存資産（ゲスト配置済みの Workbench MCP と REA）を第一に位置づける。
-- 追加候補は、GitHub 上の実在と一次・二次情報での裏付けが取れたものだけを載せる。確認できなかった項目は「未確認」と明記する。
-- 本設計の原則（docs/01 N1）に反する「任意シェル実行が中核」のサーバーは、採用候補から外し、対照としてのみ記す。
-- 最終更新の目安は、確認時点（2026-11-02）の二次情報に基づく目安であり、導入時に再確認する。
+## 1. Selection Policy
 
-## 2. 選定表
+- Existing assets (the Workbench MCP and REA already placed in the guest) are positioned first.
+- Additional candidates are included only if their existence on GitHub and corroboration from primary/secondary sources have been obtained. Items that could not be confirmed are explicitly marked "Unverified."
+- Servers whose core is "arbitrary shell execution," contrary to this design's principles (docs/01 N1), are excluded from adoption candidates and noted only for contrast.
+- The "last updated" estimates are based on secondary information as of the confirmation date (2026-11-02) and are re-checked at introduction time.
 
-### 2.1 既存資産
+## 2. Selection Table
 
-| 名称 | URL | ライセンス | 最終更新の目安 | トランスポート | ツールの粒度 | 任意シェル実行 | 主なカテゴリ | 位置づけ |
-|---|---|---|---|---|---|---|---|---|---|
-| OSS Vulnerability Workbench MCP | https://github.com/moruku36/oss-vulnerability-workbench-mcp | 自作（モルク自身のリポジトリ） | ゲスト配置済み | 未確認（ゲスト内で基本通信は確認済み） | 16 ツールの列挙を確認（ラボ記録）。実スキャナー実行は未検証 | なし（解析系ツール群） | コード監査・依存関係 | 土台として継続利用 |
-| REA（Reverse Engineer Anything）6.7.0 | https://github.com/morluto/rea | 未確認 | ゲスト配置済み（オフライン資材の固定マニフェスト確認済み） | 未確認 | Ghidra 連携の解析支援 | 未確認 | rev | 既存資産として活用。ただし REA → Ghidra の解析能力は受入れ未完了（スコープ B） |
+### 2.1 Existing Assets
 
-### 2.2 追加候補（採用を検討するもの）
+| Name | URL | License | Last-updated estimate | Transport | Tool granularity | Arbitrary shell execution | Main categories | Positioning |
+|---|---|---|---|---|---|---|---|---|
+| OSS Vulnerability Workbench MCP | https://github.com/moruku36/oss-vulnerability-workbench-mcp | In-house (Moruku's own repository) | Placed in guest | Unverified (basic communication verified inside the guest) | Listing of 16 tools confirmed (lab records). Running real scanners is unverified | None (analysis-type tool set) | Code audit, dependencies | Continue using as the foundation |
+| REA (Reverse Engineer Anything) 6.7.0 | https://github.com/morluto/rea | Unverified | Placed in guest (fixed manifest of offline materials confirmed) | Unverified | Analysis support integrated with Ghidra | Unverified | rev | Use as an existing asset. However, the REA → Ghidra analysis capability has not completed acceptance (Scope B) |
 
-| 名称 | URL | ライセンス | 最終更新の目安 | トランスポート | ツールの粒度 | 任意シェル実行 | 主なカテゴリ | 位置づけ |
-|---|---|---|---|---|---|---|---|---|---|
-| GhidraMCP（LaurieWired） | https://github.com/LaurieWired/GhidraMCP | Apache-2.0 | 活発（2026-10 時点で更新を確認した二次情報あり） | stdio ブリッジ／Streamable HTTP 選択可。Ghidra 拡張側はループバック HTTP | 関数一覧、デコンパイル、xref、リネーム等の細粒度解析ツール | なし（Ghidra 操作が中心。スクリプト実行系ツールの有無は導入時に確認） | rev | **第一候補**。導入済み Ghidra 12.1.4 に対応する |
-| radare2-mcp（r2mcp、radareorg 公式） | https://github.com/radareorg/radare2-mcp | LGPL 系との二次情報あり（導入時に LICENSE 確認） | 活発（1.9.0 リリースを確認） | stdio／HTTP モード。HTTP 時は Bearer トークン認証に対応（リリース情報） | radare2 の解析機能をツール化。readonly モード、sandbox lock、ツール制限オプションあり | raw な r2 コマンド実行を任意で有効化できる設計がある。**既定で無効化できることを採用条件とする** | rev / pwn | radare2 系の本命。自作 core の radare2 ラッパーは作らず、こちらに寄せる |
-| Burp MCP（PortSwigger 公式拡張） | https://github.com/PortSwigger/mcp-server | 未確認（二次情報に GPL-3.0 と Apache-2.0 の両説あり） | 未確認 | SSE（ループバック）＋ stdio プロキシ | Burp の操作ツール約 27（二次情報）。プロキシ履歴の参照、リクエスト送信等 | なし（Burp 操作が中心） | web | Web カテゴリの有力候補。前提として Burp Suite 本体（Community 可）の常駐が必要で、配置場所が判断ポイント |
-| ghidra-mcp（bethington） | https://github.com/bethington/ghidra-mcp | Apache-2.0（二次情報） | 未確認（2025-08 作成、活発との二次情報） | GUI プラグイン＋ヘッドレスサーバー | 219 ツール（プロジェクト自己申告） | 未確認 | rev | Ghidra 系の代替候補。ツール数が欲しい場合に比較検討 |
-| pyghidra-mcp（clearbluejar） | 未確認（導入時にリポジトリを特定する） | Apache-2.0（二次情報） | 未確認 | ヘッドレス特化 | プロジェクト横断の解析、セマンティック検索等（二次情報） | 未確認 | rev | GUI のないゲスト運用と相性が良い候補。まず出所の特定と精査から |
+### 2.2 Additional Candidates (under consideration for adoption)
 
-### 2.3 参考・対照（採用しないもの）
+| Name | URL | License | Last-updated estimate | Transport | Tool granularity | Arbitrary shell execution | Main categories | Positioning |
+|---|---|---|---|---|---|---|---|---|
+| GhidraMCP (LaurieWired) | https://github.com/LaurieWired/GhidraMCP | Apache-2.0 | Active (secondary information confirming updates as of 2026-10) | Choice of stdio bridge / Streamable HTTP. The Ghidra extension side uses loopback HTTP | Fine-grained analysis tools such as function listing, decompilation, xrefs, renaming | None (centered on Ghidra operations. Whether script-execution-type tools exist is to be checked at introduction) | rev | **First candidate**. Supports the installed Ghidra 12.1.4 |
+| radare2-mcp (r2mcp, official radareorg) | https://github.com/radareorg/radare2-mcp | Secondary information says LGPL family (check LICENSE at introduction) | Active (release 1.9.0 confirmed) | stdio / HTTP mode. Over HTTP, Bearer token authentication is supported (release information) | Turns radare2's analysis functions into tools. Has a readonly mode, sandbox lock, and tool-restriction options | Designed so that raw r2 command execution can optionally be enabled. **A condition of adoption is that it can be disabled by default** | rev / pwn | The main choice for the radare2 family. The in-house core's radare2 wrapper will not be built; delegate to this |
+| Burp MCP (official PortSwigger extension) | https://github.com/PortSwigger/mcp-server | Unverified (secondary information contains both GPL-3.0 and Apache-2.0 claims) | Unverified | SSE (loopback) + stdio proxy | About 27 Burp operation tools (secondary information). Proxy history reference, request sending, etc. | None (centered on Burp operations) | web | A strong candidate for the web category. Premised on the Burp Suite core (Community is acceptable) being resident; the placement location is a decision point |
+| ghidra-mcp (bethington) | https://github.com/bethington/ghidra-mcp | Apache-2.0 (secondary information) | Unverified (created 2025-08; secondary information says active) | GUI plugin + headless server | 219 tools (project's self-report) | Unverified | rev | An alternative candidate in the Ghidra family. Compare if a large tool count is wanted |
+| pyghidra-mcp (clearbluejar) | Unverified (identify the repository at introduction) | Apache-2.0 (secondary information) | Unverified | Headless-specialized | Cross-project analysis, semantic search, etc. (secondary information) | Unverified | rev | A candidate that fits GUI-less guest operation well. Start with identifying the source and scrutinizing it |
 
-| 名称 | URL | 概要 | 採用しない理由 |
+### 2.3 Reference / Contrast (not adopted)
+
+| Name | URL | Summary | Reason for not adopting |
 |---|---|---|---|
-| HexStrike AI（0x4m4） | https://github.com/0x4m4/hexstrike-ai | MIT。150 以上のセキュリティツールを束ねる MCP サーバー（FastMCP ブリッジ＋Flask API）。カテゴリ構成は network / web / binary / cloud / CTF・forensics 等 | ツールは個別ラッパーだが、内部実装が `shell=True` のサブプロセス実行であること、上流版にサーバー認証がないことが分析レポートで指摘されている。本設計の原則（N1・N6）と衝突するため、そのままでは採用しない。ツール目録とカテゴリ構成の参考資料として扱う |
-| CTF-Solver（foxibu） | https://github.com/foxibu/CTF-Solver | Kali ツール 55 以上を HTTP（ポート 5000）で公開する MCP Kali Server 系。7 カテゴリ対応を掲げる。ライセンス未確認 | Kali Server 系は任意コマンド実行を含む設計であり、原則（N1）と衝突する。参考のみ |
-| MCP-Kali-Server（Wh0am123） | https://github.com/Wh0am123/MCP-Kali-Server | Kali のターミナルコマンド実行そのものを API ブリッジするサーバー | 任意シェル実行が中核であり、原則（N1）に反する。対照例としてのみ記載 |
-| mcp-ctf-server（zemi-gh） | 未確認（MCP サーバーディレクトリ Glama への掲載で実在を確認） | stdio 型。crypto / forensics / stego / traffic 等のカテゴリ別ツールと、Python スニペット実行サンドボックスを含む | 出所（GitHub URL）とライセンスが未確認であり、Python 任意実行を含む。導入前に出所の特定と精査が必須の参考候補 |
+| HexStrike AI (0x4m4) | https://github.com/0x4m4/hexstrike-ai | MIT. An MCP server bundling 150+ security tools (FastMCP bridge + Flask API). Category structure includes network / web / binary / cloud / CTF & forensics, etc. | Although the tools are individual wrappers, analysis reports point out that the internal implementation executes subprocesses with `shell=True` and that the upstream version has no server authentication. This conflicts with this design's principles (N1, N6), so it is not adopted as-is. Treated as reference material for the tool catalog and category structure |
+| CTF-Solver (foxibu) | https://github.com/foxibu/CTF-Solver | An MCP Kali Server family item exposing 55+ Kali tools over HTTP (port 5000). Claims support for 7 categories. License unverified | The Kali Server family is designed to include arbitrary command execution, which conflicts with the principles (N1). Reference only |
+| MCP-Kali-Server (Wh0am123) | https://github.com/Wh0am123/MCP-Kali-Server | A server that API-bridges execution of Kali terminal commands themselves | Arbitrary shell execution is its core, contrary to the principles (N1). Noted only as a contrast example |
+| mcp-ctf-server (zemi-gh) | Unverified (existence confirmed via listing in the MCP server directory Glama) | stdio type. Includes category-specific tools for crypto / forensics / stego / traffic, etc., and a Python snippet execution sandbox | Its source (GitHub URL) and license are unverified, and it includes arbitrary Python execution. A reference candidate for which identifying the source and scrutiny are mandatory before introduction |
 
-## 3. 選定の根拠（要点）
+## 3. Selection Rationale (Key Points)
 
-1. **Ghidra 系は導入済み資産との一致を優先した。** ゲストには Ghidra 12.1.4 が配置済みであり、GhidraMCP はそのバージョンに対応する拡張＋ブリッジ構成で、実績も厚い。GUI を開かない運用が主になる場合は、ヘッドレス特化の pyghidra-mcp を比較対象に残す。
-2. **radare2 系は公式実装を採る。** radare2-mcp は radareorg 公式で、readonly モードやツール制限、HTTP 時のトークン認証など、本設計の原則と噛み合う制御を持っている。Gemini 資料が自作を想定していた radare2 ラッパー群は、原則として本家に寄せ、自作範囲を縮小する。
-3. **「全部入り」サーバーは原則との衝突で見送った。** HexStrike AI のような統合型は一見便利だが、任意実行に近い実装と認証の欠如が確認されており、公開経路を持つ本設計には載せない。必要なツールはカテゴリ別に、細粒度のサーバーと自作 core で組み立てる。
-4. **Web カテゴリは Burp 公式を軸にしつつ、配置を保留した。** Burp 本体は GUI アプリケーションであり、ヘッドレスのゲスト内常駐が適切かは未検証である。Windows 側に置く案も含め、docs/06 の判断ポイントとする。軽量な HTTP 検査は ctf-mcp core 側の httpx ラッパーで先行して賄う。
-5. **crypto / encoding は OSS が薄く、自作 core の主担当とした。** 既存の CTF 特化サーバーは任意実行を含むものが多く、決定論的ヘルパーだけを抜き出した実装が見つからなかったためである。
+1. **For the Ghidra family, matching the installed assets took priority.** Ghidra 12.1.4 is placed in the guest, and GhidraMCP consists of an extension + bridge supporting that version, with a solid track record. If operation without opening the GUI becomes the main mode, the headless-specialized pyghidra-mcp is kept as a comparison target.
+2. **For the radare2 family, the official implementation is adopted.** radare2-mcp is official from radareorg and has controls that align with this design's principles, such as a readonly mode, tool restrictions, and token authentication over HTTP. The radare2 wrapper set that the Gemini material assumed would be built in-house is in principle delegated upstream, shrinking the in-house scope.
+3. **"All-in-one" servers were passed over due to conflicts with the principles.** Integrated types such as HexStrike AI look convenient at first glance, but implementations close to arbitrary execution and a lack of authentication have been confirmed, so they are not put on this design, which has a public path. Needed tools are assembled from fine-grained servers per category plus the in-house core.
+4. **The web category is centered on the official Burp offering, with placement on hold.** The Burp core is a GUI application, and whether resident operation inside a headless guest is appropriate is unverified. It is made a decision point in docs/06, including the option of placing it on the Windows side. Lightweight HTTP inspection is covered in the meantime by the httpx wrapper on the ctf-mcp core side.
+5. **crypto / encoding is thin in OSS, so it became the in-house core's main scope.** Existing CTF-specialized servers often include arbitrary execution, and no implementation extracting only deterministic helpers was found.
 
-## 4. 導入時の再確認リスト
+## 4. Re-Confirmation List for Introduction Time
 
-- 各リポジトリの LICENSE ファイルと最新リリースを導入時点で確認する（本書のライセンス・更新情報は目安）。
-- ツール一覧を棚卸しし、許可リスト（docs/05）に載せるものだけを有効化する。特に「raw コマンド実行」「スクリプト実行」に相当するツールは既定で無効化する。
-- 依存関係とビルド手順を確認し、ゲストへの搬入はオフライン資材化（従来の ISO 経路）で完結させる。
+- Check each repository's LICENSE file and latest release at introduction time (the license and update information in this document is an estimate).
+- Inventory the tool lists and enable only those placed on the allowlist (docs/05). In particular, tools corresponding to "raw command execution" and "script execution" are disabled by default.
+- Confirm dependencies and build procedures, and complete delivery into the guest by offline materialization (the existing ISO path).

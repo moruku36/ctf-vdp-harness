@@ -8,7 +8,7 @@ Publication is done last. First verify over local paths, and open the public pat
 
 | Phase | Content | Completion criteria |
 |---|---|---|
-| Phase 0: Decisions and confirmations | Finalizing the "decision points" below. Includes confirming the ChatGPT-side connector specification (J5) | Decision points J1–J5 are all decided |
+| Phase 0: Decisions and confirmations | Finalizing the "decision points" below. Includes confirming the ChatGPT-side connector specification (C1) | Decision points J1–J5 are all decided |
 | Phase 1: Connectivity verification over local paths | Over the fallback paths (stdio via Tailscale / SSH tunnel), call the existing assets (Workbench, REA) and first candidates (GhidraMCP, radare2-mcp) from a local client on Windows. Perform a tool inventory and create the first version of the allowlist | Main tools can be called over local paths, and a first-version allowlist exists |
 | Phase 2: Implementation of ctf-mcp core | Implement the in-house gap-fillers (crypto / encoding, lightweight observation tools, shared foundation). Bring them into the guest offline, according to the placement method (whether a container platform exists, U4) | Core's tools can be called over the Phase 1 paths, and truncation, path validation, and timeouts are effective |
 | Phase 3: Isolated network construction | Add an isolated-segment vNIC to the guest (if J2 decided it is acceptable), and build the bridge, gateway, and firewall. If option B (vsock) is adopted, build that relay instead | Each FW policy (docs/04) can be verified, and unreachability to the home LAN can be confirmed |

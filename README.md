@@ -16,6 +16,44 @@ The MCP execution location is not Windows. Because security software on Windows 
 
 The path is: "ChatGPT on Windows → (public HTTPS) → gateway on the NUC host → (isolated segment) → MCP servers inside the analysis guest → CTF targets." There is one major change of premise here: the current analysis guest has no virtual NIC and is completely separated from the network, so as-is it cannot be reached from ChatGPT. Designing the connectivity path is the core of this project (details in docs/04).
 
+### Network route
+
+The route the traffic takes is shown below. Details of the overall architecture and the connectivity path design are in [docs/02](docs/02-architecture.md) and [docs/04](docs/04-connectivity.md).
+
+```mermaid
+flowchart LR
+    WIN["Windows PC<br/>ChatGPT (Daybreak-series models)"]
+    subgraph pub["Public path (Internet)"]
+        SMT["OpenAI Secure MCP Tunnel<br/>preferred, if available"]
+        CFT["Cloudflare Tunnel + Access<br/>fallback"]
+    end
+    WIN --> SMT
+    WIN --> CFT
+    subgraph lab["Home lab (Intel NUC host)"]
+        GW["MCP gateway<br/>authentication / tool allowlist / audit log"]
+        ISO["Read-only ISO<br/>material intake"]
+        subgraph guest["Isolated KVM guest (QEMU/KVM)"]
+            SET["MCP servers"]
+            GH["GhidraMCP"]
+            R2["radare2-mcp"]
+            WB["OSS Vulnerability<br/>Workbench MCP"]
+            CORE["ctf-mcp core<br/>crypto / encoding helpers"]
+            SET --- GH
+            SET --- R2
+            SET --- WB
+            SET --- CORE
+        end
+    end
+    SMT --> GW
+    CFT --> GW
+    GW -->|"isolated segment<br/>dedicated bridge"| SET
+    ISO -.-> SET
+    SET -->|"outbound, only during competitions"| CTF["CTF targets<br/>challenge servers"]
+    SET -.->|"home LAN: denied / no route"| LAN["Home LAN"]
+```
+
+Note: after a competition, the guest is rolled back to a snapshot (see also section 5).
+
 ## 3. Components
 
 - **Existing assets (first candidates)**: The OSS Vulnerability Workbench MCP (in-house) and REA 6.7.0 + Ghidra 12.1.4, already placed inside the guest. The Workbench's basic MCP communication has been verified; the REA → Ghidra analysis capability has not yet completed acceptance.

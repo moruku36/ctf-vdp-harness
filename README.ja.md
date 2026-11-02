@@ -16,6 +16,44 @@ MCP の実行場所は Windows ではありません。Windows 上ではセキ�
 
 経路は「Windows 上の ChatGPT →（公開 HTTPS）→ NUC ホスト上のゲートウェイ →（隔離セグメント）→ 解析ゲスト内の MCP サーバー群 → CTF ターゲット」です。ここに大きな前提変更があります。現行の解析ゲストには仮想 NIC がなく、ネットワークから完全に分離されているため、このままでは ChatGPT から到達できません。接続経路の設計が本プロジェクトの核心です（詳細は docs/04）。
 
+### ネットワーク経路
+
+トラフィックの経路は下図のとおりです。全体構成と接続経路設計の詳細は [docs/02](docs/02-architecture.ja.md) と [docs/04](docs/04-connectivity.ja.md) を参照してください。
+
+```mermaid
+flowchart LR
+    WIN["Windows PC<br/>ChatGPT（Daybreak 系モデル）"]
+    subgraph pub["公開経路（インターネット）"]
+        SMT["OpenAI Secure MCP Tunnel<br/>第一候補（使える場合）"]
+        CFT["Cloudflare Tunnel + Access<br/>代替"]
+    end
+    WIN --> SMT
+    WIN --> CFT
+    subgraph lab["ホームラボ（Intel NUC ホスト）"]
+        GW["MCP ゲートウェイ<br/>認証 / ツール許可リスト / 監査ログ"]
+        ISO["読み取り専用 ISO<br/>資材搬入"]
+        subgraph guest["隔離 KVM ゲスト（QEMU/KVM）"]
+            SET["MCP サーバー群"]
+            GH["GhidraMCP"]
+            R2["radare2-mcp"]
+            WB["OSS Vulnerability<br/>Workbench MCP"]
+            CORE["ctf-mcp core<br/>crypto / encoding 補助"]
+            SET --- GH
+            SET --- R2
+            SET --- WB
+            SET --- CORE
+        end
+    end
+    SMT --> GW
+    CFT --> GW
+    GW -->|"隔離セグメント<br/>専用ブリッジ"| SET
+    ISO -.-> SET
+    SET -->|"アウトバウンド（競技中のみ）"| CTF["CTF ターゲット<br/>問題サーバー"]
+    SET -.->|"家庭 LAN：到達不可 / 経路なし"| LAN["家庭 LAN"]
+```
+
+注：競技後はゲストをスナップショットへ巻き戻します（5 節も参照）。
+
 ## 3. 構成要素
 
 - **既存資産（第一候補）**: ゲスト内に配置済みの OSS Vulnerability Workbench MCP（自作）と REA 6.7.0 + Ghidra 12.1.4。Workbench は基本的な MCP 通信を確認済み、REA → Ghidra の解析能力は受入れ未完了です。

@@ -78,4 +78,4 @@ Prefer existing OSS. Custom code is restricted to missing policy, interface, sta
 | [Run report template](templates/run-report.md) | Evidence and reproducibility record |
 | [Offline pilot profile](configs/offline-pilot.example.json) | Non-executable design example; all adapters disabled |
 
-This repository remains private. No credentials, real target addresses, flags, or raw session transcripts belong in it. Local evidence storage and an export review are distinct from repository documentation. Only authorized CTF/VDP work is within the intended operating scope.
+This repository is public; operational evidence remains private. No credentials, real target addresses, flags, or raw session transcripts belong in it. Local evidence storage and an export review are distinct from repository documentation. Only authorized CTF/VDP work is within the intended operating scope.

@@ -1,98 +1,81 @@
-# ctf-mcp
+# CTF/VDP Analysis Harness
 
-日本語版: [README.ja.md](README.ja.md)
+[日本語](README.ja.md) | English
 
-This repository holds the overall design for letting ChatGPT (Daybreak-series models) safely use CTF-oriented MCP tools running in an isolated VM in the home lab.
+**Give Moruku's existing ChatGPT/Codex workflow better analysis tools, exploration state, and verifiable evidence through MCP.** This is the design home for that supporting harness, under the existing repository name `ctf-mcp`.
 
-## 1. Introduction
+The reasoning and implementation AI stays in the user's chosen client/model (currently described by Moruku as GPT-6 Sol / Daybreak). This project adds an analysis environment around it. It does not provide another autonomous CTF agent, change model weights, or promise better results merely by installing more tools.
 
-Moruku solves CTF challenges with ChatGPT's Daybreak-series models (security-specialized, used on the Windows side). This project is a design repository for building the set of MCP (Model Context Protocol) tools that this ChatGPT can call. This round is design only; no code is implemented.
+## What this project builds
 
-The approach is to "gather existing OSS MCP servers, evaluate them, and limit in-house development to filling the gaps." As design material for the in-house gap-filling components, we carry over the master prompt (tool specifications and design principles) that was researched in advance with Gemini.
+| Term | Meaning here |
+|---|---|
+| AI / client | The existing ChatGPT or Codex session that chooses hypotheses, interprets results, and writes task-specific code |
+| Harness | Scope enforcement, bounded execution, persistent analysis sessions, evidence management, recovery, and evaluation |
+| MCP | The interface through which that AI accesses the harness and selected OSS capabilities |
+| OSS tools | The actual analyzers behind narrow adapters, such as Ghidra, radare2, and the existing Workbench |
 
-## 2. Overview
+The intended improvement is practical: fewer repeated investigations, less lost debugger state, better use of long analysis output, more reproducible findings, and higher independently verified CTF solve rates. VDP work is evaluated separately for evidence quality and false positives.
 
-The MCP execution location is not Windows. Because security software on Windows reacts and prevents the tool set from running, execution happens in a QEMU/KVM security-analysis guest inside the home lab (Intel NUC).
+**Status (2026-11-09): design documents only.** No harness runtime, deployment, scanner execution, or performance improvement has been delivered by this update. Earlier lab records report basic Workbench MCP communication; they do not establish scanner acceptance, REA acceptance, or a working ChatGPT connection.
 
-The path is: "ChatGPT on Windows → (public HTTPS) → gateway on the NUC host → (isolated segment) → MCP servers inside the analysis guest → CTF targets." There is one major change of premise here: the current analysis guest has no virtual NIC and is completely separated from the network, so as-is it cannot be reached from ChatGPT. Designing the connectivity path is the core of this project (details in docs/04).
-
-### Network route
-
-The route the traffic takes is shown below. Details of the overall architecture and the connectivity path design are in [docs/02](docs/02-architecture.md) and [docs/04](docs/04-connectivity.md).
+## Architecture
 
 ```mermaid
-flowchart LR
-    WIN["Windows PC<br/>ChatGPT (Daybreak-series models)"]
-    subgraph pub["Public path (Internet)"]
-        SMT["OpenAI Secure MCP Tunnel<br/>preferred, if available"]
-        CFT["Cloudflare Tunnel + Access<br/>fallback"]
-    end
-    WIN --> SMT
-    WIN --> CFT
-    subgraph lab["Home lab (Intel NUC host)"]
-        GW["MCP gateway<br/>authentication / tool allowlist / audit log"]
-        ISO["Read-only ISO<br/>material intake"]
-        subgraph guest["Isolated KVM guest (QEMU/KVM)"]
-            SET["MCP servers"]
-            GH["GhidraMCP"]
-            R2["radare2-mcp"]
-            WB["OSS Vulnerability<br/>Workbench MCP"]
-            CORE["ctf-mcp core<br/>crypto / encoding helpers"]
-            SET --- GH
-            SET --- R2
-            SET --- WB
-            SET --- CORE
-        end
-    end
-    SMT --> GW
-    CFT --> GW
-    GW -->|"isolated segment<br/>dedicated bridge"| SET
-    ISO -.-> SET
-    SET -->|"outbound, only during competitions"| CTF["CTF targets<br/>challenge servers"]
-    SET -.->|"home LAN: denied / no route"| LAN["Home LAN"]
+flowchart TB
+    AI["Existing ChatGPT / Codex"]
+    GW["NUC host gateway: identity, scope, tool allowlist, audit"]
+    RUN["Harness: run state, hypotheses, sessions, evidence"]
+    OSS["Isolated KVM guest: selected OSS adapters and bounded helpers"]
+    E["Private evidence vault / reproducible run report"]
+    TARGET["Explicitly authorized CTF / VDP target"]
+    AI -->|"MCP: authenticated transport"| GW
+    GW --> RUN
+    RUN --> OSS
+    OSS -->|"structured observations + artifact references"| RUN
+    RUN --> E
+    OSS -->|"only when scoped network profile is enabled"| TARGET
 ```
 
-Note: after a competition, the guest is rolled back to a snapshot (see also section 5).
+The gateway stays separate from the host's existing read-only report MCP service. Security tool execution stays in the analysis guest, not on Windows. Challenge material continues to enter through the existing read-only ISO process. See [physical architecture](docs/02-architecture.md), [connectivity](docs/04-connectivity.md), and [the complete harness design](docs/08-analysis-harness.md).
 
-## 3. Components
+The last documented guest has 2 vCPU / 4 GiB / 20 GiB and no vNIC. Adding one isolated-segment vNIC and moving toward resource expansion were **approved on 2026-11-02**; neither is asserted to have been performed. Secure MCP Tunnel is the preferred connection candidate, with the existing authenticated HTTPS fallback retained. Actual account availability and end-to-end connectivity still need acceptance. Burp placement and REA handling remain on hold.
 
-- **Existing assets (first candidates)**: The OSS Vulnerability Workbench MCP (in-house) and REA 6.7.0 + Ghidra 12.1.4, already placed inside the guest. The Workbench's basic MCP communication has been verified; the REA → Ghidra analysis capability has not yet completed acceptance.
-- **Additional OSS MCP servers**: GhidraMCP (version-matched to the installed Ghidra), the official radare2-mcp, the official Burp Suite MCP extension, and others, selected after confirming they exist (docs/03).
-- **In-house gap-filler "ctf-mcp core"**: A FastMCP-based server that covers crypto / encoding helpers and shared foundations such as output truncation, which OSS does not cover (docs/02).
-- **Gateway**: Placed on the NUC host, it single-handedly handles authentication, allowlists, and audit logging. It is the key to not giving the guest side any exposed surface.
+## Research translated into this design
 
-## 4. Connectivity Path
+- **EnIGMA:** stateful interactive tool interfaces and manageable output.
+- **D-CIPHER:** decomposition and explicit action/observation feedback; sequential roles first.
+- **CTFusion:** a separate competition-platform adapter and controlled evaluation.
+- **SKILL-SIF:** revise investigation procedures from classified failures, then test on held-out tasks.
+- **HexStrike AI and existing MCP servers:** tool-category references and selective adapters; no wholesale toolkit exposure.
 
-ChatGPT's custom MCP connector is assumed to require a public HTTPS endpoint (Streamable HTTP) and OAuth authentication (this is marked "unverified" because confirmation in OpenAI's official documentation itself is not yet complete; the verification method is stated in docs/06).
+The [research-to-design map](docs/07-research-to-design.md) links primary sources and states where each result does and does not apply. HexStrike remains a reference, not an adopted dependency. A research system's benchmark result is not a measured result for Moruku's AI or VDP work.
 
-The recommendation is to publish from the host via Cloudflare Tunnel, and to add exactly one vNIC, dedicated to the isolated segment, to the guest. This is premised on a firewall where inbound traffic is only via the host-side gateway, outbound traffic is permitted only toward CTF targets, and the home LAN side is unreachable. In addition, a fallback path is provided for using the tools from local clients on the Windows side (such as Codex) via Tailscale.
+## Delivery sequence
 
-## 5. Intended Usage
+1. Freeze scope, client capabilities, tool versions, and a baseline; measure the host before resizing.
+2. Build a small offline vertical slice: intake → bounded analysis → paged evidence → verified report.
+3. Add persistent sessions only where they improve measured tasks; keep heavy analyses serialized on the current guest.
+4. Evaluate the same AI with and without the harness under the same budgets.
+5. Add scoped network/VDP capabilities and optional CTFd integration only after their acceptance criteria pass.
 
-During a competition, tools inside the analysis guest are called from the ChatGPT conversation to perform binary structure inspection, disassembly, cryptographic operations, HTTP inspection, and similar tasks. Tools are limited to "observation, analysis, and deterministic helpers"; as a rule, no arbitrary shell-command execution tool is provided. This is for safety, and also to avoid refusals by the model's guardrails.
+Prefer existing OSS. Custom code is restricted to missing policy, interface, state, and evidence glue. [Implementation plan](docs/10-implementation-plan.md) gives deliverables and acceptance gates; [evaluation](docs/09-evaluation.md) defines the comparison.
 
-Intake of materials (challenge files) continues to use the existing read-only ISO path. After a competition, the guest is rolled back to a snapshot, and network-emitting tools are kept disabled in normal times.
+## Documentation
 
-## 6. Caveats
+| Document | Contents |
+|---|---|
+| [01 Requirements](docs/01-requirements.md) | Constraints and recorded lab premises |
+| [02 Physical architecture](docs/02-architecture.md) | Host/guest placement and bounded helper stack |
+| [03 MCP selection](docs/03-mcp-selection.md) | Existing assets, candidates, adoption constraints |
+| [04 Connectivity](docs/04-connectivity.md) | Isolated segment and client transport options |
+| [05 Security](docs/05-security.md) | Authentication, isolation, scope, and data handling |
+| [06 Earlier roadmap and decisions](docs/06-roadmap.md) | J1–J5 decision history and pending confirmations |
+| [07 Research to design](docs/07-research-to-design.md) | Primary sources, extracted mechanisms, limitations |
+| [08 Analysis harness](docs/08-analysis-harness.md) | Modules, workflow, contracts, sessions, recovery |
+| [09 Evaluation](docs/09-evaluation.md) | Baselines, ablations, held-out tasks, release gates |
+| [10 Implementation plan](docs/10-implementation-plan.md) | Work packages for the implementing AI |
+| [Run report template](templates/run-report.md) | Evidence and reproducibility record |
+| [Offline pilot profile](configs/offline-pilot.example.json) | Non-executable design example; all adapters disabled |
 
-- With the current guest (2 vCPU / 4 GiB / 20 GiB), keeping the Kali tool set + Ghidra + multiple MCP servers resident is expected to run short on resources. Expansion is a decision point (docs/06).
-- Adding a vNIC is a change to the current isolation model (no virtual NIC). Because the conditional acceptance of Scope A is premised on "no NIC," whether to add one requires Moruku's decision.
-- Output returned from CTF targets becomes input to the LLM as-is. The operating premise is that tool output is always treated as "data" and instructions contained in output are not followed.
-- Whether AI and automation tools may be used differs by competition rules. The rules of each competition must be checked before participating.
-
-## 7. Open Items
-
-Points requiring Moruku's decision or confirmation are collected in docs/06. The main decisions were made on 2026-11-02: keep in-house development to a minimum; for the publication method, prioritize security (first check whether Secure MCP Tunnel is usable); the vNIC addition to the guest will be carried out; resource expansion will be done based on observed usage. What remains is the Burp MCP placement and the handling of REA (both on hold), and confirmation of the connector specification on the ChatGPT side.
-
-## Document Structure
-
-- [docs/01-requirements.md](docs/01-requirements.md) — Requirements, premises, and unverified items
-- [docs/02-architecture.md](docs/02-architecture.md) — Overall architecture and the ctf-mcp core design
-- [docs/03-mcp-selection.md](docs/03-mcp-selection.md) — MCP server selection table and rationale
-- [docs/04-connectivity.md](docs/04-connectivity.md) — Connectivity path design (option comparison and recommendation)
-- [docs/05-security.md](docs/05-security.md) — Security design
-- [docs/06-roadmap.md](docs/06-roadmap.md) — Phase plan and decision points
-
-## About Licensing and Secrets
-
-This repository contains no secrets (tokens, keys, real network addresses, etc.). Credentials are kept in secret management on the host side, and the policy is to place only configuration examples (placeholders) in the repository.
+This repository remains private. No credentials, real target addresses, flags, or raw session transcripts belong in it. Local evidence storage and an export review are distinct from repository documentation. Only authorized CTF/VDP work is within the intended operating scope.

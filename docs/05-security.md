@@ -19,7 +19,7 @@
 
 | Path | Authentication method | Notes |
 |---|---|---|
-| Public path (ChatGPT) | OAuth 2.1 is the first candidate. In addition, access control on the Tunnel side is used together | Because the specification required by the ChatGPT-side connector is unverified, the method is finalized after specification confirmation. It will not be published with Bearer tokens alone |
+| Public path (ChatGPT) | OAuth 2.1 first candidate plus tunnel-side access control as applicable | Project security policy, not a claim that OAuth is mandatory for all MCP servers. Accept the actual client/tunnel flow; no unauthenticated analysis endpoint |
 | Fallback (Tailscale) | In addition to Tailscale's authentication, a Bearer token is verified at the gateway | Authentication is not weakened even when the path changes |
 | Fallback (SSH tunnel) | SSH key authentication + server-side token | Even for stdio relay, token verification is enforced on the server side |
 
@@ -66,3 +66,11 @@ The Gemini material's principles are required of all servers in common.
 - Tokens, keys, real network addresses, and personal information are not written in the repository or design documents.
 - Competition account information and flags are not retained in audit logs either (summaries only, as above).
 - The convention of the lab documents referenced by this design (mark unverified items explicitly as "unverified") is followed.
+
+## 10. Harness extension (2026-11-09)
+
+All controls above are planned requirements, not newly verified runtime properties. For VDP, “competition mode” means a scoped, expiring run; it never grants general Internet access. Apply target/method/rate/exclusion checks at each connection, including redirects and DNS results. The default offline profile remains offline.
+
+Audit logs remain summaries only. A separate private, per-run evidence vault may retain permitted originals for reproduction, with ownership checks, retention/deletion policy and no automatic Git export. The bounded evidence importer is the sole deliverable-transfer exception to guest-only tool writes; analysis tools cannot write arbitrary host paths. See [docs/08 sections 4–7](08-analysis-harness.md).
+
+Dynamic debugger execution uses a separate accepted profile. No arbitrary shell, script evaluation, raw r2 command or general execution function is added. Disabled tools are both hidden and rejected; client-side read-only hints are not policy enforcement. Use synthetic markers for security acceptance tests and review redacted exports before publication.

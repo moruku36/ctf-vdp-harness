@@ -2,6 +2,9 @@
 
 日本語版: [02-architecture.ja.md](02-architecture.ja.md)
 
+
+**2026-11-09 status:** This is the planned physical architecture, not a deployment record. The recorded guest still has no vNIC; adding one is approved but not verified complete. Secure MCP Tunnel has first priority; Cloudflare in the original diagram is the fallback. Containers/Kali are options, not a full-toolset prerequisite. [Current logical harness design](08-analysis-harness.md) adds run state, evidence and verification.
+
 ## 1. Architectural Approach
 
 The exposed surface is consolidated at a gateway on the NUC host, and the analysis guest is placed "inside an isolated segment reachable only from the gateway." The MCP servers run inside the guest, and the guest itself has no direct exposed surface to either the Internet or the home LAN.
@@ -110,3 +113,7 @@ The current guest (2 vCPU / 4 GiB RAM / 20 GiB qcow2) is sized on the premise of
 - Memory: Ghidra's analysis alone consumes GiB-scale memory. Contention with multiple resident servers will occur.
 - Draft expansion proposal: 4 vCPU / 8–16 GiB RAM / 60–100 GiB. However, because the host (NUC)'s total resources and the usage of other services (the Docker Compose set) are unverified, the scale is left as a decision point in docs/06.
 - Combined countermeasure: MCP servers are not all kept resident; the design starts them on demand per category to keep resident memory down.
+
+## 6. Logical harness extension
+
+The gateway enforces per-run capabilities and budgets; guest adapters expose typed operations; a bounded evidence importer transfers selected deliverables into a private host vault. The AI receives short observations with authorized original-output paging. Run metadata and hypotheses survive client reconnects; debugger state does not silently survive VM restart. See [docs/08](08-analysis-harness.md). No general agent framework or autonomous orchestrator is added.

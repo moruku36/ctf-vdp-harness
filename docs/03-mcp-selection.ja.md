@@ -2,6 +2,9 @@
 
 English version: [03-mcp-selection.md](03-mcp-selection.md)
 
+
+**2026-11-09の採用境界：** 以下の従来表は新たな互換性検証・コード監査ではない。[研究対応表](07-research-to-design.ja.md)で参考研究と依存採用を区別する。版・ライセンス・接続方式を固定し実試料を受入してから有効化。HexStrikeの不採用、REA・Burpの保留は維持。小さな分野別ツール一覧から始める。
+
 ## 1. 選定方針
 
 - 既存資産（ゲスト配置済みの Workbench MCP と REA）を第一に位置づける。

@@ -125,3 +125,7 @@ Secure MCP Tunnel stays the first candidate; authenticated HTTPS is fallback. A 
 Implement only missing glue in the existing planned Python/uv/FastMCP stack after checking whether an accepted OSS component can supply it. No new agent framework is needed. Skills are short operational guides, versioned per task family. Improvement from failures happens offline on development tasks; the skill revision and adapters are frozen before evaluation. Future integration with a sleep/memory project may consume only reviewed, generalized lessons and requires a separate design; it is not part of this delivery.
 
 [Evaluation](09-evaluation.md) | [Implementation work packages](10-implementation-plan.md)
+
+## Detailed implementation contract
+
+[11 Contracts and acceptance](11-contracts-and-acceptance.md) specifies action replay, reservations, evidence pages, recovery/cleanup and CTF-01–12. This delivery is design-only; runtime fixtures remain unexecuted.

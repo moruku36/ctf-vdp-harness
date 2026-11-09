@@ -9,7 +9,7 @@ English version: [06-roadmap.md](06-roadmap.md)
 | フェーズ | 内容 | 完了条件 |
 |---|---|---|
 | Phase 0: 判断と確認 | 実クライアント経路と、その段階に必要な判断のみを確認 | J1〜J3は記録済み。オフライン構成ではJ4／J5を保留のまま進められる |
-| Phase 1: ローカル経路での疎通検証 | フォールバック経路（Tailscale / SSH トンネル経由 stdio）で、既存資産（Workbench、REA）と第一候補（GhidraMCP、radare2-mcp）を Windows のローカルクライアントから呼び出す。ツール棚卸しと許可リストの初版を作る | 主要ツールがローカル経路で呼べ、許可リスト初版がある |
+| Phase 1: オフライン基準と搬入 | 既存console・読取り専用ISOで一つの管理下観測を確認。vNICなしguestへのSSHを前提にしない | scope・artifact・証拠fixture。実client経路は隔離network受入後 |
 | Phase 2: ctf-mcp core の実装 | 自作補完（crypto / encoding、軽量観測ツール、共通基盤）を実装する。配置方法（コンテナ基盤の有無、U4）に合わせてゲストへオフライン搬入する | core のツールが Phase 1 の経路で呼べ、トランケート・パス検証・タイムアウトが効いている |
 | Phase 3: 隔離ネットワークの構築 | 決定済みの隔離vNIC1枚・ブリッジ・GW・FWを実装しラボ受入記録を更新。vsock Bは不採用 | 管理下試験網で隔離とGW制御を検証 |
 | Phase 4: 公開経路と ChatGPT 接続 | Secure MCP Tunnelを優先。不可なら認証付きHTTPS。実ChatGPT／Codex経路を受入 | 受入済み機能と調査証拠だけ取得でき、認証・拒否・再接続が合格 |

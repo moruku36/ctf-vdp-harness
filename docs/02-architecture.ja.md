@@ -12,14 +12,14 @@ English version: [02-architecture.md](02-architecture.md)
 ```mermaid
 flowchart LR
     subgraph cloud [OpenAI クラウド]
-        GPT[ChatGPT<br/>Daybreak 系モデル]
+        GPT[ChatGPT<br/>利用者が選ぶモデル]
     end
     subgraph win [Windows PC]
         GPTW[ChatGPT 利用画面]
         CODEX[ローカルクライアント<br/>Codex 等]
     end
     GPTW --- GPT
-    GPT -->|HTTPS / Streamable HTTP<br/>OAuth 認証| CF[Cloudflare Tunnel<br/>公開エンドポイント]
+    GPT -->|HTTPS / Streamable HTTP<br/>OAuth 認証| CF[Secure MCP Tunnel候補<br/>認証付きHTTPSは代替]
     CF --> GW
     CODEX -->|Tailscale 経由<br/>フォールバック| GW
     subgraph nuc [ホームラボ NUC ホスト]
@@ -49,7 +49,7 @@ flowchart LR
 | レイヤー | 配置 | 役割 |
 |---|---|---|
 | クライアント層 | OpenAI クラウド / Windows | ChatGPT が MCP ツールを呼び出す。本線はクラウド側コネクター、フォールバックは Windows のローカルクライアント |
-| 公開層 | Cloudflare Tunnel（ホスト発信） | 公開 HTTPS エンドポイントを提供する。ホストにインバウンドの公開ポートは開けない |
+| クライアント経路 | Secure MCP Tunnel優先、認証付きHTTPSは代替 | アカウント・transport受入は未了。代替経路はhost発信とし、新しい公開着信portを開けない |
 | ゲートウェイ層 | NUC ホスト | 認証検証、ツール許可リスト、監査ログ、ゲストへの中継。ホスト上の既存 mcp-server（読み取り専用レポート用）とは別系統として構築する |
 | 実行層 | QEMU/KVM 解析ゲスト | MCP サーバー群と解析ツール群。隔離セグメントに vNIC を 1 枚だけ持ち、到達はゲートウェイ経由のみ |
 | 対象層 | 外部 | CTF ターゲット。ゲストからの egress はファイアウォールで制御する |
@@ -59,7 +59,7 @@ flowchart LR
 選定の詳細は docs/03。役割分担は次のとおりとし、重複する機能は本家 OSS に寄せて自作を減らす。
 
 - **Workbench MCP（既存）**: 依存関係・静的解析等の土台。基本通信は確認済み。
-- **REA + GhidraMCP**: REA は既存配置を活かす。Ghidra 本体への MCP 接続は、導入済み Ghidra 12.1.4 に対応する GhidraMCP を第一候補とする。REA → Ghidra の解析能力は受入れ未完了である点を引き継ぐ。
+- **REA + GhidraMCP**: REA は既存配置を活かす。Ghidra 本体への MCP 接続は、GhidraMCPを第一候補とするが、導入済みGhidra 12.1.4との互換性は固定revisionで検証する。REA → Ghidra の解析能力は受入れ未完了である点を引き継ぐ。
 - **radare2-mcp**: radare2 公式の MCP サーバー。Gemini 資料が想定していた radare2 系ツール（関数一覧、逆アセンブル等）は、原則としてこちらに寄せる。
 - **ctf-mcp core（自作補完）**: OSS で埋まらない部分のみ。次節。
 - **Burp MCP（PortSwigger 公式拡張）**: Web カテゴリの候補。Burp 本体の配置場所が未決のため、ゲスト内常駐とは別枠で扱う（docs/03、docs/06）。
@@ -78,7 +78,7 @@ Gemini 下調べ資料のツール仕様を「ctf-mcp core」として引き継�
 
 - Python 3.12+ / uv、MCP フレームワークは FastMCP（PrefectHQ/fastmcp）。
 - 実行環境は Kali Linux（kalilinux/kali-rolling）または Ubuntu 24.04 ベースのコンテナ。ゲスト内にコンテナ基盤があるかは未確認（docs/01 U4）のため、配置方法はフェーズ計画で確定する。
-- トランスポートは環境変数で stdio / Streamable HTTP を切り替え可能にし、HTTP 時は Bearer トークン認証を有効化できる構成とする。ただし公開面の終端はゲートウェイ側であり、core 単体を直接公開しない。
+- トランスポートは環境変数で stdio / Streamable HTTP を切り替え可能にし、HTTP時は認証を必須とし、無認証への設定fallbackを作らない。ただし公開面の終端はゲートウェイ側であり、core 単体を直接公開しない。
 
 ### 4.3 リポジトリ構成（計画）
 

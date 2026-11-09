@@ -4,7 +4,7 @@
 
 **Give Moruku's existing ChatGPT/Codex workflow better analysis tools, exploration state, and verifiable evidence through MCP.** This is the design home for that supporting harness, in the `ctf-vdp-harness` repository.
 
-The reasoning and implementation AI stays in the user's chosen client/model (currently described by Moruku as GPT-6 Sol / Daybreak). This project adds an analysis environment around it. It does not provide another autonomous CTF agent, change model weights, or promise better results merely by installing more tools.
+The reasoning and implementation AI stays in the user's chosen client/model (record the actual model and reasoning setting for each run). This project adds an analysis environment around it. It does not provide another autonomous CTF agent, change model weights, or promise better results merely by installing more tools.
 
 ## What this project builds
 
@@ -79,3 +79,9 @@ Prefer existing OSS. Custom code is restricted to missing policy, interface, sta
 | [Offline pilot profile](configs/offline-pilot.example.json) | Non-executable design example; all adapters disabled |
 
 This repository is public; operational evidence remains private. No credentials, real target addresses, flags, or raw session transcripts belong in it. Local evidence storage and an export review are distinct from repository documentation. Only authorized CTF/VDP work is within the intended operating scope.
+
+## Design handoff update — 2026-11-09
+
+Read the [implementation contract and acceptance cases](docs/11-contracts-and-acceptance.md) before implementing. This update specifies state ownership, immutable evidence, retry/recovery behavior and evaluation boundaries; it adds design schemas and synthetic examples only. Runtime implementation belongs to a later AI-led change. No performance result or live integration is claimed.
+
+The three repositories remain independently usable. Optional integration follows the [reference-only handoff contract](https://github.com/moruku36/ai-agent-scientist/blob/main/docs/11-harness-boundaries.md); it does not create shared authority or a new agent runtime.

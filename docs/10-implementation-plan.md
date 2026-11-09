@@ -55,3 +55,7 @@ Check real upstream tool descriptors before mapping proposed names to implementa
 An existing AI can use **one accepted offline analysis capability**, access its original evidence in bounded pages, update a recoverable hypothesis record, obtain an independent local verification result, and produce a reproducible report. Timeouts and disconnects leave no untracked process. The report explicitly says whether any performance gain has been measured.
 
 More tools, live target access, Burp, REA, and competition submission can follow without blocking that first version.
+
+## Detailed implementation contract
+
+[11 Contracts and acceptance](11-contracts-and-acceptance.md) specifies action replay, reservations, evidence pages, recovery/cleanup and CTF-01–12. This delivery is design-only; runtime fixtures remain unexecuted.

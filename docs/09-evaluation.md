@@ -69,3 +69,7 @@ These are proposed pilot gates:
 5. **Broader claims:** require a larger held-out set and repeated matched runs; no numerical improvement is promised in advance.
 
 A small controlled pilot can justify continued engineering; it does not establish bounty eligibility, zero false positives, or general model superiority. [Run report](../templates/run-report.md) records the minimum evidence.
+
+## Detailed implementation contract
+
+[11 Contracts and acceptance](11-contracts-and-acceptance.md) specifies action replay, reservations, evidence pages, recovery/cleanup and CTF-01–12. This delivery is design-only; runtime fixtures remain unexecuted.

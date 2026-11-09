@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Immutable evidence page (design evidence-page/1)",
+  "$comment": "Design contract only. Runtime semantic checks and authorization are required.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "evidence_id",
+    "view_sha256",
+    "view_revision",
+    "encoding",
+    "offset_bytes",
+    "next_offset_bytes",
+    "view_bytes",
+    "content",
+    "capture_complete",
+    "omission_reason",
+    "next_cursor"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "evidence-page/1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "view_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "view_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "encoding": {
+      "enum": [
+        "utf-8",
+        "base64"
+      ]
+    },
+    "offset_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_offset_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "view_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "content": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "capture_complete": {
+      "type": "boolean"
+    },
+    "omission_reason": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "capture_complete": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "omission_reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "capture_complete": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "omission_reason": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

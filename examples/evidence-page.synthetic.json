@@ -1,0 +1,15 @@
+{
+  "schema_version": "evidence-page/1",
+  "run_id": "synthetic-run",
+  "evidence_id": "synthetic-evidence",
+  "view_sha256": "9d2e97d28313616053887dc9f244983486393f20ebfd8852602119d454808ad6",
+  "view_revision": "synthetic-unredacted-1",
+  "encoding": "utf-8",
+  "offset_bytes": 0,
+  "next_offset_bytes": 44,
+  "view_bytes": 44,
+  "content": "Synthetic observation; no target inspected.\n",
+  "capture_complete": true,
+  "omission_reason": null,
+  "next_cursor": null
+}

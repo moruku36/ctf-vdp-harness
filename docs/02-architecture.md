@@ -12,14 +12,14 @@ The exposed surface is consolidated at a gateway on the NUC host, and the analys
 ```mermaid
 flowchart LR
     subgraph cloud [OpenAI cloud]
-        GPT[ChatGPT<br/>Daybreak-series model]
+        GPT[ChatGPT<br/>User-selected model]
     end
     subgraph win [Windows PC]
         GPTW[ChatGPT client screen]
         CODEX[Local client<br/>Codex, etc.]
     end
     GPTW --- GPT
-    GPT -->|HTTPS / Streamable HTTP<br/>OAuth authentication| CF[Cloudflare Tunnel<br/>public endpoint]
+    GPT -->|HTTPS / Streamable HTTP<br/>OAuth authentication| CF[Secure MCP Tunnel candidate<br/>authenticated HTTPS fallback]
     CF --> GW
     CODEX -->|via Tailscale<br/>fallback| GW
     subgraph nuc [Home lab NUC host]
@@ -49,7 +49,7 @@ flowchart LR
 | Layer | Placement | Role |
 |---|---|---|
 | Client layer | OpenAI cloud / Windows | ChatGPT calls the MCP tools. The main path is the cloud-side connector; the fallback is a local client on Windows |
-| Publication layer | Cloudflare Tunnel (outbound from host) | Provides the public HTTPS endpoint. No inbound public ports are opened on the host |
+| Client route | Secure MCP Tunnel first; authenticated HTTPS fallback | Account/transport acceptance is pending. The fallback uses an outbound host tunnel without new public inbound ports |
 | Gateway layer | NUC host | Authentication verification, tool allowlist, audit logging, relay to the guest. Built as a separate system from the existing mcp-server on the host (for read-only reports) |
 | Execution layer | QEMU/KVM analysis guest | The MCP server set and analysis tool set. Has exactly one vNIC on the isolated segment, reachable only via the gateway |
 | Target layer | External | CTF targets. Egress from the guest is controlled by a firewall |
@@ -59,7 +59,7 @@ flowchart LR
 Selection details are in docs/03. The division of roles is as follows; overlapping functionality is delegated to the upstream OSS to reduce in-house development.
 
 - **Workbench MCP (existing)**: The foundation for dependency and static analysis, etc. Basic communication has been verified.
-- **REA + GhidraMCP**: REA uses the existing placement. For MCP connection to the Ghidra core, GhidraMCP, which supports the installed Ghidra 12.1.4, is the first candidate. The fact that the REA → Ghidra analysis capability has not completed acceptance is carried over.
+- **REA + GhidraMCP**: REA uses the existing placement. For MCP connection to the Ghidra core, GhidraMCP is the first candidate; compatibility with installed Ghidra 12.1.4 must be tested at a pinned revision. The fact that the REA → Ghidra analysis capability has not completed acceptance is carried over.
 - **radare2-mcp**: The official radare2 MCP server. The radare2-type tools the Gemini material assumed (function listing, disassembly, etc.) are in principle delegated to this.
 - **ctf-mcp core (in-house gap-filler)**: Only the parts OSS does not cover. See the next section.
 - **Burp MCP (official PortSwigger extension)**: A candidate for the web category. Because the placement of the Burp core is undecided, it is handled separately from residency inside the guest (docs/03, docs/06).
@@ -78,7 +78,7 @@ The tool specifications of the Gemini advance-research material are carried over
 
 - Python 3.12+ / uv; the MCP framework is FastMCP (PrefectHQ/fastmcp).
 - The execution environment is a container based on Kali Linux (kalilinux/kali-rolling) or Ubuntu 24.04. Whether a container platform exists inside the guest is unverified (docs/01 U4), so the placement method is finalized in the phase plan.
-- The transport can be switched between stdio and Streamable HTTP via environment variables, with Bearer token authentication enableable over HTTP. However, the exposed surface terminates at the gateway side; core alone is never published directly.
+- The transport can be switched between stdio and Streamable HTTP via environment variables, with authentication required on every HTTP path (no unauthenticated configuration fallback). However, the exposed surface terminates at the gateway side; core alone is never published directly.
 
 ### 4.3 Repository Structure (Planned)
 

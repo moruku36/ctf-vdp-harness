@@ -2,9 +2,12 @@
 
 日本語版: [01-requirements.ja.md](01-requirements.ja.md)
 
+
+Historical observations below come from the cited 2026-10-20 lab record, not a fresh inspection. J2 approved an isolated vNIC on 2026-11-02; actual installation and acceptance remain unverified.
+
 ## 1. Purpose
 
-Build, in an isolated environment in the home lab, a set of MCP tools that ChatGPT (Daybreak-series models) can call during CTF competitions. This document defines the requirements and premises. The scope covers design only; implementation is work for later phases.
+Support the user's existing ChatGPT/Codex AI in authorized CTF and VDP work with an isolated analysis harness exposed through MCP. This document records the requirements and lab premises; docs/07–10 add research, logical design, evaluation and implementation packages. The scope is design only.
 
 ## 2. Functional Requirements
 
@@ -25,13 +28,13 @@ These carry over the design principles of the Gemini advance-research material (
 
 | # | Principle | Reason |
 |---|---|---|
-| N1 | As a rule, do not implement or adopt an arbitrary shell-command execution tool (such as `exec_shell`) | It easily triggers refusals by the model's guardrails, and is also less safe |
-| N2 | Define all tools at a fine granularity as "observation, static analysis, and deterministic helpers," with explicit input/output schemas | Improves analysis accuracy and prevents tool misuse |
+| N1 | Do not implement or adopt an arbitrary shell-command tool such as `exec_shell` | Enforce least privilege, typed operations and reproducible execution boundaries |
+| N2 | Define typed, bounded observation/static/helper tools by default; accept dynamic execution in a separate profile only | Improves analysis accuracy and prevents tool misuse |
 | N3 | Provide output truncation on all tools (`max_lines` / `max_chars`, default around 4,000 characters) and return structured responses (JSON) | Protects the context window |
 | N4 | For tools that accept file paths, forcibly verify that the path is under the workspace, and block path traversal | Limits the access scope within the guest |
 | N5 | Execute subprocesses in a `shell=False`-equivalent manner, and set a timeout on all commands (default 60 seconds, configurable) | Prevents command injection and runaway execution |
 | N6 | Require authentication (Bearer / OAuth) on HTTP-based transports | Defense premised on a public path |
-| N7 | Tools can be enabled/disabled per category. Network-emitting tools are enabled only during competitions | Reduces the attack surface in normal times |
+| N7 | Tools can be enabled/disabled per category. Network-emitting tools require an authorized, expiring CTF/VDP run profile | Reduces the attack surface in normal times |
 
 ## 4. Premises (Confirmed Facts)
 
@@ -60,10 +63,20 @@ The following could not be confirmed as of this design and are not asserted. Ver
 
 | # | Unverified item | Impact |
 |---|---|---|
-| U1 | The exact specification of ChatGPT's custom MCP connector (whether public HTTPS + Streamable HTTP + OAuth is mandatory). Secondary information is broadly consistent, but direct confirmation in OpenAI's official documentation is not yet complete | Finalizing the publication path method |
-| U2 | Whether connectors can be added under Moruku's plan (Daybreak series), and whether write-type (action) tools are permitted. Secondary information contains both claims: "Plus/Pro are read-only only" and "writing is possible in developer mode" | Design of the tool exposure scope |
+| U1 | General product support was checked in official documentation on 2026-11-09: ChatGPT custom MCP plugins support read/write, streaming HTTP/SSE and a tunnel option. Exact client/account integration is not accepted yet (see docs/08) | End-to-end route and authentication acceptance |
+| U2 | Whether the actual account/workspace enables the needed tools and connection flow; model UI labels are not subscription entitlements | Available client tool surface |
 | U3 | Whether OpenAI's Secure MCP Tunnel can be used in Moruku's environment | Whether the alternative publication method works |
 | U4 | Whether a container platform such as Docker is already installed in the current guest | How ctf-mcp core is placed |
 | U5 | The host (NUC)'s total resources and free capacity (the ceiling for guest expansion) | Scale of the expansion proposal |
 | U6 | Details of REA's transport type, license, etc. | How it is incorporated into the connectivity design |
-| U7 | Whether AI and automation tools may be used under each CTF competition's rules | Operational feasibility (checked per competition) |
+| U7 | Actual CTF/VDP rules for AI, automation, targets, allowed operations, rate limits and reporting | Per-run scope and operational feasibility |
+
+## 7. Harness requirements added 2026-11-09
+
+- Keep the existing AI as the reasoning/implementation actor; no replacement agent.
+- Persist bounded sessions, action history and evidence-backed hypotheses; retain retrievable originals under access control.
+- Enforce run-specific scope and budgets independently of client prompts; separate offline, dynamic and network profiles.
+- Distinguish audit summaries, private evidence and reviewed exports.
+- Independently verify claims and compare matched-budget baselines before asserting improved performance.
+
+Details: [design](08-analysis-harness.md), [evaluation](09-evaluation.md), [implementation](10-implementation-plan.md).

@@ -1,75 +1,56 @@
-# 04 Connectivity Path Design
+# 04 Connectivity Design
 
-日本語版: [04-connectivity.ja.md](04-connectivity.ja.md)
+[日本語](04-connectivity.ja.md) | [Home](../README.md)
 
-## 1. The Core Problem
+Updated 2026-11-09. This is a planned route, not evidence of installation. The historical guest has no vNIC and is reachable only through the host serial console and loopback VNC.
 
-The current analysis guest has no virtual NIC. The only access paths are the host's serial console and loopback-only VNC, and it cannot be reached over the network from either ChatGPT or Windows.
+## 1. Current decision and product evidence
 
-Meanwhile, ChatGPT connects from OpenAI's cloud side. Within the range of secondary information, the custom MCP connector is said to require a "public HTTPS endpoint (Streamable HTTP, or SSE) + OAuth authentication," and a local stdio server cannot be registered directly (direct confirmation in OpenAI's official documentation is not yet complete = unverified. The verification method is in docs/06).
+The 2026-11-02 record is authoritative: **add exactly one isolated-segment vNIC (J2)**; prioritize Secure MCP Tunnel when usable (J1); measure before deciding expansion scale (J3). The vsock alternative is not the selected implementation. Reconcile the lab's earlier no-NIC acceptance record before commissioning the changed isolation model.
 
-In other words, this design must squarely address the following two changes.
+Official [ChatGPT custom MCP documentation](https://developers.openai.com/api/docs/guides/custom-mcp-server) describes read/write tools, streaming HTTP/SSE, authentication choices and a Secure MCP Tunnel option. Thus a public URL and mandatory OAuth for every server are not universal product requirements. This project's analysis gateway nevertheless requires authenticated access. Actual account/workspace availability and end-to-end acceptance remain unverified.
 
-1. Newly establishing a network reachability path to the guest (or a host-side termination point acting on its behalf).
-2. Controlling that path in a way that does not expose the home LAN and does not break the intent of isolation.
+The [official Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) describes stdio and Streamable HTTP. Local configuration is not automatically a ChatGPT web plugin connection. Test the actual client rather than treating all ChatGPT/Codex surfaces as interchangeable.
 
-## 2. Comparison of Options
+## 2. Routes
 
-| Option | Path | Reachable from ChatGPT | Isolation preserved | Implementation cost | Notes |
-|---|---|---|---|---|---|
-| A. Public HTTPS (Tunnel) + isolated-segment vNIC | ChatGPT → Cloudflare Tunnel → host GW → isolated segment → guest | Yes (assumed to satisfy the connector specification) | Premised on adding a vNIC. Preservable depending on FW design | Medium | **Recommended (main line)**. The Tunnel is established by outbound connections from the host, so no public ports are opened on the host |
-| B. No vNIC + host proxy (vsock relay) | ChatGPT → Tunnel → host GW → virtio-vsock → in-guest server | Yes (the public termination is the same as A) | Most faithful (the guest is given no IP network) | High | The in-guest server side needs vsock support or a relay (socat, etc.). Relaying stdio-type servers works well, but aggregating HTTP-type and multiple servers requires ingenuity on the gateway side |
-| C. stdio via SSH tunnel | Local client → SSH → stdio server started inside the guest | No (because ChatGPT is on the cloud side) | Can be established via the host management path even without a vNIC | Low | The method the Gemini material assumed. Effective as a development/verification path dedicated to local clients on Windows (Codex, etc.) |
-| D. Via Tailscale | Local client → tailnet → NUC host GW → guest | No (the OpenAI cloud does not participate in the tailnet) | The host already participates in Tailscale, so new setup cost is small | Low | The main choice for the fallback path. Not a substitute for ChatGPT |
-| E. OpenAI Secure MCP Tunnel | ChatGPT → OpenAI's tunnel mechanism → local side | Unverified | May avoid having a public endpoint | Unverified | Secondary information exists that this is an official private connectivity method. Whether it can be used in Moruku's Daybreak environment is unverified, so it is not relied on until confirmed |
+| Route | Purpose / disposition |
+|---|---|
+| E: Secure MCP Tunnel → host gateway → isolated guest segment | First connection candidate, subject to actual account, authentication and runtime acceptance. Does not grant broader tools or egress. |
+| A: Authenticated HTTPS tunnel → host gateway → isolated guest segment | Fallback if E is unavailable. Existing Cloudflare Tunnel + Access + MCP authentication proposal retained. Compatibility of layered authentication must be tested by the actual MCP client. |
+| D: Local client → Tailscale → host gateway → isolated guest segment | Local development/fallback after the host-to-guest route is commissioned. Tailnet membership is not granted to a cloud client by implication. |
+| C: Local stdio relay via authenticated host management path | Optional development route. No ordinary SSH-to-guest path exists in the recorded no-vNIC state. Use an accepted relay/console workflow, or the approved isolated segment; do not claim this already works. |
+| B: Host proxy / virtio-vsock without vNIC | Historical alternative only; not selected under J2. |
 
-## 3. Recommended Option
+First accept the smallest offline analysis path. Remote reachability is a separate milestone; a local tools/list result is not proof that ChatGPT can use the analyzers.
 
-**The main line is A, with C and D used together for verification and fallback.** B is kept as the alternative if the decision becomes "absolutely do not add a vNIC." If E is confirmed usable, it could replace the public part of A.
+## 3. Isolated segment
 
-The reason for staged introduction is that the public path (A) only becomes safe once authentication, allowlists, and the firewall are all in place. First, verify connectivity and behavior of the tool set from local clients via C and D, and open A only after the controls are solidified (docs/06).
+Add one guest vNIC on a dedicated host bridge separated from the home LAN. The host gateway reaches only accepted guest MCP ports. The guest has no general Internet route or access to host management services. Target traffic is relayed/controlled by the gateway or host firewall, with explicit per-run policy.
 
-## 4. Details of the Recommended Option (A)
+| Direction | Policy |
+|---|---|
+| Gateway → accepted guest MCP ports | Allow only the selected service identity/path |
+| Other inbound → guest | Deny |
+| Guest → home LAN, host management, metadata services | Deny; no management reachability through target aliases |
+| Guest/relay → authorized CTF/VDP target | Default deny; scoped profile only, within destination/time/rate budgets |
+| Guest → arbitrary Internet / arbitrary DNS | Deny |
+| Maintenance acquisition | Separate controlled maintenance procedure outside task runs; no implicit target permission |
 
-### 4.1 Guest-Side Network Addition
+Firewall and application checks are independent. Validate resolved addresses and every redirect/new connection; proxy/browser/adapter bypass paths must obey the same scope. Record sanitized destinations/times. Concrete addresses and credentials belong outside the repository.
 
-- Add exactly one vNIC to the guest and connect it to a host bridge dedicated to the isolated segment. This bridge is separated from the home LAN segment and is given no routing.
-- As a rule, the only party the guest can communicate with is the gateway on the host. Communication toward CTF targets is basically relayed and controlled on the gateway side (or by the host's FW), and the guest is not given direct reachability to the Internet by default.
+## 4. External connection boundary
 
-### 4.2 Firewall Policy (default: deny all)
+The host, not the guest, terminates the client-facing route. Keep the existing read-only report MCP service, management console and other services outside this endpoint. A tunnel must not become a general port forward.
 
-| Direction | Source → Destination | Policy |
-|---|---|---|
-| inbound | Gateway → guest's MCP ports | Allow (only this path) |
-| inbound | Everything else → guest | Deny |
-| lateral | Guest → home LAN segment | **Deny all** (create no reachability path) |
-| lateral | Guest → host's management plane (SSH, console, etc.) | Deny |
-| outbound | Guest / relay → CTF targets (organizer-provided endpoints) | Allow only during competitions. Log destinations and times |
-| outbound | Guest → general Internet | Deny by default. If needed for tool acquisition, etc., operate with temporary allowance limited to maintenance windows outside competitions |
+For the HTTPS fallback, keep host-originated tunnel establishment and no newly opened public inbound router/host ports. The previous OAuth-first gateway policy remains; a bare unauthenticated server is not a fallback. Validate token audience/expiry, principal-to-run binding, authentication failures, catalog filtering, evidence access and reconnect. Do not confuse Cloudflare browser login with usable MCP authentication.
 
-- DNS is also subject to control, closing paths by which the guest communicates externally via arbitrary name resolution (resolution is relayed on the host side, or allowed only during competitions).
-- Concrete values such as addresses are decided in the design/implementation phase and are not written in this document.
+For Secure MCP Tunnel, accept actual client binding and authenticated identity, not simply process startup. Adopt only when it provides the required access controls in this environment. Do not weaken server-side scope enforcement on any local/tunnel path.
 
-### 4.3 Public Side (Host → ChatGPT)
+## 5. Materials, target access and rollback
 
-- Cloudflare Tunnel (cloudflared) runs on the NUC host and relays from the public HTTPS endpoint to the host's gateway over an outbound connection. No inbound public ports are opened on the router or the host.
-- Authentication is two-layered. In addition to access control on the Tunnel side (Cloudflare Access, etc.), the gateway verifies MCP authentication (OAuth 2.1, or Bearer tokens). Because the authentication method required by the ChatGPT-side connector is unverified, finalization comes after specification confirmation (docs/06).
-- Only the gateway's MCP endpoint is published; the management console and other host services are not published over the same path.
+Keep the existing read-only ISO intake with `noexec,nosuid,nodev`. Optional CTFd download is a later acquisition/staging capability: content must still pass intake validation and the offline transfer process; it does not directly mount network downloads into the analysis workspace.
 
-## 5. Fallback Paths (C and D)
+Competition mode becomes a scoped run profile for authorized CTF or VDP work. An authorized target definition, expiry and operation budget replace an unrestricted “network on” switch. Before a run: snapshot, scope and tool checks. After: stop sessions, revoke temporary egress, preserve permitted evidence through the bounded importer and restore the guest. Network permission does not authorize external flag or vulnerability-report submission.
 
-- From local clients on Windows (Codex, etc.), a path connecting to the host's gateway via Tailscale is provided. Because the host already participates in Tailscale, no additional publication is needed.
-- stdio-type MCP servers (radare2-mcp, the GhidraMCP bridge, etc.) can also be used via the method of relaying stdio over an SSH tunnel (C). This path is the simplest during development and debugging.
-- On the fallback paths as well, authentication and allowlists are enforced identically on the gateway/server side. Controls are not weakened depending on the path.
-
-## 6. Reaching CTF Targets
-
-In many CTFs, it is necessary to actively connect to instances provided by the organizer (endpoint host and port). Outbound is therefore essential, but it is not made unlimited egress.
-
-- "Competition mode," which Moruku enables at the start of a competition and disables at the end, is the unit of operation.
-- Destinations are recorded in the audit log so they can be reviewed after the competition.
-- Access to organizer sites, such as downloading challenge files, is placed under the same controls.
-
-## 7. Material Intake Path (unchanged)
-
-Intake of challenge files and similar materials maintains the existing read-only ISO path. Even after a network path exists, intake of analysis targets is not shifted to the network. This preserves the current operating principle that "analysis targets are always brought in offline."
+[Security](05-security.md) | [Logical harness](08-analysis-harness.md) | [Implementation plan](10-implementation-plan.md)

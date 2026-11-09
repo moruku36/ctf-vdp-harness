@@ -8,16 +8,16 @@ Publication is done last. First verify over local paths, and open the public pat
 
 | Phase | Content | Completion criteria |
 |---|---|---|
-| Phase 0: Decisions and confirmations | Finalizing the "decision points" below. Includes confirming the ChatGPT-side connector specification (C1) | Decision points J1–J5 are all decided |
+| Phase 0: Decisions and confirmations | Confirm the actual client route and only the decisions needed by the current slice | J1–J3 preferences recorded; J4/J5 may remain deferred for an offline slice |
 | Phase 1: Connectivity verification over local paths | Over the fallback paths (stdio via Tailscale / SSH tunnel), call the existing assets (Workbench, REA) and first candidates (GhidraMCP, radare2-mcp) from a local client on Windows. Perform a tool inventory and create the first version of the allowlist | Main tools can be called over local paths, and a first-version allowlist exists |
 | Phase 2: Implementation of ctf-mcp core | Implement the in-house gap-fillers (crypto / encoding, lightweight observation tools, shared foundation). Bring them into the guest offline, according to the placement method (whether a container platform exists, U4) | Core's tools can be called over the Phase 1 paths, and truncation, path validation, and timeouts are effective |
-| Phase 3: Isolated network construction | Add an isolated-segment vNIC to the guest (if J2 decided it is acceptable), and build the bridge, gateway, and firewall. If option B (vsock) is adopted, build that relay instead | Each FW policy (docs/04) can be verified, and unreachability to the home LAN can be confirmed |
-| Phase 4: Public path and ChatGPT connection | Publish via Cloudflare Tunnel (or Secure MCP Tunnel, J1), enable authentication (OAuth, etc.), and connect from ChatGPT | Only tools on the allowlist can be called from ChatGPT, and records remain in the audit log |
+| Phase 3: Isolated network construction | Implement the approved single isolated vNIC, bridge, gateway and firewall; update lab acceptance records. vsock B is not selected | Isolation and gateway policies are verified in a controlled fixture network |
+| Phase 4: Public path and ChatGPT connection | Secure MCP Tunnel first; authenticated HTTPS fallback if unavailable. Accept the actual ChatGPT/Codex route | Only accepted tools and run evidence are reachable; auth/deny/reconnect cases pass |
 | Phase 5: Operations | Make competition mode (pre-start snapshot, egress enablement, post-end rollback and disablement), audit log review, and tool/allowlist review part of regular operations | One full competition can be run through with these procedures |
 
 Resource expansion (J3): after seeing the Phase 1 verification results (measured shortfalls against the current specifications), the scale is finalized and it is carried out by Phase 3.
 
-## 2. Decision Points (Moruku's decision required)
+## 2. Decision Register (original options; status follows below)
 
 | # | Decision item | Options / issues | Affected phase |
 |---|---|---|---|
@@ -39,8 +39,8 @@ Resource expansion (J3): after seeing the Phase 1 verification results (measured
 
 | # | Item to confirm | Confirmation method |
 |---|---|---|
-| C1 | The exact specification of the ChatGPT custom MCP connector (public HTTPS / Streamable HTTP / whether OAuth is required) | Check OpenAI's official documentation (developer connectors / Apps SDK deployment requirements) directly. This design does not assert it based on secondary information alone |
-| C2 | Whether connectors can be added and write-type tools used under Moruku's plan (Daybreak series) | In Moruku's ChatGPT settings screen, check the flow for adding connectors and whether developer-mode-equivalent settings exist. Secondary information contains both claims: "Plus/Pro are read-only" and "writing is possible in developer mode" |
+| C1 | General MCP product support checked 2026-11-09; exact integration still pending | Official sources in docs/08; exercise the chosen transport and authentication with the actual client |
+| C2 | Actual account/workspace availability of custom MCP tools | Check the current account flow and restrictions. Official general read/write support does not prove this account's entitlement; Daybreak is not a plan identifier |
 | C3 | Whether OpenAI Secure MCP Tunnel can be used in Moruku's environment | Check the official documentation and whether a tunnel option exists in the actual settings screen |
 | C4 | Whether the current guest has a container platform (Docker, etc.) | Check inside the guest via the host's serial console (possible with the existing management path) |
 | C5 | The host (NUC)'s total resources and current usage | Check on the host (within the scope of existing operational information) |
@@ -51,3 +51,11 @@ Resource expansion (J3): after seeing the Phase 1 verification results (measured
 - Depending on the results for the ChatGPT-side specifications (C1, C2), the public path design may change. In particular, if it turns out that "write-type tools are not allowed," the tool exposure scope needs redesign toward read-only and analysis types (even in that case, the Phase 1–3 assets remain useful on the fallback paths).
 - The vNIC addition must be reconciled with the lab-side acceptance records (Scope A premises). Updating the records on the home-ai-engineering-lab side, not only the design documents, is included in the work.
 - The state of the OSS candidates (licenses, updates, tool contents) is premised on re-confirmation at introduction time (docs/03).
+
+## 5. Research-based harness plan (2026-11-09)
+
+The logical implementation sequence is now [P0–P8 in docs/10](10-implementation-plan.md): baseline → offline contracts/evidence → one analyzer → state/recovery → selective sessions → matched evaluation → client route → scoped network/VDP → optional expansion. This refines the earlier infrastructure phases; their dependencies still apply. No phase is marked executed by this update.
+
+J1/J2/J3 decisions above are preserved verbatim and need no renewed blanket confirmation. J4/J5 remain on hold and are not blockers for the initial offline vertical slice. The old Cloudflare-first ordering is superseded by the recorded Secure MCP Tunnel preference. No unconditional public endpoint is required. General official product support is now sourced; account-specific availability, resources, actual vNIC installation and tool acceptance remain unverified.
+
+Performance acceptance is defined in [docs/09](09-evaluation.md), rather than inferred from the number of installed tools. VDP target rules and reproducibility are separate from CTF exact-answer verification. This remains a design-only change.

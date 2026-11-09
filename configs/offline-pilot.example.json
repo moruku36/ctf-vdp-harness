@@ -1,0 +1,47 @@
+{
+  "schema_version": "design-example-1",
+  "executable": false,
+  "profile": "offline_ctf",
+  "description": "Design example only; no runtime currently consumes this file.",
+  "client": {
+    "kind": "OPERATOR_SELECTED",
+    "model_label": "RECORD_ACTUAL_UI_LABEL",
+    "instruction_revision": "PIN_BEFORE_EVALUATION"
+  },
+  "scope": {
+    "task_id": "OWNED_LOCAL_FIXTURE",
+    "revision": "EXAMPLE_ONLY",
+    "authorization_reference": "REQUIRED_LOCAL_RECORD",
+    "expires_at": null
+  },
+  "network": {
+    "enabled": false,
+    "allowed_targets": [],
+    "external_submission": false
+  },
+  "execution": {
+    "adapters_enabled": [],
+    "arbitrary_shell": false,
+    "dynamic_execution": false,
+    "heavy_job_concurrency": 1,
+    "interactive_session_limit": 1,
+    "action_timeout_seconds": 60,
+    "session_idle_seconds": 900,
+    "run_budget_seconds": 1800,
+    "max_tool_calls": 40,
+    "max_output_chars_per_page": 4000,
+    "max_evidence_bytes_per_run": 104857600
+  },
+  "evidence": {
+    "storage": "PRIVATE_LOCAL_VAULT_PLACEHOLDER",
+    "cross_run_access": false,
+    "automatic_git_export": false,
+    "retention_policy_reference": "SET_FROM_RULES",
+    "audit_raw_output": false
+  },
+  "acceptance": {
+    "require_pinned_revisions": true,
+    "require_scope_validation": true,
+    "require_registered_verifier": true
+  }
+}

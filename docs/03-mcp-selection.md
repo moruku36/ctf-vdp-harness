@@ -2,6 +2,9 @@
 
 日本語版: [03-mcp-selection.ja.md](03-mcp-selection.ja.md)
 
+
+**2026-11-09 adoption boundary:** The historical table below is not a fresh compatibility or source-code audit. [Research mapping](07-research-to-design.md) distinguishes design inspiration from dependencies. Pin licenses/revisions/transports and accept real fixtures before enabling adapters. HexStrike's exclusion remains; REA and Burp decisions remain pending. Start with a small category-specific catalog.
+
 ## 1. Selection Policy
 
 - Existing assets (the Workbench MCP and REA already placed in the guest) are positioned first.

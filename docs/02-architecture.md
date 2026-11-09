@@ -82,10 +82,10 @@ The tool specifications of the Gemini advance-research material are carried over
 
 ### 4.3 Repository Structure (Planned)
 
-Based on the directory structure in the material, with names unified to `ctf-mcp`.
+Based on the directory structure in the material. The repository root is `ctf-vdp-harness`; the planned internal helper/package names remain `ctf-mcp core` / `ctf_mcp`.
 
 ```text
-ctf-mcp/
+ctf-vdp-harness/
 ├── README.md
 ├── docs/            # This design document set
 ├── compose.yaml     # Container configuration inside the guest (planned)

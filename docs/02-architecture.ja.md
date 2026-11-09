@@ -82,10 +82,10 @@ Gemini 下調べ資料のツール仕様を「ctf-mcp core」として引き継�
 
 ### 4.3 リポジトリ構成（計画）
 
-資料のディレクトリ構成を基に、名称を `ctf-mcp` に統一する。
+資料のディレクトリ構成を基に、リポジトリのルート名を `ctf-vdp-harness` とする。予定する内部ヘルパー／パッケージ名 `ctf-mcp core`／`ctf_mcp` は維持する。
 
 ```text
-ctf-mcp/
+ctf-vdp-harness/
 ├── README.md
 ├── docs/            # 本設計ドキュメント一式
 ├── compose.yaml     # ゲスト内コンテナ構成（計画）

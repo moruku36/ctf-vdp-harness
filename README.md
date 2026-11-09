@@ -1,8 +1,8 @@
-# CTF/VDP Analysis Harness
+# CTF VDP Harness
 
 [日本語](README.ja.md) | English
 
-**Give Moruku's existing ChatGPT/Codex workflow better analysis tools, exploration state, and verifiable evidence through MCP.** This is the design home for that supporting harness, under the existing repository name `ctf-mcp`.
+**Give Moruku's existing ChatGPT/Codex workflow better analysis tools, exploration state, and verifiable evidence through MCP.** This is the design home for that supporting harness, in the `ctf-vdp-harness` repository.
 
 The reasoning and implementation AI stays in the user's chosen client/model (currently described by Moruku as GPT-6 Sol / Daybreak). This project adds an analysis environment around it. It does not provide another autonomous CTF agent, change model weights, or promise better results merely by installing more tools.
 

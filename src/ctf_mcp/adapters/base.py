@@ -453,6 +453,8 @@ class BaseAdapter(ABC):
         usage = UsageMetrics(
             wall_ms=sub_res.wall_ms,
             output_bytes=sub_res.output_bytes,
+            peak_rss_bytes=sub_res.peak_rss_bytes,
+            cpu_ms=sub_res.cpu_ms,
         )
         summary = self._summarize_result(action, sub_res)
 

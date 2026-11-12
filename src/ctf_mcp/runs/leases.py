@@ -573,6 +573,8 @@ class LeaseManager:
         run_id: str | None = None,
         max_age_seconds: int = 60,
         expiry_reason: str = "reservation_expired_before_launch",
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
         manage_run_budget: bool = True,
         now: datetime | None = None,
     ) -> list[ActionSubmission]:
@@ -605,6 +607,10 @@ class LeaseManager:
                     usage=UsageMetrics(wall_ms=0, output_bytes=0),
                     expiry_reason=expiry_reason,
                     summary=expiry_reason,
+                    usage_unknown=False,
+                    heavy_job_slot=heavy_job_slot,
+                    interactive_session_slot=interactive_session_slot,
+                    cleanup_confirmed=True,
                     manage_run_budget=manage_run_budget,
                     now=ts,
                 )
@@ -617,6 +623,8 @@ class LeaseManager:
         run_id: str | None = None,
         max_age_seconds: int = 60,
         expiry_reason: str = "reservation_expired_before_launch",
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
         now: datetime | None = None,
     ) -> list[ActionSubmission]:
         """Expire stale ``reserved`` actions inside an atomic transaction."""
@@ -626,6 +634,8 @@ class LeaseManager:
                 run_id=run_id,
                 max_age_seconds=max_age_seconds,
                 expiry_reason=expiry_reason,
+                heavy_job_slot=heavy_job_slot,
+                interactive_session_slot=interactive_session_slot,
                 manage_run_budget=True,
                 now=now,
             )

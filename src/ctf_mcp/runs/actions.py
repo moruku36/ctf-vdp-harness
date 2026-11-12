@@ -57,6 +57,47 @@ def _parse_dt(raw: str) -> datetime:
     return _normalize_utc(dt)
 
 
+ACTION_BUDGET_SLOTS_DDL = """
+CREATE TABLE IF NOT EXISTS action_budget_slots (
+    action_id TEXT PRIMARY KEY REFERENCES actions(action_id) ON DELETE CASCADE,
+    heavy_job_slot INTEGER NOT NULL DEFAULT 0,
+    interactive_session_slot INTEGER NOT NULL DEFAULT 0,
+    managed_by_action INTEGER NOT NULL DEFAULT 1
+);
+"""
+
+
+def ensure_action_slots_schema_in_tx(conn: sqlite3.Connection) -> None:
+    """Create the ``action_budget_slots`` auxiliary table idempotently."""
+    conn.execute(ACTION_BUDGET_SLOTS_DDL)
+
+
+def _lookup_action_slots_in_tx(
+    conn: sqlite3.Connection, action_id: str
+) -> tuple[bool, bool, bool] | None:
+    """Return ``(heavy_job_slot, interactive_session_slot, managed_by_action)`` if recorded."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'action_budget_slots'"
+    ).fetchone()
+    if exists is None:
+        return None
+    row = conn.execute(
+        """
+        SELECT heavy_job_slot, interactive_session_slot, managed_by_action
+        FROM action_budget_slots
+        WHERE action_id = ?
+        """,
+        (action_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return (
+        bool(row["heavy_job_slot"]),
+        bool(row["interactive_session_slot"]),
+        bool(row["managed_by_action"]),
+    )
+
+
 def _row_to_action_record(row: sqlite3.Row) -> ActionRecord:
     return ActionRecord(
         run_id=str(row["run_id"]),
@@ -327,6 +368,8 @@ class ActionManager:
         sanitized_args: dict[str, Any] | None = None,
         reserved_ms: int | None = None,
         reserved_bytes: int | None = None,
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
         manage_run_budget: bool = True,
         now: datetime | None = None,
     ) -> ActionSubmission:
@@ -416,6 +459,12 @@ class ActionManager:
             raise BudgetExceededError("Action budget reservation must be strictly positive.")
 
         if manage_run_budget:
+            eff_heavy = True if heavy_job_slot is None else bool(heavy_job_slot)
+            eff_session = (
+                ExecutionClass.DYNAMIC in capability.execution_classes
+                if interactive_session_slot is None
+                else bool(interactive_session_slot)
+            )
             remaining_ms = int(run_row["remaining_ms"])
             remaining_bytes = int(run_row["remaining_bytes"])
             remaining_calls = int(run_row["remaining_calls"])
@@ -437,7 +486,7 @@ class ActionManager:
                     "Run evidence byte budget exhausted.",
                     details={"run_id": run_id, "remaining_bytes": remaining_bytes},
                 )
-            if active_heavy >= budget_spec.heavy_job_concurrency:
+            if eff_heavy and active_heavy >= budget_spec.heavy_job_concurrency:
                 raise BudgetExceededError(
                     "Heavy job concurrency limit reached.",
                     details={
@@ -446,10 +495,7 @@ class ActionManager:
                         "limit": budget_spec.heavy_job_concurrency,
                     },
                 )
-            if (
-                ExecutionClass.DYNAMIC in capability.execution_classes
-                and active_sessions >= budget_spec.interactive_session_limit
-            ):
+            if eff_session and active_sessions >= budget_spec.interactive_session_limit:
                 raise BudgetExceededError(
                     "Interactive session concurrency limit reached.",
                     details={
@@ -462,6 +508,8 @@ class ActionManager:
             # Short remaining run budget lowers executable allowance before dispatch.
             effective_ms = min(desired_ms, remaining_ms)
             effective_bytes = min(desired_bytes, remaining_bytes)
+            inc_heavy = 1 if eff_heavy else 0
+            inc_sessions = 1 if eff_session else 0
 
             cur = conn.execute(
                 """
@@ -469,15 +517,29 @@ class ActionManager:
                 SET remaining_ms = remaining_ms - ?,
                     remaining_bytes = remaining_bytes - ?,
                     remaining_calls = remaining_calls - 1,
-                    active_heavy_jobs = active_heavy_jobs + 1,
+                    active_heavy_jobs = active_heavy_jobs + ?,
+                    active_sessions = active_sessions + ?,
                     revision = revision + 1
                 WHERE run_id = ? AND revision = ?
                 """,
-                (effective_ms, effective_bytes, run_id, current_revision),
+                (
+                    effective_ms,
+                    effective_bytes,
+                    inc_heavy,
+                    inc_sessions,
+                    run_id,
+                    current_revision,
+                ),
             )
             if cur.rowcount != 1:
                 raise ActionConflictError("Concurrent modification while reserving run budget.")
         else:
+            eff_heavy = bool(heavy_job_slot) if heavy_job_slot is not None else False
+            eff_session = (
+                bool(interactive_session_slot)
+                if interactive_session_slot is not None
+                else False
+            )
             effective_ms = desired_ms
             effective_bytes = desired_bytes
             cur = conn.execute(
@@ -550,6 +612,20 @@ class ActionManager:
                 ts_iso,
             ),
         )
+        ensure_action_slots_schema_in_tx(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO action_budget_slots (
+                action_id, heavy_job_slot, interactive_session_slot, managed_by_action
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                record.action_id,
+                1 if eff_heavy else 0,
+                1 if eff_session else 0,
+                1 if manage_run_budget else 0,
+            ),
+        )
         return ActionSubmission(action=record, envelope=None, replayed=False)
 
     def submit_action(
@@ -561,6 +637,8 @@ class ActionManager:
         capability: CapabilityDescriptor,
         scope_revision: str,
         sanitized_args: dict[str, Any] | None = None,
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
         now: datetime | None = None,
     ) -> ActionSubmission:
         """Reserve a new action or replay an existing idempotent submission."""
@@ -573,6 +651,8 @@ class ActionManager:
                 capability=capability,
                 scope_revision=scope_revision,
                 sanitized_args=sanitized_args,
+                heavy_job_slot=heavy_job_slot,
+                interactive_session_slot=interactive_session_slot,
                 manage_run_budget=True,
                 now=now,
             )
@@ -798,6 +878,10 @@ class ActionManager:
         next_cursor: str | None = None,
         error: ErrorDetail | None = None,
         retain_reservation: bool = False,
+        usage_unknown: bool = False,
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
+        cleanup_confirmed: bool = True,
         manage_run_budget: bool = True,
         allow_reconciled_resolution: bool = False,
         supervisor_key: str | None = None,
@@ -965,11 +1049,10 @@ class ActionManager:
                     f"Concurrent state change prevented settling action {action_id!r}."
                 )
 
-        # Budget settlement: retain reservation on reconciliation_required or unconfirmed cleanup.
-        should_release = (
+        # Budget settlement: align with gateway/budget.py (usage_unknown / cleanup_confirmed / slots).
+        should_settle_budget = (
             manage_run_budget
             and target_state in TERMINAL_ACTION_STATES
-            and not retain_reservation
             and current_state
             in {
                 ActionLifecycleState.RESERVED,
@@ -977,25 +1060,78 @@ class ActionManager:
                 ActionLifecycleState.RECONCILIATION_REQUIRED,
             }
         )
-        if should_release:
-            run_row = conn.execute(
-                "SELECT remaining_ms, remaining_bytes, active_heavy_jobs FROM runs WHERE run_id = ?",
-                (current_action.run_id,),
-            ).fetchone()
-            if run_row is not None:
-                refund_ms = current_action.reserved_ms - usage.wall_ms
-                refund_bytes = current_action.reserved_bytes - usage.output_bytes
-                new_rem_ms = max(0, int(run_row["remaining_ms"]) + refund_ms)
-                new_rem_bytes = max(0, int(run_row["remaining_bytes"]) + refund_bytes)
-                new_active = max(0, int(run_row["active_heavy_jobs"]) - 1)
-                conn.execute(
+        if should_settle_budget:
+            if retain_reservation or not cleanup_confirmed:
+                if not cleanup_confirmed:
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET guest_health = ?, revision = revision + 1
+                        WHERE run_id = ?
+                        """,
+                        (GuestHealthState.CLEANUP_UNCONFIRMED.value, current_action.run_id),
+                    )
+            else:
+                run_row = conn.execute(
                     """
-                    UPDATE runs
-                    SET remaining_ms = ?, remaining_bytes = ?, active_heavy_jobs = ?
+                    SELECT remaining_ms, remaining_bytes, active_heavy_jobs, active_sessions
+                    FROM runs
                     WHERE run_id = ?
                     """,
-                    (new_rem_ms, new_rem_bytes, new_active, current_action.run_id),
-                )
+                    (current_action.run_id,),
+                ).fetchone()
+                if run_row is not None:
+                    stored_slots = _lookup_action_slots_in_tx(conn, action_id)
+                    if heavy_job_slot is not None:
+                        eff_heavy = bool(heavy_job_slot)
+                    elif stored_slots is not None:
+                        eff_heavy = stored_slots[0]
+                    else:
+                        eff_heavy = False
+
+                    if interactive_session_slot is not None:
+                        eff_session = bool(interactive_session_slot)
+                    elif stored_slots is not None:
+                        eff_session = stored_slots[1]
+                    else:
+                        eff_session = False
+
+                    if usage_unknown:
+                        new_rem_ms = int(run_row["remaining_ms"])
+                        new_rem_bytes = int(run_row["remaining_bytes"])
+                    else:
+                        refund_ms = current_action.reserved_ms - usage.wall_ms
+                        refund_bytes = current_action.reserved_bytes - usage.output_bytes
+                        new_rem_ms = max(0, int(run_row["remaining_ms"]) + refund_ms)
+                        new_rem_bytes = max(0, int(run_row["remaining_bytes"]) + refund_bytes)
+
+                    new_active_heavy = (
+                        max(0, int(run_row["active_heavy_jobs"]) - 1)
+                        if eff_heavy
+                        else int(run_row["active_heavy_jobs"])
+                    )
+                    new_active_sessions = (
+                        max(0, int(run_row["active_sessions"]) - 1)
+                        if eff_session
+                        else int(run_row["active_sessions"])
+                    )
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET remaining_ms = ?,
+                            remaining_bytes = ?,
+                            active_heavy_jobs = ?,
+                            active_sessions = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            new_rem_ms,
+                            new_rem_bytes,
+                            new_active_heavy,
+                            new_active_sessions,
+                            current_action.run_id,
+                        ),
+                    )
 
         updated_row = conn.execute(
             "SELECT * FROM actions WHERE action_id = ?",
@@ -1023,6 +1159,10 @@ class ActionManager:
         next_cursor: str | None = None,
         error: ErrorDetail | None = None,
         retain_reservation: bool = False,
+        usage_unknown: bool = False,
+        heavy_job_slot: bool | None = None,
+        interactive_session_slot: bool | None = None,
+        cleanup_confirmed: bool = True,
         supervisor_key: str | None = None,
         now: datetime | None = None,
     ) -> ActionSubmission:
@@ -1042,6 +1182,10 @@ class ActionManager:
                 next_cursor=next_cursor,
                 error=error,
                 retain_reservation=retain_reservation,
+                usage_unknown=usage_unknown,
+                heavy_job_slot=heavy_job_slot,
+                interactive_session_slot=interactive_session_slot,
+                cleanup_confirmed=cleanup_confirmed,
                 manage_run_budget=True,
                 supervisor_key=supervisor_key,
                 now=now,
@@ -1065,7 +1209,9 @@ class ActionManager:
 
 
 __all__ = [
+    "ACTION_BUDGET_SLOTS_DDL",
     "ActionManager",
     "ActionSubmission",
     "build_result_envelope",
+    "ensure_action_slots_schema_in_tx",
 ]

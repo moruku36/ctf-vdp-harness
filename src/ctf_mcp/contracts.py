@@ -572,6 +572,8 @@ class UsageMetrics(StrictModel):
 
     wall_ms: int = Field(ge=0)
     output_bytes: int = Field(ge=0)
+    peak_rss_bytes: int | None = Field(default=None, ge=0)
+    cpu_ms: int | None = Field(default=None, ge=0)
 
 
 class ProvenanceInfo(StrictModel):

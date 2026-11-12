@@ -413,6 +413,9 @@ class RunReportExporter:
         # Build action & evidence rows
         action_lines: list[str] = []
         total_used_ms = 0
+        max_peak_rss_bytes: int | None = None
+        total_cpu_ms = 0
+        has_cpu_ms = False
         has_derived_or_redacted = False
         has_truncation = False
         if action_rows:
@@ -424,8 +427,22 @@ class RunReportExporter:
                 if ar["envelope_json"]:
                     try:
                         env_obj: Any = json.loads(str(ar["envelope_json"]))
-                        if isinstance(env_obj, dict) and env_obj.get("status"):
-                            status_label = str(env_obj["status"])
+                        if isinstance(env_obj, dict):
+                            if env_obj.get("status"):
+                                status_label = str(env_obj["status"])
+                            usage_obj = env_obj.get("usage")
+                            if isinstance(usage_obj, dict):
+                                pr = usage_obj.get("peak_rss_bytes")
+                                if isinstance(pr, int) and not isinstance(pr, bool) and pr >= 0:
+                                    max_peak_rss_bytes = (
+                                        pr
+                                        if max_peak_rss_bytes is None
+                                        else max(max_peak_rss_bytes, pr)
+                                    )
+                                cm = usage_obj.get("cpu_ms")
+                                if isinstance(cm, int) and not isinstance(cm, bool) and cm >= 0:
+                                    total_cpu_ms += cm
+                                    has_cpu_ms = True
                     except json.JSONDecodeError:
                         pass
 
@@ -501,6 +518,8 @@ class RunReportExporter:
         total_calls = max(0, budget.max_tool_calls - int(run_row["remaining_calls"]))
         used_ev_bytes = max(0, budget.max_evidence_bytes_per_run - int(run_row["remaining_bytes"]))
         guest_health = str(run_row["guest_health"])
+        peak_rss_label = str(max_peak_rss_bytes) if max_peak_rss_bytes is not None else "N/A"
+        cpu_ms_label = str(total_cpu_ms) if has_cpu_ms else "N/A"
 
         if language == "ja":
             lines = [
@@ -538,7 +557,7 @@ class RunReportExporter:
                 "",
                 "## 結果とコスト",
                 f"- 検証済み結果／未解決／判断不能／基盤失敗：`{clean(meta.outcome_summary)}`",
-                f"- 全所要時間、呼出数、資源最大値、直接取得できるトークン・費用：`wall_ms={total_used_ms}`, `tool_calls={total_calls}`, `evidence_bytes={used_ev_bytes}`",
+                f"- 全所要時間、呼出数、資源最大値、直接取得できるトークン・費用：`wall_ms={total_used_ms}`, `tool_calls={total_calls}`, `evidence_bytes={used_ev_bytes}`, `peak_rss_bytes={peak_rss_label}`, `cpu_ms={cpu_ms_label}`",
                 f"- 悪化、失敗分類、開発用に限定した改訂案：`{clean(meta.regressions_notes)}`",
                 "- 条件を揃えた比較結果がなければ性能改善は主張しない。",
                 "",
@@ -583,7 +602,7 @@ class RunReportExporter:
                 "",
                 "## Outcome and cost",
                 f"- Verified outcome / unsolved / inconclusive / infrastructure failure: `{clean(meta.outcome_summary)}`",
-                f"- Total wall time, tool calls, resource peaks, tokens/cost if directly available: `wall_ms={total_used_ms}`, `tool_calls={total_calls}`, `evidence_bytes={used_ev_bytes}`",
+                f"- Total wall time, tool calls, resource peaks, tokens/cost if directly available: `wall_ms={total_used_ms}`, `tool_calls={total_calls}`, `evidence_bytes={used_ev_bytes}`, `peak_rss_bytes={peak_rss_label}`, `cpu_ms={cpu_ms_label}`",
                 f"- Regressions, failure category and proposed development-only revision: `{clean(meta.regressions_notes)}`",
                 "- No claim of performance gain unless backed by the matched comparison.",
                 "",
@@ -602,30 +621,84 @@ class RunReportExporter:
         # Final fail-closed secrecy check before returning or writing to disk.
         assert_report_clean(rendered, forbidden_literals=forbidden_literals)
 
-        written_path: str | None = None
-        if output_relpath is not None:
-            assert self.export_root is not None
-            target = safe_write_atomic(
-                self.export_root,
-                output_relpath,
-                rendered.encode("utf-8"),
-                overwrite=overwrite,
-                create_parents=True,
-            )
-            written_path = str(target)
-
-        return ExportResult(
+        result = ExportResult(
             run_id=run_id,
             language=language,
             markdown=rendered,
             report_sha256=sha256_bytes(rendered.encode("utf-8")),
-            output_path=written_path,
+            output_path=None,
             evidence_ids_referenced=ev_ids_referenced,
             redactions_applied=redaction_count,
             cleanup_confirmed=cleanup_confirmed,
             import_confirmed=import_confirmed,
             exported_at=datetime.now(UTC),
         )
+        if output_relpath is not None:
+            return self.write_verified_report(
+                result,
+                output_relpath=output_relpath,
+                overwrite=overwrite,
+                forbidden_literals=forbidden_literals,
+            )
+        return result
+
+    def prepare_run_report(
+        self,
+        *,
+        run_id: str,
+        principal_id: str,
+        language: Literal["ja", "en"] = "ja",
+        cleanup_confirmed: bool = True,
+        import_confirmed: bool = True,
+        require_rolled_back: bool = False,
+        expected_evidence_ids: Sequence[str] = (),
+        findings: Sequence[FindingRecord] = (),
+        metadata: ReportMetadata | None = None,
+        auto_redact: bool = True,
+        forbidden_literals: Sequence[str] = (),
+        include_evidence_excerpts: bool = False,
+        excerpt_max_chars: int = 200,
+        conn: sqlite3.Connection | None = None,
+    ) -> ExportResult:
+        """Render and verify report text cleanly in memory without writing to disk."""
+        return self.export_run_report(
+            run_id=run_id,
+            principal_id=principal_id,
+            language=language,
+            output_relpath=None,
+            cleanup_confirmed=cleanup_confirmed,
+            import_confirmed=import_confirmed,
+            require_rolled_back=require_rolled_back,
+            expected_evidence_ids=expected_evidence_ids,
+            findings=findings,
+            metadata=metadata,
+            auto_redact=auto_redact,
+            forbidden_literals=forbidden_literals,
+            include_evidence_excerpts=include_evidence_excerpts,
+            excerpt_max_chars=excerpt_max_chars,
+            conn=conn,
+        )
+
+    def write_verified_report(
+        self,
+        result: ExportResult,
+        *,
+        output_relpath: str,
+        overwrite: bool = False,
+        forbidden_literals: Sequence[str] = (),
+    ) -> ExportResult:
+        """Re-check secrecy invariants and atomically write a prepared report to ``export_root``."""
+        if self.export_root is None:
+            raise ConfigurationError("output_relpath requires export_root to be configured.")
+        assert_report_clean(result.markdown, forbidden_literals=forbidden_literals)
+        target = safe_write_atomic(
+            self.export_root,
+            output_relpath,
+            result.markdown.encode("utf-8"),
+            overwrite=overwrite,
+            create_parents=True,
+        )
+        return result.model_copy(update={"output_path": str(target)})
 
 
 __all__ = [

@@ -85,6 +85,10 @@ class SubprocessResult(StrictModel):
     cleanup_detail: str | None = None
     root_pid: int | None = None
     observed_pids: tuple[int, ...] = ()
+    peak_rss_bytes: int | None = Field(default=None, ge=0)
+    cpu_ms: int | None = Field(default=None, ge=0)
+    os_pid: int | None = Field(default=None, ge=1)
+    process_start_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_capture_invariants(self) -> SubprocessResult:
@@ -216,9 +220,24 @@ if sys.platform == "win32":
     _JOB_OBJECT_EXTENDED_LIMIT_INFO = 9
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _SYNCHRONIZE = 0x00100000
+    _WAIT_TIMEOUT = 0x00000102
     _STILL_ACTIVE = 259
     _ERROR_ACCESS_DENIED = 5
     _ERROR_INVALID_PARAMETER = 87
+
+    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -299,8 +318,56 @@ if sys.platform == "win32":
     _k32.GetExitCodeProcess.restype = wintypes.BOOL
     _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     _k32.WaitForSingleObject.restype = wintypes.DWORD
+    _k32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    _k32.GetProcessTimes.restype = wintypes.BOOL
+    _HAS_K32_MEMINFO = hasattr(_k32, "K32GetProcessMemoryInfo")
+    if _HAS_K32_MEMINFO:
+        _k32.K32GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_PROCESS_MEMORY_COUNTERS),
+            wintypes.DWORD,
+        ]
+        _k32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
     _k32.CloseHandle.argtypes = [wintypes.HANDLE]
     _k32.CloseHandle.restype = wintypes.BOOL
+
+    def _filetime_to_int(ft: wintypes.FILETIME) -> int:
+        return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+    def _query_process_times_from_handle(handle: int) -> tuple[int, int] | None:
+        creation = wintypes.FILETIME()
+        exit_ft = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        ok = _k32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_ft),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        creation_int = _filetime_to_int(creation)
+        total_100ns = _filetime_to_int(kernel) + _filetime_to_int(user)
+        cpu_ms = max(0, total_100ns // 10_000)
+        return creation_int, cpu_ms
+
+    def _query_win32_process_peak_rss(handle: int) -> int | None:
+        if not _HAS_K32_MEMINFO:
+            return None
+        pmc = _PROCESS_MEMORY_COUNTERS()
+        pmc.cb = ctypes.sizeof(pmc)
+        if not _k32.K32GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+            return None
+        peak = int(pmc.PeakWorkingSetSize)
+        return peak if peak > 0 else None
 
 
 class _WindowsProcessTreeGuard:
@@ -477,6 +544,49 @@ class _WindowsProcessTreeGuard:
 
             time.sleep(0.02)
 
+    def query_resource_metrics(
+        self, proc: subprocess.Popen[bytes] | None = None
+    ) -> tuple[int | None, int | None]:
+        """Return observed ``(peak_rss_bytes, cpu_ms)`` from the Win32 Job Object."""
+        peak_rss_bytes: int | None = None
+        cpu_ms: int | None = None
+
+        if self._job_handle is not None and self._attached:
+            ext = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            if _k32.QueryInformationJobObject(
+                self._job_handle,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFO,
+                ctypes.byref(ext),
+                ctypes.sizeof(ext),
+                None,
+            ):
+                job_peak = int(ext.PeakJobMemoryUsed) or int(ext.PeakProcessMemoryUsed)
+                if job_peak > 0:
+                    peak_rss_bytes = job_peak
+
+            acct = _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            if _k32.QueryInformationJobObject(
+                self._job_handle,
+                _JOB_OBJECT_BASIC_ACCOUNTING_INFO,
+                ctypes.byref(acct),
+                ctypes.sizeof(acct),
+                None,
+            ):
+                total_100ns = int(acct.TotalUserTime) + int(acct.TotalKernelTime)
+                if total_100ns >= 0:
+                    cpu_ms = total_100ns // 10_000
+
+        proc_handle = int(getattr(proc, "_handle", 0) or 0) if proc is not None else 0
+        if proc_handle:
+            if cpu_ms is None:
+                times = _query_process_times_from_handle(proc_handle)
+                if times is not None:
+                    cpu_ms = times[1]
+            if peak_rss_bytes is None:
+                peak_rss_bytes = _query_win32_process_peak_rss(proc_handle)
+
+        return peak_rss_bytes, cpu_ms
+
     def close(self) -> None:
         if self._job_handle is not None:
             _k32.CloseHandle(self._job_handle)
@@ -494,15 +604,45 @@ class _PosixProcessTreeGuard:
 
     def __init__(self) -> None:
         self._pgid: int | None = None
+        self._peak_rss_bytes: int | None = None
+        self._cpu_ms: int | None = None
 
     def popen_kwargs(self) -> dict[str, Any]:
         return {"start_new_session": True}
 
     def attach(self, proc: subprocess.Popen[bytes]) -> bool:
         self._pgid = proc.pid
+        self._sample_proc_metrics(proc.pid)
         return True
 
+    def _sample_proc_metrics(self, pid: int) -> None:
+        if pid <= 0 or sys.platform == "win32":
+            return
+        status_path = Path(f"/proc/{pid}/status")
+        if status_path.exists():
+            try:
+                for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("VmHWM:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            rss_bytes = int(parts[1]) * 1024
+                            if self._peak_rss_bytes is None or rss_bytes > self._peak_rss_bytes:
+                                self._peak_rss_bytes = rss_bytes
+                        break
+            except OSError:
+                pass
+
+        stat_info = _read_proc_stat_info(pid)
+        if stat_info is not None:
+            _, _, cpu_ticks = stat_info
+            clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+            if clk_tck > 0:
+                ms = max(0, int((cpu_ticks * 1000) // clk_tck))
+                if self._cpu_ms is None or ms > self._cpu_ms:
+                    self._cpu_ms = ms
+
     def collect_pids(self, root_pid: int) -> tuple[int, ...]:
+        self._sample_proc_metrics(root_pid)
         return (root_pid,)
 
     def _group_exists(self) -> bool | None:
@@ -589,6 +729,14 @@ class _PosixProcessTreeGuard:
 
             time.sleep(0.02)
 
+    def query_resource_metrics(
+        self, proc: subprocess.Popen[bytes] | None = None
+    ) -> tuple[int | None, int | None]:
+        """Return observed ``(peak_rss_bytes, cpu_ms)`` from POSIX ``/proc`` samples."""
+        if proc is not None:
+            self._sample_proc_metrics(proc.pid)
+        return self._peak_rss_bytes, self._cpu_ms
+
     def close(self) -> None:
         self._pgid = None
 
@@ -597,6 +745,150 @@ def _default_tree_guard_factory() -> ProcessTreeGuard:
     if sys.platform == "win32":
         return _WindowsProcessTreeGuard()
     return _PosixProcessTreeGuard()
+
+
+def _read_proc_stat_info(pid: int) -> tuple[str, int, int] | None:
+    """Parse ``(state, starttime_ticks, utime_plus_stime_ticks)`` from ``/proc/<pid>/stat``."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return None
+    fields = raw[rparen + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    try:
+        state = fields[0]
+        utime = int(fields[11])
+        stime = int(fields[12])
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+    return state, starttime, max(0, utime + stime)
+
+
+def _is_win32_handle_alive(handle: int) -> bool:
+    if _k32.WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
+        return False
+    exit_code = wintypes.DWORD()
+    if not _k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        return False
+    return int(exit_code.value) == _STILL_ACTIVE
+
+
+def get_os_process_start_id(pid: int) -> str | None:
+    """Return a deterministic ``pid:<pid>:<kind>:<start_token>`` for a live OS process."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        handle = _k32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            if not _is_win32_handle_alive(handle):
+                return None
+            times = _query_process_times_from_handle(handle)
+            if times is None:
+                return None
+            return f"pid:{pid}:win:{times[0]}"
+        finally:
+            _k32.CloseHandle(handle)
+
+    stat_info = _read_proc_stat_info(pid)
+    if stat_info is not None:
+        state, starttime, _ = stat_info
+        if state in {"Z", "X", "x"}:
+            return None
+        return f"pid:{pid}:proc:{starttime}"
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    line = res.stdout.strip()
+    if not line:
+        return None
+    parts = line.split(None, 1)
+    if len(parts) < 2 or parts[0].startswith("Z"):
+        return None
+    return f"pid:{pid}:lstart:{parts[1].strip()}"
+
+
+def _process_start_id_for_popen(proc: subprocess.Popen[bytes]) -> str | None:
+    if sys.platform == "win32":
+        proc_handle = int(getattr(proc, "_handle", 0) or 0)
+        if proc_handle:
+            times = _query_process_times_from_handle(proc_handle)
+            if times is not None:
+                return f"pid:{proc.pid}:win:{times[0]}"
+    return get_os_process_start_id(proc.pid)
+
+
+def is_os_process_alive(process_start_id: str | None) -> bool:
+    """Verify real OS process liveness and creation-timestamp match (anti-PID-reuse)."""
+    if process_start_id is None or not isinstance(process_start_id, str):
+        return False
+    raw = process_start_id.strip()
+    if not raw.startswith("pid:"):
+        return False
+    parts = raw.split(":", 3)
+    if len(parts) != 4:
+        return False
+    _, pid_str, kind, start_token = parts
+    if not pid_str.isdigit() or not start_token:
+        return False
+    pid = int(pid_str)
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        if kind != "win" or not start_token.isdigit():
+            return False
+        expected_creation = int(start_token)
+        handle = _k32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            if not _is_win32_handle_alive(handle):
+                return False
+            times = _query_process_times_from_handle(handle)
+            if times is None:
+                return False
+            return times[0] == expected_creation
+        finally:
+            _k32.CloseHandle(handle)
+
+    if kind == "proc":
+        stat_info = _read_proc_stat_info(pid)
+        if stat_info is None:
+            return False
+        state, starttime, _ = stat_info
+        return state not in {"Z", "X", "x"} and str(starttime) == start_token
+
+    if kind == "lstart":
+        current = get_os_process_start_id(pid)
+        return current == raw
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +1063,13 @@ class SubprocessRunner:
                     cleanup_detail=f"spawn_failed: {type(exc).__name__}: {exc}",
                     root_pid=None,
                     observed_pids=(),
+                    peak_rss_bytes=None,
+                    cpu_ms=None,
+                    os_pid=None,
+                    process_start_id=None,
                 )
+            os_pid = proc.pid
+            process_start_id = _process_start_id_for_popen(proc)
             guard.attach(proc)
             observed_pids = guard.collect_pids(proc.pid)
 
@@ -878,6 +1176,14 @@ class SubprocessRunner:
                 capture_complete = True
                 omission_reason = None
 
+            peak_rss_bytes: int | None = None
+            cpu_ms: int | None = None
+            query_metrics = getattr(guard, "query_resource_metrics", None)
+            if callable(query_metrics):
+                metrics = query_metrics(proc)
+                if isinstance(metrics, tuple) and len(metrics) == 2:
+                    peak_rss_bytes, cpu_ms = metrics
+
             wall_ms = max(0, int((time.monotonic() - started_mono) * 1000))
             return SubprocessResult(
                 outcome=outcome,
@@ -894,6 +1200,10 @@ class SubprocessRunner:
                 cleanup_detail=cleanup_detail,
                 root_pid=proc.pid,
                 observed_pids=observed_pids,
+                peak_rss_bytes=peak_rss_bytes,
+                cpu_ms=cpu_ms,
+                os_pid=os_pid,
+                process_start_id=process_start_id,
             )
         finally:
             guard.close()
@@ -956,4 +1266,6 @@ __all__ = [
     "SubprocessResult",
     "SubprocessRunner",
     "build_minimal_env",
+    "get_os_process_start_id",
+    "is_os_process_alive",
 ]

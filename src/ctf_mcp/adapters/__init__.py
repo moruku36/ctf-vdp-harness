@@ -20,6 +20,8 @@ from ctf_mcp.adapters.runner import (
     SubprocessResult,
     SubprocessRunner,
     build_minimal_env,
+    get_os_process_start_id,
+    is_os_process_alive,
 )
 from ctf_mcp.adapters.static_inspector import (
     FORBIDDEN_OR_UNACCEPTED_OPERATIONS,
@@ -72,6 +74,8 @@ __all__ = [
     "create_static_inspector_descriptor",
     "create_synthetic_descriptor",
     "get_dependency_lock_sha256",
+    "get_os_process_start_id",
+    "is_os_process_alive",
     "validate_action_request_inputs",
     "validate_descriptor_integrity",
 ]

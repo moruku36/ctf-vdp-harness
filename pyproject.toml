@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctf-vdp-harness"
+version = "0.1.0"
+description = "Bounded analysis harness, scope/budget controller, and immutable evidence paging for CTF/VDP workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "UNLICENSED" }
+authors = [{ name = "Moruku" }]
+dependencies = [
+    "fastmcp==4.1.8",
+    "mcp==2.3.0",
+    "pydantic==2.14.3",
+    "jsonschema[format-nongpl]==4.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

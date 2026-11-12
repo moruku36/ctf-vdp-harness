@@ -8,6 +8,7 @@ verification, audit sanitization, crash reconciliation, and ordered run closure.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sqlite3
 import threading
@@ -20,6 +21,7 @@ from uuid import uuid4
 
 from ctf_mcp.adapters import (
     PRODUCTION_DEFAULT_ENABLED as SYNTHETIC_PRODUCTION_DEFAULT_ENABLED,
+    StaticArtifactInspectorAdapter,
     SyntheticAdapter,
 )
 from ctf_mcp.config import (
@@ -175,9 +177,20 @@ def _infer_tool_group(descriptor: CapabilityDescriptor) -> str:
         return "helper.transform"
     if name == "session.control" or name.startswith("session."):
         return "session.control"
-    if descriptor.execution_class != ExecutionClass.STATIC:
+    if set(descriptor.execution_classes) != {ExecutionClass.STATIC}:
         return "session.control"
     return "analysis.query"
+
+
+def _supports_kwarg(fn: Any, kwarg: str) -> bool:
+    """Return True if callable accepts ``kwarg`` explicitly or via **kwargs."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return kwarg in sig.parameters or any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+    )
 
 
 def _extract_descriptor(adapter: Any, explicit: CapabilityDescriptor | None) -> CapabilityDescriptor:
@@ -873,15 +886,16 @@ class HarnessController:
         )
         return denied_sub.envelope
 
-    def _resolve_run_artifact_paths(
+    def _resolve_run_artifact_context(
         self,
         *,
         principal: PrincipalContext,
         run_id: str,
         arguments: Mapping[str, Any],
-    ) -> dict[str, Path]:
-        """Resolve only artifact_id values owned by (run_id, principal_id)."""
+    ) -> tuple[dict[str, Path], tuple[str, ...]]:
+        """Resolve only artifact_id values and pinned SHA-256 hashes owned by (run_id, principal_id)."""
         paths: dict[str, Path] = {}
+        hashes: list[str] = []
         candidate_ids: list[str] = []
         raw_single = arguments.get("artifact_id")
         if isinstance(raw_single, str) and raw_single.strip():
@@ -898,6 +912,27 @@ class HarnessController:
                 principal_id=principal.principal_id,
                 artifact_id=aid,
             )
+            record = self.intake.get_artifact(
+                run_id=run_id,
+                principal_id=principal.principal_id,
+                artifact_id=aid,
+            )
+            hashes.append(record.sha256)
+        return paths, tuple(dict.fromkeys(hashes))
+
+    def _resolve_run_artifact_paths(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Path]:
+        """Resolve only artifact_id values owned by (run_id, principal_id)."""
+        paths, _ = self._resolve_run_artifact_context(
+            principal=principal,
+            run_id=run_id,
+            arguments=arguments,
+        )
         return paths
 
     def _execute_adapter_outside_tx(
@@ -906,16 +941,21 @@ class HarnessController:
         adapter: Any,
         started: ActionRecord,
         artifact_paths: dict[str, Path],
+        source_artifact_hashes: tuple[str, ...] = (),
         cancel_event: threading.Event | None,
     ) -> tuple[ActionLifecycleState, ResultEnvelope, bool, bytes]:
         """Invoke adapter outside SQLite transactions and normalize outcome."""
         try:
             if hasattr(adapter, "execute_with_capture"):
-                outcome = adapter.execute_with_capture(
-                    started,
-                    artifact_paths=artifact_paths or None,
-                    cancel_event=cancel_event,
-                )
+                capture_kwargs: dict[str, Any] = {
+                    "artifact_paths": artifact_paths or None,
+                    "cancel_event": cancel_event,
+                }
+                if source_artifact_hashes and _supports_kwarg(
+                    adapter.execute_with_capture, "source_artifact_hashes"
+                ):
+                    capture_kwargs["source_artifact_hashes"] = source_artifact_hashes
+                outcome = adapter.execute_with_capture(started, **capture_kwargs)
                 envelope = outcome.envelope
                 cleanup_confirmed = bool(outcome.cleanup_confirmed)
                 captured = outcome.captured_bytes
@@ -1241,7 +1281,7 @@ class HarnessController:
                 )
                 return expired_sub.envelope
 
-            artifact_paths = self._resolve_run_artifact_paths(
+            artifact_paths, source_artifact_hashes = self._resolve_run_artifact_context(
                 principal=principal,
                 run_id=request.run_id,
                 arguments=request.arguments,
@@ -1266,6 +1306,7 @@ class HarnessController:
             adapter=adapter_spec.adapter,
             started=started,
             artifact_paths=artifact_paths,
+            source_artifact_hashes=source_artifact_hashes,
             cancel_event=cancel_event,
         )
 
@@ -1763,3 +1804,96 @@ class HarnessController:
             integrity_report=final_report,
             guest_rolled_back=True,
         )
+
+
+def register_default_adapters(
+    controller: HarnessController,
+    *,
+    static_inspector_enabled: bool = True,
+    timeout_seconds: int | None = None,
+    max_output_bytes: int = 65_536,
+    max_decode_bytes: int = 65_536,
+    require_running_state: bool = True,
+) -> StaticArtifactInspectorAdapter:
+    """Register the default P2 static artifact inspector onto ``controller``."""
+    effective_timeout = timeout_seconds or (
+        controller.config.execution.action_timeout_seconds
+        if controller.config is not None
+        else 60
+    )
+    inspector = StaticArtifactInspectorAdapter(
+        enabled=static_inspector_enabled,
+        timeout_seconds=effective_timeout,
+        max_output_bytes=max_output_bytes,
+        max_decode_bytes=max_decode_bytes,
+        evidence_vault=controller.evidence_vault,
+        require_running_state=require_running_state,
+    )
+    controller.register_adapter(inspector, tool_group="analysis.query")
+    return inspector
+
+
+def create_default_controller(
+    *,
+    storage: Storage,
+    vault_root: str | Path,
+    export_root: str | Path | None = None,
+    staging_root: str | Path | None = None,
+    cursor_hmac_key: bytes | None = None,
+    config: HarnessConfig | None = None,
+    runtime_settings: RuntimeSettings | None = None,
+    allow_ephemeral_cursor_key: bool = False,
+    allow_synthetic_adapters: bool = False,
+    enable_static_inspector: bool | None = None,
+    static_inspector_enabled: bool = True,
+    timeout_seconds: int | None = None,
+    max_output_bytes: int = 65_536,
+    max_decode_bytes: int = 65_536,
+    initialize: bool = True,
+    **controller_kwargs: Any,
+) -> HarnessController:
+    """Construct and initialize a ``HarnessController`` with default static inspector."""
+    vault_path = Path(vault_root)
+    resolved_export_root = (
+        Path(export_root) if export_root is not None else (vault_path / "_exports")
+    )
+    controller = HarnessController(
+        storage=storage,
+        vault_root=vault_path,
+        export_root=resolved_export_root,
+        staging_root=staging_root,
+        cursor_hmac_key=cursor_hmac_key,
+        config=config,
+        runtime_settings=runtime_settings,
+        allow_ephemeral_cursor_key=allow_ephemeral_cursor_key,
+        allow_synthetic_adapters=allow_synthetic_adapters,
+        **controller_kwargs,
+    )
+    if initialize:
+        controller.initialize()
+
+    if enable_static_inspector is None:
+        if config is not None and config.execution.adapters_enabled:
+            should_register = any(
+                item in {"analysis.query", "ctf-static-inspector", "static_inspector"}
+                for item in config.execution.adapters_enabled
+            )
+        else:
+            should_register = True
+    else:
+        should_register = bool(enable_static_inspector)
+
+    if should_register:
+        if not initialize:
+            controller.storage.initialize()
+            controller.leases.ensure_schema()
+        register_default_adapters(
+            controller,
+            static_inspector_enabled=static_inspector_enabled,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            max_decode_bytes=max_decode_bytes,
+            require_running_state=True,
+        )
+
+    return controller

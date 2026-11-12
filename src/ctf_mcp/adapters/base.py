@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
+import re
 import stat
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -33,12 +35,14 @@ from ctf_mcp.contracts import (
     ProvenanceInfo,
     ResultEnvelope,
     RunMode,
+    SHA256_PATTERN,
     StrictModel,
     UsageMetrics,
     canonical_digest,
 )
 
 FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_SHA256_RE = re.compile(SHA256_PATTERN)
 
 FORBIDDEN_ARG_KEYS: frozenset[str] = frozenset(
     {
@@ -528,11 +532,84 @@ class BaseAdapter(ABC):
             provenance=provenance,
         )
 
+    @staticmethod
+    def _hash_validated_file(artifact_id: str, path: Path) -> str:
+        """Compute lowercase SHA-256 of a validated regular file without following swaps."""
+        try:
+            expected_st = os.lstat(path)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise PathSecurityError(
+                f"Failed to open resolved artifact {artifact_id!r} for hashing: {exc}"
+            ) from exc
+
+        try:
+            opened_st = os.fstat(fd)
+            if not stat.S_ISREG(opened_st.st_mode) or (
+                opened_st.st_dev,
+                opened_st.st_ino,
+            ) != (expected_st.st_dev, expected_st.st_ino):
+                raise PathSecurityError(
+                    f"Resolved artifact {artifact_id!r} changed or is not a regular file during hashing."
+                )
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "rb", closefd=True) as stream:
+                fd = -1
+                while chunk := stream.read(65_536):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError as exc:
+            raise PathSecurityError(
+                f"Failed reading resolved artifact {artifact_id!r} for hashing: {exc}"
+            ) from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _resolve_source_artifact_hashes(
+        self,
+        action: ActionRecord,
+        *,
+        artifact_paths: Mapping[str, Path],
+        explicit_hashes: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Resolve lowercase SHA-256 digests for the input artifacts of this action."""
+        del action
+        if explicit_hashes is not None:
+            normalized: list[str] = []
+            for raw in explicit_hashes:
+                if not isinstance(raw, str):
+                    raise ContractViolationError(
+                        "source_artifact_hashes entries must be SHA-256 hex strings."
+                    )
+                candidate = raw.strip().lower()
+                if not _SHA256_RE.fullmatch(candidate):
+                    raise ContractViolationError(
+                        f"Invalid source_artifact_hashes digest: {raw!r}."
+                    )
+                normalized.append(candidate)
+            if normalized or not artifact_paths:
+                return tuple(dict.fromkeys(normalized))
+
+        if not artifact_paths:
+            return ()
+
+        computed = [
+            self._hash_validated_file(artifact_id, path)
+            for artifact_id, path in artifact_paths.items()
+        ]
+        return tuple(dict.fromkeys(computed))
+
     def execute_with_capture(
         self,
         action: ActionRecord,
         *,
         artifact_paths: dict[str, Any] | None = None,
+        source_artifact_hashes: Sequence[str] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> AdapterExecutionOutcome:
         """Validate contract inputs, execute bounded subprocess, and return full capture."""
@@ -543,6 +620,11 @@ class BaseAdapter(ABC):
             require_running=self._require_running_state,
         )
         validated_paths = _validate_resolved_artifact_paths(artifact_paths)
+        resolved_source_hashes = self._resolve_source_artifact_hashes(
+            action,
+            artifact_paths=validated_paths,
+            explicit_hashes=source_artifact_hashes,
+        )
         timeout_s, max_bytes = self.compute_effective_limits(action)
 
         argv, extra_env, cwd = self._build_invocation(
@@ -573,7 +655,7 @@ class BaseAdapter(ABC):
                 media_type=media_type,
                 capture_complete=sub_res.capture_complete,
                 omission_reason=sub_res.omission_reason,
-                source_artifact_hashes=(),
+                source_artifact_hashes=resolved_source_hashes,
                 adapter_revision=self._descriptor.adapter_commit,
                 sanitized_args_sha256=action.canonical_args_sha256,
             )

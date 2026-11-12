@@ -47,6 +47,7 @@ from ctf_mcp.controller import (
     ALWAYS_FORBIDDEN_TOOLS,
     ACTION_DISPATCH_TOOLS,
     HarnessController,
+    create_default_controller,
 )
 from ctf_mcp.evidence import ReportMetadata
 from ctf_mcp.gateway import sanitize_audit_text
@@ -747,16 +748,16 @@ def build_server_from_env(
     )
     storage = Storage(settings.db_path)
     export_root = settings.vault_root / "_exports"
-    controller = HarnessController(
+    controller = create_default_controller(
         storage=storage,
         vault_root=settings.vault_root,
-        cursor_hmac_key=hmac_key,
         export_root=export_root,
+        cursor_hmac_key=hmac_key,
         config=config,
         runtime_settings=settings,
         allow_synthetic_adapters=False,
+        initialize=True,
     )
-    controller.initialize()
     return create_mcp_server(
         controller,
         transport_mode=settings.transport,

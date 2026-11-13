@@ -145,3 +145,19 @@ ctf-mcp-server --transport stdio --active-run <RUN_ID>
 $env:CTF_MCP_AUTH_TOKEN = "<strong-local-bearer-token>"
 ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
 ```
+
+### Extended Modules & Offline Evaluation (P4–P5)
+
+- **P4 Surface (`helper.transform`, `session.control`, Local `CTF-09` `net.probe`)**:
+  - `helper.transform`: Bounded stdlib/static decode and transformation helpers constrained by capability pins and output caps.
+  - `session.control`: Profile-isolated bounded interactive debugging (`allow_dynamic=True`), enforcing single active session limits, 15-minute idle lease expiry, `lost` lease recovery after restarts, and zero surviving child processes on exit/timeout (hidden and denied by default in `offline_ctf`).
+  - `net.probe` (`CTF-09`): Scoped local HTTP probing gated behind explicit `scoped_ctf` / `vdp` authorization (`network_enabled=True`), enforcing target allowlists, userinfo rejection, IP pinning, HTTP redirect re-validation, DNS rebinding rejection, IPv6/metadata blocking, and immediate mid-run scope revocation (hidden and denied by default in `offline_ctf`).
+- **P5 Offline A/B/C/D Comparative Evaluation (`src/ctf_mcp/evaluation.py`, `tests/evaluation/`)**:
+  - `OfflineEvaluationHarness` compares Conditions `A` (no MCP), `B` (single stateless `StaticArtifactInspectorAdapter` call), `C` (full `HarnessController` + `EvidenceVault` paging + `hypothesis.update` + `LocalCtfVerifier` + `RunReportExporter`), and `D` (Condition C + frozen guidance derived strictly from `dev` failure analysis).
+  - Evaluates 10 `dev` and 20 disjoint holdout `eval` synthetic tasks across `rev`, `forensics`, `crypto_transform`, and `source_audit`, plus an independent matched vulnerable/fixed VDP pair dataset (`vdp_precision` / `vdp_recall` excluded from CTF denominators). Reports strict first-attempt `pass@1` separately from `best_of_k`, preserves category-level regressions and flat limits without concealment, records unmeasured external LLM API costs as `not_measured`, and includes an acceptance record in `records/p5-offline-evaluation-acceptance.md`.
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m pytest tests/evaluation/ -v
+```
+

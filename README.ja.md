@@ -145,3 +145,19 @@ ctf-mcp-server --transport stdio --active-run <RUN_ID>
 $env:CTF_MCP_AUTH_TOKEN = "<十分な強度のローカルBearerトークン>"
 ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
 ```
+
+### 拡張モジュール・オフライン比較評価（P4〜P5）
+
+- **P4 拡張サーフェス（`helper.transform`, `session.control`, ローカル `CTF-09` `net.probe`）**:
+  - `helper.transform`: 署名付き capability pin と出力上限に従う決定論的変換・デコード補助。
+  - `session.control`: 動的プロファイル（`allow_dynamic=True`）に分離された境界付き対話デバッグ（1 セッション上限、15 分アイドルリース失効、再起動時の `lost` 遷移、終了・タイムアウト時の残存子プロセス 0 件を強制。既定の `offline_ctf` では非表示・拒否）。
+  - `net.probe`（`CTF-09`）: 明示的認可済み `scoped_ctf` / `vdp`（`network_enabled=True`）に限定されたローカル HTTP プローブ（許可ターゲット照合、userinfo 拒否、IP ピン留め、リダイレクト再検証、DNS rebinding 防御、IPv6・メタデータ宛先遮断、実行中 revoke 即時拒否。既定の `offline_ctf` では非表示・拒否）。
+- **P5 オフライン A/B/C/D 比較評価フレームワーク（`src/ctf_mcp/evaluation.py`, `tests/evaluation/`）**:
+  - `OfflineEvaluationHarness` により、条件 `A`（MCP ツールなしベースライン）、`B`（単発 stateless な `StaticArtifactInspectorAdapter` 呼出のみ）、`C`（`HarnessController` + `EvidenceVault` ページ取得 + `hypothesis.update` + `LocalCtfVerifier` + `RunReportExporter` フル運用）、`D`（`dev` 課題失敗分析に基づく凍結ガイド適用済み C）を隔離ワークスペース・新規 `run_id` ごとに比較実行します。
+  - 全 4 分野（`rev`, `forensics`, `crypto_transform`, `source_audit`）を含む `dev` 10 件・重複なしホールドアウト `eval` 20 件に加え、独立した脆弱版 / 修正版 VDP ペア集合（CTF 分母から完全分離した `vdp_precision` / `vdp_recall`）を評価します。`pass@1` を初回試行のみに厳密限定して `best_of_k` と分離し、悪化・横ばい・限界ケース・分野別内訳・未計測項目（`not_measured`）を隠さず出力します（受入記録: `records/p5-offline-evaluation-acceptance.md`）。
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m pytest tests/evaluation/ -v
+```
+

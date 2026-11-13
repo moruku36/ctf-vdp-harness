@@ -798,7 +798,7 @@ def test_p3_fixture4_timeout_cancel_and_zero_os_survivors(tmp_path: Path) -> Non
     """Fixture 4 (Timeout/Cancel): grandchild OS tree killed (0 survivors) & cleanup recovery."""
     ws = tmp_path / "ws_fixture4"
     ws.mkdir(parents=True)
-    # Write a 4 MiB payload for timeout test in StaticInspector hash_and_entropy
+    # Write a 2 MiB payload for timeout/cancel test in StaticInspector hash_and_entropy
     (ws / "slow.bin").write_bytes(os.urandom(2 * 1024 * 1024))
 
     ctrl = create_default_controller(
@@ -1461,3 +1461,52 @@ def test_p3_cli_admin_and_server_entrypoints_e2e(
     )
     capsys.readouterr()
     assert rc_srv == 0
+
+    # 8. CTF_MCP_CURSOR_HMAC_KEY via env mapping (valid key -> 0; placeholder/short -> 2)
+    valid_env = {"CTF_MCP_CURSOR_HMAC_KEY": "cli-valid-32-byte-hmac-key-00001"}
+    rc_admin_key = admin_main(
+        [
+            "describe-run",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--run-id",
+            run_id,
+        ],
+        env=valid_env,
+    )
+    assert rc_admin_key == 0
+    out_key_desc = json.loads(capsys.readouterr().out)
+    assert out_key_desc["run_id"] == run_id
+
+    for bad_key in ("PLACEHOLDER_KEY", "too-short"):
+        rc_bad = admin_main(
+            [
+                "describe-run",
+                "--db-path",
+                str(db_path),
+                "--vault-root",
+                str(vault_root),
+                "--run-id",
+                run_id,
+            ],
+            env={"CTF_MCP_CURSOR_HMAC_KEY": bad_key},
+        )
+        capsys.readouterr()
+        assert rc_bad == 2
+
+    rc_srv_env_key = server_main(
+        [
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--config",
+            str(cfg_path),
+        ],
+        env=valid_env,
+        start_server=False,
+    )
+    capsys.readouterr()
+    assert rc_srv_env_key == 0

@@ -13,7 +13,7 @@
 
 ### 主要実装変更
 - [`src/ctf_mcp/controller.py`](../src/ctf_mcp/controller.py)（Layer 3 復旧・リース・閉鎖順序・テレメトリ統合）
-  - `initialize()` にデフォルト `is_process_alive=is_os_process_alive` を用いた非終端アクション実 OS プロセス照合、起動時 `AuditEvent` 記録、および補完テーブル初期化（`action_slots`, `hypothesis_requests`）を統合。
+  - `initialize()` にデフォルト `is_process_alive=is_os_process_alive` を用いた非終端アクション実 OS プロセス照合、起動時 `AuditEvent` 記録、および補完テーブル初期化（`action_budget_slots`, `hypothesis_requests`）を統合。
   - `execute_action()` でアダプタ種別ごとの `heavy_job_slot` / `interactive_session_slot` を予約・精算と連動させ、`SubprocessResult` の実測 `process_start_id`・`peak_rss_bytes`・`cpu_ms` を `ActionRecord` / `UsageMetrics` へ記録・伝播。
   - 公開 API を追加：`resolve_reconciled_action`, `commit_worker_result`, `acquire_lease`, `touch_lease`, `expire_idle_leases`, `close_lease`, `recover_guest_ready`, `register_scope`, `save_verifier_expectation`, `load_verifier_expectations`, `register_default_verifier`。
   - `describe_run()` に `session_leases` 一覧および `reconciliation_required` アクション要約（`fencing_token`, `error_code` 含む）を統合。
@@ -38,7 +38,7 @@
   - [`tests/integration/test_p3_five_fixtures_mvp_e2e.py`](../tests/integration/test_p3_five_fixtures_mvp_e2e.py)（6件：`docs/09` §2 の合成試料 5 件一気通貫検証＋`CTF-09` オフライン境界＋`CTF-12`＋CLI 統合検証）
 
 ### 固定依存版・ライセンス根拠
-- `pyproject.toml` の依存パッケージおよび固定バージョン（`fastmcp==3.2.4`, `mcp==1.27.0`, `pydantic==2.13.0`, `pyyaml==6.0.3` 等）は**一切変更していない**。
+- `pyproject.toml` の依存パッケージおよび固定バージョン（`fastmcp==4.1.8`, `mcp==2.3.0`, `pydantic==2.14.3`, `jsonschema[format-nongpl]==4.26.0`, dev: `pytest==9.2.0`）は**一切変更していない**（`PyYAML==6.0.3` は [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md) 記載の推移的依存であり `pyproject.toml` 直接指定ではない）。
 - `THIRD_PARTY_LICENSES.md`（既知分布 80 件 / Copyleft 0 / Unknown 0）も無変更のまま維持している。
 
 ---
@@ -98,7 +98,7 @@
 ## 5. 全数テスト・安全性検証サマリー & 再現・ロールバック手順
 
 ### 全数検証結果
-- `pytest` 全数実行: **`85 passed, 1 warning in 31.21s`**（既存 73 件 ＋ 新規 P3-B+C テスト 12 件すべて合格、skip 0 / fail 0。warning 1 件は `beartype` における外部 `key_value` protocol に係る既知 `DeprecationWarning`）
+- `pytest` 全数実行: **`85 passed, 1 warning`**（既存 73 件 ＋ 新規 P3-B+C テスト 12 件すべて合格、skip 0 / fail 0。warning 1 件は `beartype` における外部 `key_value` protocol に係る既知 `DeprecationWarning`）
 - `src/**/*.py` AST 構文スキャン（`shell=True`, `os.system`, `eval`, `exec`）: **0 件**
 
 ### 再現手順

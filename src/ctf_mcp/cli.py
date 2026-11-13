@@ -22,6 +22,7 @@ from typing import Any
 
 from ctf_mcp.config import (
     HarnessConfig,
+    get_cursor_hmac_key,
     load_config_file,
     load_runtime_settings,
 )
@@ -122,11 +123,15 @@ def _resolve_admin_context(
         settings = settings.model_copy(update={"profile": config.profile})
 
     has_env_key = bool(str(eff_env.get("CTF_MCP_CURSOR_HMAC_KEY", "")).strip())
+    cursor_hmac_key = get_cursor_hmac_key(
+        eff_env, allow_ephemeral_dev_key=not has_env_key
+    )
     storage = Storage(settings.db_path)
     controller = create_default_controller(
         storage=storage,
         vault_root=settings.vault_root,
         export_root=settings.vault_root / "_exports",
+        cursor_hmac_key=cursor_hmac_key,
         config=config,
         runtime_settings=settings,
         allow_ephemeral_cursor_key=not has_env_key,

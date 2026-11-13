@@ -8,7 +8,9 @@ verification, audit sanitization, crash reconciliation, and ordered run closure.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import os
 import sqlite3
 import threading
@@ -23,6 +25,7 @@ from ctf_mcp.adapters import (
     PRODUCTION_DEFAULT_ENABLED as SYNTHETIC_PRODUCTION_DEFAULT_ENABLED,
     StaticArtifactInspectorAdapter,
     SyntheticAdapter,
+    is_os_process_alive,
 )
 from ctf_mcp.config import (
     HarnessConfig,
@@ -39,10 +42,12 @@ from ctf_mcp.contracts import (
     BudgetSpec,
     CapabilityDeniedError,
     CapabilityDescriptor,
+    ConfigurationError,
     ContractViolationError,
     EnvelopeStatus,
     ErrorDetail,
     EvidencePage,
+    EvidenceRef,
     ExecutionClass,
     FindingRecord,
     GuestBlockedError,
@@ -72,6 +77,7 @@ from ctf_mcp.evidence import (
     RunReportExporter,
     scan_sensitive_markers,
 )
+from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
 from ctf_mcp.gateway import (
     ArtifactIntakeService,
     AuditLogger,
@@ -89,17 +95,23 @@ from ctf_mcp.gateway import (
 )
 from ctf_mcp.runs import (
     ActionManager,
+    ActionSubmission,
     HypothesisManager,
     LeaseManager,
     ReconciliationReport,
     RecoveryManager,
     RunManifestManager,
     RunSnapshot,
+    SessionLease,
+    SessionLeaseState,
     assert_no_secrets_in_manifest,
+    ensure_action_slots_schema_in_tx,
 )
 from ctf_mcp.storage import Storage
 from ctf_mcp.verification import (
     CloseIntegrityReport,
+    ExpectedChallengeSpec,
+    LocalCtfVerifier,
     VerifierRegistry,
     evaluate_close_integrity_in_tx,
     load_verifications_for_run,
@@ -150,6 +162,67 @@ class RunCloseResult:
     export_result: ExportResult
     integrity_report: CloseIntegrityReport
     guest_rolled_back: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedTelemetry:
+    """Real OS process identity and resource usage extracted from adapter capture."""
+
+    process_start_id: str | None = None
+    peak_rss_bytes: int | None = None
+    cpu_ms: int | None = None
+
+
+HYPOTHESIS_REQUESTS_DDL = """
+CREATE TABLE IF NOT EXISTS hypothesis_requests (
+    principal_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    hypothesis_id TEXT NOT NULL,
+    result_revision INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (principal_id, run_id, request_id)
+);
+"""
+
+
+def _ensure_hypothesis_requests_schema_in_tx(conn: sqlite3.Connection) -> None:
+    """Ensure the hypothesis idempotency ledger table exists inside an active transaction."""
+    conn.execute(HYPOTHESIS_REQUESTS_DDL)
+
+
+def _compute_hypothesis_request_digest(
+    *,
+    run_id: str,
+    hypothesis_id: str | None,
+    expected_revision: int | None,
+    state: HypothesisState,
+    claim: str | None,
+    next_observation: str | None,
+    supporting_evidence_ids: Sequence[str],
+    contradicting_evidence_ids: Sequence[str],
+    add_supporting_evidence_ids: Sequence[str],
+    add_contradicting_evidence_ids: Sequence[str],
+) -> str:
+    """Compute canonical SHA-256 digest of sanitized hypothesis update parameters."""
+    payload = {
+        "run_id": run_id,
+        "hypothesis_id": hypothesis_id,
+        "expected_revision": expected_revision,
+        "state": state.value,
+        "claim": claim,
+        "next_observation": next_observation,
+        "supporting_evidence_ids": list(supporting_evidence_ids),
+        "contradicting_evidence_ids": list(contradicting_evidence_ids),
+        "add_supporting_evidence_ids": list(add_supporting_evidence_ids),
+        "add_contradicting_evidence_ids": list(add_contradicting_evidence_ids),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _sanitize_value(value: Any) -> Any:
@@ -322,7 +395,11 @@ class HarnessController:
         self._supervisor_instance_id = (
             supervisor_instance_id or f"sup-{os.getpid()}-{uuid4().hex[:8]}"
         )
-        self._is_process_alive = is_process_alive
+        self._is_process_alive = (
+            is_process_alive
+            if is_process_alive is not None
+            else (lambda action: is_os_process_alive(action.process_start_id))
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
 
         if authenticator is not None:
@@ -382,17 +459,120 @@ class HarnessController:
     # Startup, registration, and capability visibility
     # ------------------------------------------------------------------
 
+    def _ensure_controller_schemas_in_tx(self, conn: sqlite3.Connection) -> None:
+        """Ensure supplemental runtime schemas exist inside an active transaction."""
+        ensure_action_slots_schema_in_tx(conn)
+        _ensure_hypothesis_requests_schema_in_tx(conn)
+
+    def _record_reconciliation_audits_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        report: ReconciliationReport,
+        *,
+        ts: datetime,
+    ) -> None:
+        """Persist sanitized audit summaries for actions and leases reconciled at startup."""
+        for act in report.reconciled_to_required:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=act.run_id,
+                    principal_id=act.principal_id,
+                    action_id=act.action_id,
+                    capability=act.capability_name,
+                    operation=act.operation,
+                    outcome=EnvelopeStatus.TOOL_ERROR.value,
+                    usage=None,
+                    scope_revision=act.scope_revision,
+                    destination_summary=(
+                        f"reconcile:reconciliation_required;fencing_token={act.fencing_token};"
+                        f"lost_sessions={len(report.lost_session_ids)}"
+                    ),
+                ),
+            )
+        for act in report.expired_reserved:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=act.run_id,
+                    principal_id=act.principal_id,
+                    action_id=act.action_id,
+                    capability=act.capability_name,
+                    operation=act.operation,
+                    outcome=EnvelopeStatus.DENIED.value,
+                    usage=None,
+                    scope_revision=act.scope_revision,
+                    destination_summary="reconcile:expired_reserved",
+                ),
+            )
+        for act in report.still_running:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=act.run_id,
+                    principal_id=act.principal_id,
+                    action_id=act.action_id,
+                    capability=act.capability_name,
+                    operation=act.operation,
+                    outcome="still_running",
+                    usage=None,
+                    scope_revision=act.scope_revision,
+                    destination_summary=f"reconcile:still_running;fencing_token={act.fencing_token}",
+                ),
+            )
+        for sid in report.lost_session_ids:
+            lease_row = conn.execute(
+                """
+                SELECT s.run_id, s.principal_id, s.capability_name, r.scope_revision
+                FROM session_leases s
+                JOIN runs r ON r.run_id = s.run_id
+                WHERE s.session_id = ?
+                """,
+                (sid,),
+            ).fetchone()
+            if lease_row is not None:
+                self.audit.record_sanitized_in_tx(
+                    conn,
+                    AuditEvent(
+                        event_id=f"aud-{uuid4().hex}",
+                        timestamp=ts,
+                        run_id=str(lease_row["run_id"]),
+                        principal_id=str(lease_row["principal_id"]),
+                        action_id=None,
+                        capability=str(lease_row["capability_name"]),
+                        operation="session_lost_on_restart",
+                        outcome="lost",
+                        usage=None,
+                        scope_revision=str(lease_row["scope_revision"]),
+                        destination_summary=f"session_id={sid};reason=supervisor_restarted",
+                    ),
+                )
+
     def initialize(self) -> ReconciliationReport:
-        """Initialize storage schema, lease tables, descriptors, and reconcile crashes."""
+        """Initialize storage schema, lease/slot tables, descriptors, and reconcile crashes."""
         self.storage.initialize()
+        with self.storage.transaction() as conn:
+            self._ensure_controller_schemas_in_tx(conn)
         self.leases.ensure_schema()
         self.catalog.verify_all_descriptors()
-        return self.recovery.reconcile_inflight_actions(
-            supervisor_key=self._supervisor_key,
-            is_process_alive=self._is_process_alive,
-            mark_sessions_lost=True,
-            now=self._now(),
-        )
+
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            report = self.recovery.reconcile_inflight_actions_in_tx(
+                conn,
+                supervisor_key=self._supervisor_key,
+                is_process_alive=self._is_process_alive,
+                mark_sessions_lost=True,
+                now=ts,
+            )
+            self._record_reconciliation_audits_in_tx(conn, report, ts=ts)
+        return report
 
     def register_adapter(
         self,
@@ -703,6 +883,65 @@ class HarnessController:
             )
         return created
 
+    def register_scope(
+        self,
+        *,
+        run_id: str,
+        scope: ScopePolicy,
+        principal: PrincipalContext | None = None,
+        activate: bool = True,
+    ) -> ScopePolicy:
+        """Register and optionally activate a new immutable scope revision on an open run."""
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            snapshot = (
+                self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+                if principal is not None
+                else self.runs.get_run_snapshot_in_tx(conn, run_id)
+            )
+            registered = self.scope_validator.register_scope_in_tx(
+                conn, run_id, scope, activate=activate
+            )
+            if activate:
+                updated_manifest = snapshot.manifest.model_copy(
+                    update={
+                        "scope_revision": registered.scope_revision,
+                        "scope_sha256": registered.scope_sha256,
+                        "scope_expires_at": registered.expires_at,
+                    }
+                )
+                assert_no_secrets_in_manifest(updated_manifest)
+                conn.execute(
+                    "UPDATE runs SET scope_revision = ?, manifest_json = ?, revision = revision + 1 WHERE run_id = ?",
+                    (
+                        registered.scope_revision,
+                        updated_manifest.model_dump_json(),
+                        run_id,
+                    ),
+                )
+            eff_principal = (
+                principal.principal_id
+                if principal is not None
+                else snapshot.manifest.owner_principal_id
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=eff_principal,
+                    action_id=None,
+                    capability="scope.register",
+                    operation="activate" if activate else "register",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=registered.scope_revision,
+                    destination_summary=f"task_id={registered.task_id};activate={bool(activate)}",
+                ),
+            )
+        return registered
+
     def ingest_artifact(
         self,
         *,
@@ -780,10 +1019,19 @@ class HarnessController:
         with self.storage.transaction() as conn:
             snapshot = self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
             budget = get_budget_snapshot_in_tx(conn, run_id)
+            err_rows = conn.execute(
+                "SELECT action_id, error_code FROM actions WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        error_code_by_id = {
+            str(r["action_id"]): (str(r["error_code"]) if r["error_code"] is not None else None)
+            for r in err_rows
+        }
 
         artifacts = self.intake.list_artifacts(run_id=run_id, principal_id=principal.principal_id)
         hypotheses = self.hypotheses.list_hypotheses(run_id)
         actions = self.actions.list_actions(run_id)
+        leases = self.leases.list_leases(run_id)
         verifications = load_verifications_for_run(self.storage, run_id)
         visible_caps = self.list_visible_tools(principal=principal, run_id=run_id)
         visible_mcp_tools = sorted(
@@ -825,10 +1073,43 @@ class HarnessController:
                     "capability_name": a.capability_name,
                     "operation": a.operation,
                     "state": a.state.value,
+                    "fencing_token": a.fencing_token,
+                    "process_start_id": a.process_start_id,
+                    "error_code": error_code_by_id.get(a.action_id),
                     "used_ms": a.used_ms,
                     "used_bytes": a.used_bytes,
                 }
                 for a in actions
+            ],
+            "reconciliation_required": [
+                {
+                    "action_id": a.action_id,
+                    "request_id": a.request_id,
+                    "capability_name": a.capability_name,
+                    "operation": a.operation,
+                    "fencing_token": a.fencing_token,
+                    "error_code": error_code_by_id.get(a.action_id),
+                }
+                for a in actions
+                if a.state == ActionLifecycleState.RECONCILIATION_REQUIRED
+            ],
+            "session_leases": [
+                {
+                    "session_id": lease.session_id,
+                    "capability_name": lease.capability_name,
+                    "adapter_revision": lease.adapter_revision,
+                    "artifact_id": lease.artifact_id,
+                    "state": lease.state.value,
+                    "supervisor_instance_id": lease.supervisor_instance_id,
+                    "created_at": lease.created_at.isoformat(),
+                    "last_activity_at": lease.last_activity_at.isoformat(),
+                    "expires_at": lease.expires_at.isoformat(),
+                    "closed_at": (
+                        lease.closed_at.isoformat() if lease.closed_at is not None else None
+                    ),
+                    "termination_reason": lease.termination_reason,
+                }
+                for lease in leases
             ],
             "verifications": [v.model_dump(mode="json") for v in verifications],
             "visible_capabilities": [c.name for c in visible_caps],
@@ -943,8 +1224,9 @@ class HarnessController:
         artifact_paths: dict[str, Path],
         source_artifact_hashes: tuple[str, ...] = (),
         cancel_event: threading.Event | None,
-    ) -> tuple[ActionLifecycleState, ResultEnvelope, bool, bytes]:
+    ) -> tuple[ActionLifecycleState, ResultEnvelope, bool, bytes, _ObservedTelemetry]:
         """Invoke adapter outside SQLite transactions and normalize outcome."""
+        telemetry = _ObservedTelemetry()
         try:
             if hasattr(adapter, "execute_with_capture"):
                 capture_kwargs: dict[str, Any] = {
@@ -959,6 +1241,13 @@ class HarnessController:
                 envelope = outcome.envelope
                 cleanup_confirmed = bool(outcome.cleanup_confirmed)
                 captured = outcome.captured_bytes
+                sub_res = getattr(outcome, "subprocess_result", None)
+                if sub_res is not None:
+                    telemetry = _ObservedTelemetry(
+                        process_start_id=getattr(sub_res, "process_start_id", None),
+                        peak_rss_bytes=getattr(sub_res, "peak_rss_bytes", None),
+                        cpu_ms=getattr(sub_res, "cpu_ms", None),
+                    )
             else:
                 envelope = adapter.execute(started)
                 cleanup_confirmed = (
@@ -986,24 +1275,34 @@ class HarnessController:
                     scope_revision=started.scope_revision,
                 ),
             )
-            return ActionLifecycleState.FAILED, fallback_env, False, b""
+            return ActionLifecycleState.FAILED, fallback_env, False, b"", telemetry
 
         target_state, normalized_err, clean_summary = _map_envelope_to_lifecycle_state(
             envelope,
             captured_bytes=captured,
         )
         clean_err = _sanitize_error_detail(normalized_err)
+        usage = envelope.usage
+        usage_updates: dict[str, Any] = {}
+        if usage.peak_rss_bytes is None and telemetry.peak_rss_bytes is not None:
+            usage_updates["peak_rss_bytes"] = telemetry.peak_rss_bytes
+        if usage.cpu_ms is None and telemetry.cpu_ms is not None:
+            usage_updates["cpu_ms"] = telemetry.cpu_ms
+        if usage_updates:
+            usage = usage.model_copy(update=usage_updates)
+
         normalized_env = envelope.model_copy(
             update={
                 "summary": clean_summary,
                 "error": clean_err,
+                "usage": usage,
                 "status": lifecycle_to_envelope_status(
                     target_state,
                     has_tool_receipt=(target_state == ActionLifecycleState.COMPLETED),
                 ),
             }
         )
-        return target_state, normalized_env, cleanup_confirmed, captured
+        return target_state, normalized_env, cleanup_confirmed, captured, telemetry
 
     def execute_action(
         self,
@@ -1216,6 +1515,8 @@ class HarnessController:
                 sanitized_args=sanitized_args,
                 reserved_ms=reservation.reserved_ms,
                 reserved_bytes=reservation.reserved_bytes,
+                heavy_job_slot=reservation.heavy_job_slot,
+                interactive_session_slot=reservation.interactive_session_slot,
                 manage_run_budget=False,
                 now=now,
             )
@@ -1244,11 +1545,6 @@ class HarnessController:
                     interactive_session_slot=reservation.interactive_session_slot,
                     cleanup_confirmed=True,
                 )
-                expired_err = ErrorDetail(
-                    code="action_expired",
-                    message=expiry_reason,
-                    retryable=False,
-                )
                 expired_sub = self.actions.settle_action_in_tx(
                     conn,
                     action_id=reserved_sub.action.action_id,
@@ -1257,8 +1553,14 @@ class HarnessController:
                     has_tool_receipt=False,
                     expiry_reason=expiry_reason,
                     summary=f"Action expired before launch: {expiry_reason}",
-                    error=expired_err,
+                    error=ErrorDetail(
+                        code="action_expired",
+                        message=expiry_reason,
+                        retryable=False,
+                    ),
                     retain_reservation=False,
+                    heavy_job_slot=reservation.heavy_job_slot,
+                    interactive_session_slot=reservation.interactive_session_slot,
                     manage_run_budget=False,
                     now=now,
                 )
@@ -1302,17 +1604,33 @@ class HarnessController:
         assert adapter_spec is not None
         assert active_scope is not None
 
-        target_state, normalized_env, cleanup_confirmed, _ = self._execute_adapter_outside_tx(
-            adapter=adapter_spec.adapter,
-            started=started,
-            artifact_paths=artifact_paths,
-            source_artifact_hashes=source_artifact_hashes,
-            cancel_event=cancel_event,
+        target_state, normalized_env, cleanup_confirmed, _, telemetry = (
+            self._execute_adapter_outside_tx(
+                adapter=adapter_spec.adapter,
+                started=started,
+                artifact_paths=artifact_paths,
+                source_artifact_hashes=source_artifact_hashes,
+                cancel_event=cancel_event,
+            )
         )
 
         # ---------------- TX2: Settle budget, settle action, cleanup mark, sanitized audit ----------------
         finish_now = self._now()
         with self.storage.transaction() as conn:
+            if telemetry.process_start_id:
+                conn.execute(
+                    """
+                    UPDATE actions
+                    SET process_start_id = ?, updated_at = ?
+                    WHERE action_id = ? AND fencing_token = ?
+                    """,
+                    (
+                        telemetry.process_start_id,
+                        finish_now.isoformat(),
+                        started.action_id,
+                        started.fencing_token,
+                    ),
+                )
             settle_run_budget_in_tx(
                 conn,
                 run_id=request.run_id,
@@ -1338,6 +1656,10 @@ class HarnessController:
                 next_cursor=normalized_env.next_cursor,
                 error=normalized_env.error,
                 retain_reservation=not cleanup_confirmed,
+                usage_unknown=not cleanup_confirmed,
+                heavy_job_slot=reservation.heavy_job_slot,
+                interactive_session_slot=reservation.interactive_session_slot,
+                cleanup_confirmed=cleanup_confirmed,
                 manage_run_budget=False,
                 supervisor_key=self._supervisor_key,
                 now=finish_now,
@@ -1497,9 +1819,16 @@ class HarnessController:
         add_supporting_evidence_ids: Sequence[str] = (),
         add_contradicting_evidence_ids: Sequence[str] = (),
         require_existing_evidence: bool = True,
+        request_id: str | None = None,
     ) -> HypothesisRecord:
-        """Create a new hypothesis or update an existing one with optimistic locking."""
+        """Create a new hypothesis or update an existing one with optional request_id idempotency."""
         now = self._now()
+        clean_req_id: str | None = None
+        if request_id is not None:
+            clean_req_id = request_id.strip()
+            if not clean_req_id:
+                raise ContractViolationError("hypothesis.update request_id cannot be blank.")
+
         target_state = state if isinstance(state, HypothesisState) else HypothesisState(state)
         clean_claim = sanitize_audit_text(claim) if claim is not None else None
         clean_next = sanitize_audit_text(next_observation) if next_observation is not None else None
@@ -1508,8 +1837,44 @@ class HarnessController:
         if clean_next is not None and contains_sensitive_marker(clean_next):
             raise ContractViolationError("Hypothesis next_observation must not contain sensitive markers.")
 
+        req_digest = (
+            _compute_hypothesis_request_digest(
+                run_id=run_id,
+                hypothesis_id=hypothesis_id,
+                expected_revision=expected_revision,
+                state=target_state,
+                claim=clean_claim,
+                next_observation=clean_next,
+                supporting_evidence_ids=supporting_evidence_ids,
+                contradicting_evidence_ids=contradicting_evidence_ids,
+                add_supporting_evidence_ids=add_supporting_evidence_ids,
+                add_contradicting_evidence_ids=add_contradicting_evidence_ids,
+            )
+            if clean_req_id is not None
+            else None
+        )
+
         with self.storage.transaction() as conn:
+            self._ensure_controller_schemas_in_tx(conn)
             snapshot = self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+
+            if clean_req_id is not None and req_digest is not None:
+                prior = conn.execute(
+                    """
+                    SELECT request_digest, response_json
+                    FROM hypothesis_requests
+                    WHERE principal_id = ? AND run_id = ? AND request_id = ?
+                    """,
+                    (principal.principal_id, run_id, clean_req_id),
+                ).fetchone()
+                if prior is not None:
+                    if str(prior["request_digest"]) != req_digest:
+                        raise ActionConflictError(
+                            f"Hypothesis update request_id {clean_req_id!r} was reused with conflicting arguments.",
+                            details={"run_id": run_id, "request_id": clean_req_id},
+                        )
+                    return HypothesisRecord.model_validate_json(str(prior["response_json"]))
+
             if snapshot.manifest.closed_at is not None:
                 raise ScopeDeniedError(f"Cannot modify hypotheses on closed run {run_id!r}.")
 
@@ -1559,6 +1924,26 @@ class HarnessController:
                     add_contradicting_evidence_ids=tuple(add_contradicting_evidence_ids),
                     require_existing_evidence=require_existing_evidence,
                     now=now,
+                )
+
+            if clean_req_id is not None and req_digest is not None:
+                conn.execute(
+                    """
+                    INSERT INTO hypothesis_requests (
+                        principal_id, run_id, request_id, request_digest,
+                        hypothesis_id, result_revision, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        principal.principal_id,
+                        run_id,
+                        clean_req_id,
+                        req_digest,
+                        record.hypothesis_id,
+                        record.revision,
+                        record.model_dump_json(),
+                        now.isoformat(),
+                    ),
                 )
 
             self.audit.record_sanitized_in_tx(
@@ -1662,6 +2047,433 @@ class HarnessController:
         return record
 
     # ------------------------------------------------------------------
+    # Crash reconciliation resolution, worker fencing, leases, & guest recovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_lifecycle_state(target_state: ActionLifecycleState | str) -> ActionLifecycleState:
+        return (
+            target_state
+            if isinstance(target_state, ActionLifecycleState)
+            else ActionLifecycleState(target_state)
+        )
+
+    @staticmethod
+    def _sanitize_summary_text(summary: str | None) -> str | None:
+        if summary is None:
+            return None
+        cleaned = sanitize_audit_text(summary)
+        if contains_sensitive_marker(cleaned):
+            raise ContractViolationError("Action summary must not contain sensitive markers.")
+        return cleaned
+
+    def _get_snapshot_and_principal_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        principal: PrincipalContext | None,
+    ) -> tuple[RunSnapshot, str]:
+        snapshot = (
+            self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+            if principal is not None
+            else self.runs.get_run_snapshot_in_tx(conn, run_id)
+        )
+        eff_principal = (
+            principal.principal_id
+            if principal is not None
+            else snapshot.manifest.owner_principal_id
+        )
+        return snapshot, eff_principal
+
+    def resolve_reconciled_action(
+        self,
+        *,
+        action_id: str,
+        target_state: ActionLifecycleState | str,
+        principal: PrincipalContext | None = None,
+        usage: UsageMetrics | None = None,
+        has_tool_receipt: bool = False,
+        summary: str | None = None,
+        evidence: Sequence[EvidenceRef] = (),
+        error: ErrorDetail | None = None,
+        process_start_id: str | None = None,
+        retain_reservation: bool = False,
+        usage_unknown: bool | None = None,
+        cleanup_confirmed: bool = True,
+    ) -> ActionSubmission:
+        """Resolve an action in ``reconciliation_required`` with audit recording."""
+        target_lifecycle = self._coerce_lifecycle_state(target_state)
+        clean_summary = self._sanitize_summary_text(summary)
+        clean_err = _sanitize_error_detail(error)
+        ts = self._now()
+
+        with self.storage.transaction() as conn:
+            self._ensure_controller_schemas_in_tx(conn)
+            current = self.actions.get_action_with_envelope_in_tx(conn, action_id).action
+            snapshot, eff_principal = self._get_snapshot_and_principal_in_tx(
+                conn, run_id=current.run_id, principal=principal
+            )
+            resolved = self.recovery.resolve_reconciled_action_in_tx(
+                conn,
+                action_id=action_id,
+                target_state=target_lifecycle,
+                usage=usage,
+                has_tool_receipt=has_tool_receipt,
+                summary=clean_summary,
+                evidence=tuple(evidence),
+                error=clean_err,
+                supervisor_key=self._supervisor_key,
+                supervisor_instance_id=self._supervisor_instance_id,
+                process_start_id=process_start_id,
+                retain_reservation=retain_reservation,
+                usage_unknown=usage_unknown,
+                cleanup_confirmed=cleanup_confirmed,
+                manage_run_budget=True,
+                now=ts,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=current.run_id,
+                    principal_id=eff_principal,
+                    action_id=current.action_id,
+                    capability=current.capability_name,
+                    operation=f"reconcile_resolve:{target_lifecycle.value}",
+                    outcome=(
+                        resolved.envelope.status.value
+                        if resolved.envelope is not None
+                        else target_lifecycle.value
+                    ),
+                    usage=usage,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"retain_reservation={bool(retain_reservation)};"
+                        f"cleanup_confirmed={bool(cleanup_confirmed)}"
+                    ),
+                ),
+            )
+            return resolved
+
+    def commit_worker_result(
+        self,
+        *,
+        action_id: str,
+        fencing_token: int,
+        target_state: ActionLifecycleState | str,
+        usage: UsageMetrics,
+        principal: PrincipalContext | None = None,
+        has_tool_receipt: bool = True,
+        summary: str | None = None,
+        evidence: Sequence[EvidenceRef] = (),
+        truncated: bool = False,
+        next_cursor: str | None = None,
+        error: ErrorDetail | None = None,
+        usage_unknown: bool = False,
+        cleanup_confirmed: bool = True,
+    ) -> ActionSubmission:
+        """Commit an out-of-band worker result guarded by strict fencing verification."""
+        target_lifecycle = self._coerce_lifecycle_state(target_state)
+        clean_summary = self._sanitize_summary_text(summary)
+        clean_err = _sanitize_error_detail(error)
+        ts = self._now()
+
+        with self.storage.transaction() as conn:
+            self._ensure_controller_schemas_in_tx(conn)
+            current = self.actions.get_action_with_envelope_in_tx(conn, action_id).action
+            snapshot, eff_principal = self._get_snapshot_and_principal_in_tx(
+                conn, run_id=current.run_id, principal=principal
+            )
+            committed = self.recovery.commit_worker_result_in_tx(
+                conn,
+                action_id=action_id,
+                fencing_token=fencing_token,
+                target_state=target_lifecycle,
+                usage=usage,
+                has_tool_receipt=has_tool_receipt,
+                summary=clean_summary,
+                evidence=tuple(evidence),
+                truncated=truncated,
+                next_cursor=next_cursor,
+                error=clean_err,
+                supervisor_key=self._supervisor_key,
+                usage_unknown=usage_unknown,
+                cleanup_confirmed=cleanup_confirmed,
+                manage_run_budget=True,
+                now=ts,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=current.run_id,
+                    principal_id=eff_principal,
+                    action_id=current.action_id,
+                    capability=current.capability_name,
+                    operation=f"worker_commit:{target_lifecycle.value}",
+                    outcome=(
+                        committed.envelope.status.value
+                        if committed.envelope is not None
+                        else target_lifecycle.value
+                    ),
+                    usage=usage,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"fencing_token={fencing_token};cleanup_confirmed={bool(cleanup_confirmed)}"
+                    ),
+                ),
+            )
+            return committed
+
+    def acquire_lease(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        capability_name: str,
+        adapter_revision: str | None = None,
+        artifact_id: str | None = None,
+        endpoint: str | None = None,
+        idle_seconds: int | None = None,
+    ) -> SessionLease:
+        """Acquire a bounded interactive session lease within run concurrency limits."""
+        ts = self._now()
+        resolved_rev = adapter_revision
+        with self.storage.transaction() as conn:
+            snapshot = self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+            if not resolved_rev:
+                with self._lock:
+                    spec = self._adapters.get(capability_name)
+                if spec is not None:
+                    resolved_rev = spec.descriptor.adapter_commit
+                else:
+                    try:
+                        resolved_rev = self.catalog.get_capability(
+                            capability_name, snapshot.manifest.mode
+                        ).adapter_commit
+                    except CapabilityDeniedError:
+                        resolved_rev = "unregistered"
+            lease = self.leases.acquire_lease_in_tx(
+                conn,
+                run_id=run_id,
+                principal_id=principal.principal_id,
+                capability_name=capability_name,
+                adapter_revision=resolved_rev,
+                artifact_id=artifact_id,
+                endpoint=endpoint,
+                supervisor_instance_id=self._supervisor_instance_id,
+                idle_seconds=idle_seconds,
+                now=ts,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=principal.principal_id,
+                    action_id=None,
+                    capability="session.lease",
+                    operation="acquire",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=f"session_id={lease.session_id};capability={capability_name}",
+                ),
+            )
+            return lease
+
+    def touch_lease(
+        self,
+        *,
+        session_id: str,
+        run_id: str | None = None,
+        principal: PrincipalContext | None = None,
+    ) -> SessionLease:
+        """Extend an active session lease heartbeat or fail closed if idle-expired."""
+        ts = self._now()
+        existing = self.leases.get_lease(session_id)
+        if run_id is not None and existing.run_id != run_id:
+            raise ScopeDeniedError(
+                f"Session lease {session_id!r} does not belong to run {run_id!r}."
+            )
+        if principal is not None:
+            _ = self._get_owned_snapshot(principal=principal, run_id=existing.run_id)
+        updated = self.leases.touch_lease(
+            session_id,
+            run_id=run_id,
+            principal_id=(principal.principal_id if principal is not None else None),
+            now=ts,
+        )
+        with self.storage.transaction() as conn:
+            snap = self.runs.get_run_snapshot_in_tx(conn, updated.run_id)
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=updated.run_id,
+                    principal_id=(
+                        principal.principal_id if principal is not None else updated.principal_id
+                    ),
+                    action_id=None,
+                    capability="session.lease",
+                    operation="touch",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snap.manifest.scope_revision,
+                    destination_summary=f"session_id={updated.session_id};expires_at={updated.expires_at.isoformat()}",
+                ),
+            )
+        return updated
+
+    def expire_idle_leases(
+        self,
+        *,
+        principal: PrincipalContext | None = None,
+        run_id: str | None = None,
+    ) -> list[SessionLease]:
+        """Sweep and expire idle session leases, releasing session concurrency slots."""
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            if principal is not None and run_id is not None:
+                _ = self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+            expired = self.leases.expire_idle_leases_in_tx(conn, run_id=run_id, now=ts)
+            for lease in expired:
+                if principal is not None and lease.principal_id != principal.principal_id:
+                    continue
+                snap = self.runs.get_run_snapshot_in_tx(conn, lease.run_id)
+                self.audit.record_sanitized_in_tx(
+                    conn,
+                    AuditEvent(
+                        event_id=f"aud-{uuid4().hex}",
+                        timestamp=ts,
+                        run_id=lease.run_id,
+                        principal_id=lease.principal_id,
+                        action_id=None,
+                        capability="session.lease",
+                        operation="expire_idle",
+                        outcome=SessionLeaseState.EXPIRED.value,
+                        usage=None,
+                        scope_revision=snap.manifest.scope_revision,
+                        destination_summary=f"session_id={lease.session_id};reason={lease.termination_reason}",
+                    ),
+                )
+            return expired
+
+    def close_lease(
+        self,
+        *,
+        session_id: str,
+        run_id: str | None = None,
+        principal: PrincipalContext | None = None,
+        reason: str = "closed_by_client",
+    ) -> SessionLease:
+        """Close an active session lease cleanly and record audit summary."""
+        ts = self._now()
+        clean_reason = sanitize_audit_text(reason) or "closed_by_client"
+        if contains_sensitive_marker(clean_reason):
+            raise ContractViolationError("Lease close reason must not contain sensitive markers.")
+
+        with self.storage.transaction() as conn:
+            self.leases.ensure_schema()
+            row = conn.execute(
+                "SELECT * FROM session_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ContractViolationError(f"Session lease {session_id!r} does not exist.")
+            existing_run_id = str(row["run_id"])
+            existing_principal = str(row["principal_id"])
+            if run_id is not None and existing_run_id != run_id:
+                raise ScopeDeniedError(
+                    f"Session lease {session_id!r} does not belong to run {run_id!r}."
+                )
+            if principal is not None:
+                snapshot = self._get_owned_snapshot_in_tx(
+                    conn, principal=principal, run_id=existing_run_id
+                )
+                if existing_principal != principal.principal_id:
+                    raise ScopeDeniedError(
+                        f"Principal {principal.principal_id!r} does not own session {session_id!r}."
+                    )
+            else:
+                snapshot = self.runs.get_run_snapshot_in_tx(conn, existing_run_id)
+
+            closed = self.leases.close_lease_in_tx(
+                conn,
+                session_id,
+                run_id=run_id,
+                reason=clean_reason,
+                now=ts,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=closed.run_id,
+                    principal_id=(
+                        principal.principal_id if principal is not None else closed.principal_id
+                    ),
+                    action_id=None,
+                    capability="session.lease",
+                    operation="close",
+                    outcome=SessionLeaseState.CLOSED.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=f"session_id={closed.session_id};reason={clean_reason}",
+                ),
+            )
+            return closed
+
+    def recover_guest_ready(
+        self,
+        *,
+        run_id: str,
+        cleanup_verified: bool,
+        note: str,
+        principal: PrincipalContext | None = None,
+    ) -> GuestHealthState:
+        """Restore a ``cleanup_unconfirmed`` run to ``ready`` after operator cleanup verification."""
+        ts = self._now()
+        clean_note = sanitize_audit_text(note)
+        if contains_sensitive_marker(clean_note):
+            raise ContractViolationError("Recovery note must not contain sensitive markers.")
+
+        with self.storage.transaction() as conn:
+            snapshot, eff_principal = self._get_snapshot_and_principal_in_tx(
+                conn, run_id=run_id, principal=principal
+            )
+            health = self.recovery.recover_guest_ready_in_tx(
+                conn,
+                run_id,
+                cleanup_verified=cleanup_verified,
+                note=clean_note,
+                now=ts,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=eff_principal,
+                    action_id=None,
+                    capability="guest.recover",
+                    operation="recover_ready",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=f"note={clean_note}",
+                ),
+            )
+            return health
+
+    # ------------------------------------------------------------------
     # Ordered run closure & report export
     # ------------------------------------------------------------------
 
@@ -1691,15 +2503,18 @@ class HarnessController:
         1. Verify pre-rollback integrity (no active heavy/session jobs, zero
            non-terminal actions, guest_health != cleanup_unconfirmed, evidence
            hashes valid, child processes stopped, bounded import confirmed).
-        2. Generate and verify sanitized report via RunReportExporter BEFORE guest
-           rollback (import_confirmed checked before rollback per docs/11).
-        3. Invoke guest rollback hook (defaults to local offline rollback = True).
-        4. Mark guest rolled back in TX, verify post-rollback close integrity,
-           mark run closed in manifest, and record sanitized audit event.
+        2. Prepare and verify sanitized report IN MEMORY via RunReportExporter BEFORE
+           guest rollback (never leaves unconfirmed report files on disk).
+        3. Invoke guest rollback hook (defaults to local offline rollback = True)
+           and mark guest_health = 'rolled_back' in TX.
+        4. Verify final post-rollback close integrity, atomically write the verified
+           report via write_verified_report, mark run closed, and record audit event.
         """
         snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
         if snapshot.manifest.closed_at is not None:
             raise ScopeDeniedError(f"Run {run_id!r} is already closed.")
+        if output_relpath is not None and self.report_exporter.export_root is None:
+            raise ConfigurationError("output_relpath requires export_root to be configured.")
 
         # Step 1: Pre-rollback integrity check.
         with self.storage.read_connection() as conn:
@@ -1729,13 +2544,11 @@ class HarnessController:
                 details=details,
             )
 
-        # Step 2: Export sanitized report BEFORE guest rollback (docs/11 §4 ordering).
-        export_result = self.report_exporter.export_run_report(
+        # Step 2: Prepare sanitized report in memory BEFORE guest rollback (no disk write yet).
+        prepared_report = self.report_exporter.prepare_run_report(
             run_id=run_id,
             principal_id=principal.principal_id,
             language=language,
-            output_relpath=output_relpath,
-            overwrite=overwrite,
             cleanup_confirmed=pre_report.cleanup_confirmed,
             import_confirmed=pre_report.import_verified,
             require_rolled_back=False,
@@ -1747,18 +2560,28 @@ class HarnessController:
             include_evidence_excerpts=include_evidence_excerpts,
         )
 
-        # Step 3: Guest rollback (host import & report already verified and saved).
-        rollback_ok = True if vm_rollback_hook is None else bool(vm_rollback_hook(run_id))
+        # Step 3: Guest rollback (report verified in memory; failure leaves zero files on disk).
+        try:
+            rollback_ok = True if vm_rollback_hook is None else bool(vm_rollback_hook(run_id))
+        except GuestBlockedError:
+            raise
+        except Exception as exc:
+            raise GuestBlockedError(
+                f"Guest rollback hook failed for run {run_id!r}; run remains open.",
+                details={"run_id": run_id, "error": sanitize_audit_text(str(exc))},
+            ) from exc
         if not rollback_ok:
             raise GuestBlockedError(
                 f"Guest rollback failed for run {run_id!r}; run remains open.",
                 details={"run_id": run_id},
             )
 
-        # Step 4: Mark guest rolled back, verify final close integrity, close run, audit.
-        close_ts = self._now()
         with self.storage.transaction() as conn:
             self.recovery.mark_guest_rolled_back_in_tx(conn, run_id)
+
+        # Step 4: Verify final close integrity -> write verified report -> close run -> audit.
+        close_ts = self._now()
+        with self.storage.transaction() as conn:
             final_report = evaluate_close_integrity_in_tx(
                 conn,
                 run_id=run_id,
@@ -1778,6 +2601,31 @@ class HarnessController:
                     f"{final_report.blocking_reasons}.",
                     details=final_report.model_dump(mode="json"),
                 )
+            final_prepared = self.report_exporter.prepare_run_report(
+                run_id=run_id,
+                principal_id=principal.principal_id,
+                language=language,
+                cleanup_confirmed=final_report.cleanup_confirmed,
+                import_confirmed=final_report.import_verified,
+                require_rolled_back=True,
+                expected_evidence_ids=expected_evidence_ids,
+                findings=findings,
+                metadata=metadata,
+                auto_redact=auto_redact_report,
+                forbidden_literals=forbidden_literals,
+                include_evidence_excerpts=include_evidence_excerpts,
+                conn=conn,
+            )
+            _ = prepared_report
+            if output_relpath is not None:
+                export_result = self.report_exporter.write_verified_report(
+                    final_prepared,
+                    output_relpath=output_relpath,
+                    overwrite=overwrite,
+                    forbidden_literals=forbidden_literals,
+                )
+            else:
+                export_result = final_prepared
             closed_manifest = self.runs.close_run_in_tx(conn, run_id, closed_at=close_ts)
             self.audit.record_sanitized_in_tx(
                 conn,
@@ -1833,6 +2681,84 @@ def register_default_adapters(
     return inspector
 
 
+VERIFIER_EXPECTATIONS_RELPATH = "_verifier/expectations.json"
+
+
+def load_verifier_expectations(
+    vault_root: str | Path,
+) -> tuple[dict[str, ExpectedChallengeSpec], dict[str, ExpectedChallengeSpec]]:
+    """Load digest-only verifier expectations stored inside the private vault root."""
+    vault_path = Path(vault_root)
+    target = vault_path / VERIFIER_EXPECTATIONS_RELPATH
+    if not target.exists():
+        return {}, {}
+    raw = safe_read_bounded(
+        vault_path,
+        VERIFIER_EXPECTATIONS_RELPATH,
+        max_bytes=1_048_576,
+        allow_truncate=False,
+    )
+    payload = json.loads(raw.data.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ConfigurationError("Verifier expectations file must contain a JSON object.")
+    by_run = {
+        str(k): ExpectedChallengeSpec.model_validate(v)
+        for k, v in dict(payload.get("runs") or {}).items()
+    }
+    by_task = {
+        str(k): ExpectedChallengeSpec.model_validate(v)
+        for k, v in dict(payload.get("tasks") or {}).items()
+    }
+    return by_run, by_task
+
+
+def save_verifier_expectation(
+    vault_root: str | Path,
+    *,
+    spec: ExpectedChallengeSpec,
+    run_id: str | None = None,
+    task_id: str | None = None,
+) -> Path:
+    """Persist a digest-only ExpectedChallengeSpec for a run_id and/or task_id atomically."""
+    if not run_id and not task_id:
+        raise ContractViolationError("At least one of run_id or task_id must be specified.")
+    vault_path = Path(vault_root)
+    vault_path.mkdir(parents=True, exist_ok=True)
+    by_run, by_task = load_verifier_expectations(vault_path)
+    if run_id:
+        by_run[run_id] = spec
+    if task_id:
+        by_task[task_id] = spec
+    data = {
+        "runs": {k: v.model_dump(mode="json") for k, v in sorted(by_run.items())},
+        "tasks": {k: v.model_dump(mode="json") for k, v in sorted(by_task.items())},
+    }
+    return safe_write_atomic(
+        vault_path,
+        VERIFIER_EXPECTATIONS_RELPATH,
+        (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        overwrite=True,
+        create_parents=True,
+    )
+
+
+def register_default_verifier(
+    controller: HarnessController,
+    *,
+    replace: bool = False,
+) -> LocalCtfVerifier:
+    """Register the standard LocalCtfVerifier loaded with any private vault expectations."""
+    expected_by_run, expected_by_task = load_verifier_expectations(controller.vault_root)
+    verifier = LocalCtfVerifier(
+        storage=controller.storage,
+        vault_root=controller.vault_root,
+        expected_by_run=expected_by_run,
+        expected_by_task=expected_by_task,
+    )
+    controller.register_verifier(verifier, replace=replace)
+    return verifier
+
+
 def create_default_controller(
     *,
     storage: Storage,
@@ -1845,6 +2771,7 @@ def create_default_controller(
     allow_ephemeral_cursor_key: bool = False,
     allow_synthetic_adapters: bool = False,
     enable_static_inspector: bool | None = None,
+    enable_local_verifier: bool = False,
     static_inspector_enabled: bool = True,
     timeout_seconds: int | None = None,
     max_output_bytes: int = 65_536,
@@ -1875,7 +2802,14 @@ def create_default_controller(
     if enable_static_inspector is None:
         if config is not None and config.execution.adapters_enabled:
             should_register = any(
-                item in {"analysis.query", "ctf-static-inspector", "static_inspector"}
+                item
+                in {
+                    "analysis.query",
+                    "artifact.inspect",
+                    "ctf-static-inspector",
+                    "ctf.static_inspector",
+                    "static_inspector",
+                }
                 for item in config.execution.adapters_enabled
             )
         else:
@@ -1883,10 +2817,13 @@ def create_default_controller(
     else:
         should_register = bool(enable_static_inspector)
 
+    if not initialize:
+        controller.storage.initialize()
+        with controller.storage.transaction() as conn:
+            controller._ensure_controller_schemas_in_tx(conn)
+        controller.leases.ensure_schema()
+
     if should_register:
-        if not initialize:
-            controller.storage.initialize()
-            controller.leases.ensure_schema()
         register_default_adapters(
             controller,
             static_inspector_enabled=static_inspector_enabled,
@@ -1895,5 +2832,8 @@ def create_default_controller(
             max_decode_bytes=max_decode_bytes,
             require_running_state=True,
         )
+
+    if enable_local_verifier:
+        register_default_verifier(controller)
 
     return controller

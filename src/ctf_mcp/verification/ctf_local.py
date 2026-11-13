@@ -491,7 +491,17 @@ class LocalCtfVerifier:
                         if source not in matched_sources:
                             matched_sources.append(source)
 
-                if matched_sources:
+                if (
+                    spec.require_complete_capture
+                    and incomplete_found
+                    and "claim" not in matched_sources
+                ):
+                    checks.append("expected_flag_sha256:rejected_incomplete_capture")
+                    limitations.append(
+                        "Cannot pass expected_flag_sha256 solely from an incomplete/truncated capture."
+                    )
+                    flag_check_passed = False
+                elif matched_sources:
                     checks.append(
                         f"expected_flag_sha256:matched({'+'.join(matched_sources)})"
                     )

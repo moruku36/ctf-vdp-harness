@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp import types as mt
 
+from ctf_mcp.adapters import is_os_process_alive
 from ctf_mcp.config import (
     HarnessConfig,
     RuntimeSettings,
@@ -32,12 +34,14 @@ from ctf_mcp.config import (
     load_runtime_settings,
 )
 from ctf_mcp.contracts import (
+    ActionLifecycleState,
     ActionRequest,
     AuthenticationError,
     CapabilityDeniedError,
     ConfigurationError,
     EvidenceAccessDeniedError,
     FindingRecord,
+    GuestHealthState,
     HarnessError,
     PrincipalContext,
     ScopeDeniedError,
@@ -48,6 +52,7 @@ from ctf_mcp.controller import (
     ACTION_DISPATCH_TOOLS,
     HarnessController,
     create_default_controller,
+    register_default_verifier,
 )
 from ctf_mcp.evidence import ReportMetadata
 from ctf_mcp.gateway import sanitize_audit_text
@@ -587,6 +592,7 @@ class HarnessMcpServer:
             contradicting_evidence_ids: list[str] | None = None,
             add_supporting_evidence_ids: list[str] | None = None,
             add_contradicting_evidence_ids: list[str] | None = None,
+            request_id: str | None = None,
         ) -> ToolResult:
             principal = self.resolve_principal()
             return await self._run_guarded(
@@ -602,6 +608,7 @@ class HarnessMcpServer:
                     contradicting_evidence_ids=tuple(contradicting_evidence_ids or ()),
                     add_supporting_evidence_ids=tuple(add_supporting_evidence_ids or ()),
                     add_contradicting_evidence_ids=tuple(add_contradicting_evidence_ids or ()),
+                    request_id=request_id,
                 ).model_dump(mode="json")
             )
 
@@ -631,7 +638,7 @@ class HarnessMcpServer:
 
         @self.mcp.tool(
             name="run.close",
-            description="Verify close integrity, export sanitized report, mark guest rollback, and close the run.",
+            description="Verify host close integrity, export sanitized report, mark guest rollback, and close the run.",
             annotations=mutating_hint,
         )
         async def run_close(
@@ -644,8 +651,6 @@ class HarnessMcpServer:
             forbidden_literals: list[str] | None = None,
             require_verification: bool = False,
             expected_evidence_ids: list[str] | None = None,
-            import_completed: bool = True,
-            child_processes_confirmed_stopped: bool = True,
             auto_redact_report: bool = True,
         ) -> ToolResult:
             principal = self.resolve_principal()
@@ -659,6 +664,12 @@ class HarnessMcpServer:
                     if metadata is not None
                     else None
                 )
+                (
+                    child_processes_stopped,
+                    unconfirmed_pids,
+                    import_completed,
+                    import_errors,
+                ) = _derive_host_close_checks(self.controller, run_id)
                 result = self.controller.close_run(
                     principal=principal,
                     run_id=run_id,
@@ -669,9 +680,11 @@ class HarnessMcpServer:
                     metadata=parsed_meta,
                     forbidden_literals=tuple(forbidden_literals or ()),
                     require_verification=require_verification,
-                    expected_evidence_ids=tuple(expected_evidence_ids or ()),
+                    child_processes_confirmed_stopped=child_processes_stopped,
+                    unconfirmed_process_ids=unconfirmed_pids,
                     import_completed=import_completed,
-                    child_processes_confirmed_stopped=child_processes_confirmed_stopped,
+                    import_errors=import_errors,
+                    expected_evidence_ids=tuple(expected_evidence_ids or ()),
                     auto_redact_report=auto_redact_report,
                 )
                 return {
@@ -730,6 +743,112 @@ def create_mcp_server(
     )
 
 
+def _derive_host_close_checks(
+    controller: HarnessController,
+    run_id: str,
+) -> tuple[bool, list[str], bool, list[str]]:
+    """Derive host child-process cleanup and bounded import completeness server-side."""
+    child_stopped = True
+    unconfirmed_pids: list[str] = []
+    import_completed = True
+    import_errors: list[str] = []
+
+    with controller.storage.read_connection() as conn:
+        run_row = conn.execute(
+            "SELECT guest_health, active_heavy_jobs, active_sessions FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if run_row is not None:
+            health = GuestHealthState(str(run_row["guest_health"]))
+            if (
+                health == GuestHealthState.CLEANUP_UNCONFIRMED
+                or int(run_row["active_heavy_jobs"]) > 0
+                or int(run_row["active_sessions"]) > 0
+            ):
+                child_stopped = False
+
+            leases_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_leases'"
+            ).fetchone()
+            if leases_table is not None:
+                active_leases = conn.execute(
+                    "SELECT session_id FROM session_leases WHERE run_id = ? AND state = 'active'",
+                    (run_id,),
+                ).fetchall()
+                if active_leases:
+                    child_stopped = False
+
+            action_rows = conn.execute(
+                """
+                SELECT action_id, state, process_start_id, error_code, envelope_json
+                FROM actions
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            stored_evidence_ids = {
+                str(r["evidence_id"])
+                for r in conn.execute(
+                    "SELECT evidence_id FROM evidence_objects WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+            }
+            evidence_with_views = {
+                str(r["evidence_id"])
+                for r in conn.execute(
+                    "SELECT DISTINCT evidence_id FROM evidence_views WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+            }
+
+            for arow in action_rows:
+                state = ActionLifecycleState(str(arow["state"]))
+                pid_token = (
+                    str(arow["process_start_id"])
+                    if arow["process_start_id"] is not None
+                    else None
+                )
+                if state in {
+                    ActionLifecycleState.RESERVED,
+                    ActionLifecycleState.RUNNING,
+                    ActionLifecycleState.RECONCILIATION_REQUIRED,
+                }:
+                    child_stopped = False
+                    if pid_token and is_os_process_alive(pid_token):
+                        unconfirmed_pids.append(pid_token)
+                else:
+                    if pid_token and is_os_process_alive(pid_token):
+                        child_stopped = False
+                        unconfirmed_pids.append(pid_token)
+                    if (
+                        arow["error_code"] == "cleanup_unconfirmed"
+                        and health != GuestHealthState.READY
+                    ):
+                        child_stopped = False
+
+                env_raw = arow["envelope_json"]
+                if env_raw:
+                    try:
+                        env_data = json.loads(str(env_raw))
+                    except json.JSONDecodeError:
+                        import_completed = False
+                        import_errors.append(f"corrupt_envelope:{arow['action_id']}")
+                        continue
+                    for ev in env_data.get("evidence") or ():
+                        eid = str(ev.get("id") or "").strip()
+                        if not eid:
+                            continue
+                        if eid not in stored_evidence_ids:
+                            import_completed = False
+                            import_errors.append(f"missing_evidence_object:{eid}")
+                        elif eid not in evidence_with_views:
+                            import_completed = False
+                            import_errors.append(f"missing_evidence_view:{eid}")
+
+    return child_stopped, unconfirmed_pids, import_completed, import_errors
+
+
 def build_server_from_env(
     env: Mapping[str, str] | None = None,
     *,
@@ -737,14 +856,17 @@ def build_server_from_env(
     allow_ephemeral_cursor_key: bool = False,
 ) -> HarnessMcpServer:
     """Build a fail-closed HarnessController + HarnessMcpServer from environment config."""
-    settings = load_runtime_settings(env)
+    eff_env = env if env is not None else os.environ
+    settings = load_runtime_settings(eff_env)
     if settings.db_path is None or settings.vault_root is None:
         raise ConfigurationError(
             "CTF_MCP_DB_PATH and CTF_MCP_VAULT_ROOT must be configured."
         )
     config: HarnessConfig | None = load_config_file(config_path) if config_path else None
+    if config is not None and not str(eff_env.get("CTF_MCP_PROFILE", "")).strip():
+        settings = settings.model_copy(update={"profile": config.profile})
     hmac_key = get_cursor_hmac_key(
-        env, allow_ephemeral_dev_key=allow_ephemeral_cursor_key
+        eff_env, allow_ephemeral_dev_key=allow_ephemeral_cursor_key
     )
     storage = Storage(settings.db_path)
     export_root = settings.vault_root / "_exports"
@@ -757,7 +879,13 @@ def build_server_from_env(
         runtime_settings=settings,
         allow_synthetic_adapters=False,
         initialize=True,
+        enable_local_verifier=False,
     )
+    if controller.config is not None:
+        if controller.config.acceptance.require_registered_verifier:
+            register_default_verifier(controller)
+    else:
+        register_default_verifier(controller)
     return create_mcp_server(
         controller,
         transport_mode=settings.transport,

@@ -85,3 +85,63 @@ This repository is public; operational evidence remains private. No credentials,
 Read the [implementation contract and acceptance cases](docs/11-contracts-and-acceptance.md) before implementing. This update specifies state ownership, immutable evidence, retry/recovery behavior and evaluation boundaries; it adds design schemas and synthetic examples only. Runtime implementation belongs to a later AI-led change. No performance result or live integration is claimed.
 
 The three repositories remain independently usable. Optional integration follows the [reference-only handoff contract](https://github.com/moruku36/ai-agent-scientist/blob/main/docs/11-harness-boundaries.md); it does not create shared authority or a new agent runtime.
+
+## MVP Implementation Status & Local Setup (P1–P3)
+
+This repository now includes the P1–P3 MVP runtime under `src/ctf_mcp/`, built strictly on the contracts in `docs/08`–`docs/11`:
+
+- **Layer 0–1 (Storage, FS Guard, Gateway)**: SQLite single-writer state ownership (`storage.py`), symlink/traversal-proof bounded I/O (`fs_guard.py`), fail-closed `ScopeValidator`, `CapabilityCatalog` (pinned SHA-256 descriptors), single-source budget accounting, and sanitized `AuditLogger`.
+- **Layer 2 (Runs, Evidence, Adapters, Verification)**: Action lifecycle & `request_id` idempotency (`runs/actions.py`), startup crash reconciliation & strictly monotonic fencing (`runs/recovery.py`), idle-timeout session leases (`runs/leases.py`), SHA-256 paged `EvidenceVault` + `EvidenceRedactor` + `BoundedEvidenceImporter` (`evidence/`), deterministic stdlib `StaticArtifactInspectorAdapter` (`adapters/static_inspector.py`), and digest-only `LocalCtfVerifier` (`verification/ctf_local.py`).
+- **Layer 3–4 (Controller, FastMCP Server, CLI)**: `HarnessController` (`controller.py`), authenticated `stdio` / `streamable-http` FastMCP server (`server.py`, `allow_synthetic_adapters=False` by default, server-derived `run.close` checks), and local CLI entrypoints (`cli.py`: `ctf-mcp-server`, `ctf-mcp-admin`).
+
+### Installation (Windows PowerShell / Python 3.12+)
+
+> [!NOTE]
+> On Windows environments without C build tools for `libyaml` when building/installing transitive YAML packages, set `PYYAML_FORCE_LIBYAML=0` before `pip install`.
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+$env:PYYAML_FORCE_LIBYAML = "0"
+python -m pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m pytest -v
+```
+
+### CLI Usage (`ctf-mcp-admin` and `ctf-mcp-server`)
+
+1. **Create a run, ingest an owned local artifact, and register expected SHA-256 digest** (secrets/flags never enter CLI arguments or logs):
+
+```powershell
+$env:CTF_MCP_DB_PATH = "$PWD\.local_state\harness.db"
+$env:CTF_MCP_VAULT_ROOT = "$PWD\.local_vault"
+$env:CTF_MCP_CURSOR_HMAC_KEY = "<32+-char-random-local-key>"
+
+ctf-mcp-admin create-run --task-id owned-fixture-1 --scope-revision scope-v1 --auth-ref local-owned-record
+ctf-mcp-admin ingest-artifact --run-id <RUN_ID> --source-root C:\path\to\owned_fixtures --rel-path sample.bin
+ctf-mcp-admin register-expectation --run-id <RUN_ID> --flag-sha256 <64_HEX_SHA256>
+```
+
+2. **Reconcile / recover / inspect**:
+
+```powershell
+ctf-mcp-admin reconcile
+ctf-mcp-admin describe-run --run-id <RUN_ID>
+ctf-mcp-admin recover-guest --run-id <RUN_ID> --cleanup-verified --note "verified zero remaining child PIDs"
+```
+
+3. **Launch the MCP server** (`StaticArtifactInspectorAdapter` + `LocalCtfVerifier`, `allow_synthetic_adapters=False`):
+
+```powershell
+# stdio (fail-closed if CTF_MCP_CURSOR_HMAC_KEY is unset)
+ctf-mcp-server --transport stdio --active-run <RUN_ID>
+
+# authenticated streamable-http
+$env:CTF_MCP_AUTH_TOKEN = "<strong-local-bearer-token>"
+ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
+```

@@ -85,3 +85,63 @@ flowchart TB
 実装前に[実装契約と受入ケース](docs/11-contracts-and-acceptance.ja.md)を読む。この更新は状態の正本、不変の証拠、再送・復旧、評価境界を具体化し、設計schemaと合成例だけを追加する。実装は別のAIによる後続変更で行う。性能結果や実接続は主張しない。
 
 三つのrepoはそれぞれ単独で使える設計を維持。任意接続は[参照型の受け渡し契約](https://github.com/moruku36/ai-agent-scientist/blob/main/docs/11-harness-boundaries.ja.md)に従い、権限の共有や新agent runtimeを作らない。
+
+## MVP 実装状況・ローカルセットアップ（P1〜P3）
+
+本リポジトリの `src/ctf_mcp/` には、`docs/08`〜`docs/11` の契約に準拠した P1〜P3 MVP ランタイムが含まれています（既存設計文書および非実行設定例 `configs/offline-pilot.example.json` はそのまま維持されています）。
+
+- **Layer 0〜1（状態・ファイル境界・ゲートウェイ）**: SQLite 単一ライター正本 (`storage.py`)、symlink / traversal を遮断する境界付き I/O (`fs_guard.py`)、fail-closed な `ScopeValidator`、SHA-256 署名検証付き `CapabilityCatalog`、単一正本予算管理、秘匿サニタイズ済み `AuditLogger`。
+- **Layer 2（ライフサイクル・証拠・アダプタ・検証器）**: `request_id` 冪等性と状態機械 (`runs/actions.py`)、再起動照合と単調増加 fencing token (`runs/recovery.py`)、15 分アイドル失効付きセッションリース (`runs/leases.py`)、SHA-256 ページング付き `EvidenceVault` / `EvidenceRedactor` / `BoundedEvidenceImporter` (`evidence/`)、標準ライブラリ完結の `StaticArtifactInspectorAdapter` (`adapters/static_inspector.py`)、ダイジェスト照合専用の `LocalCtfVerifier` (`verification/ctf_local.py`)。
+- **Layer 3〜4（コントローラ・FastMCP サーバー・CLI）**: `HarnessController` (`controller.py`)、認証付き `stdio` / `streamable-http` FastMCP サーバー（`server.py`、`allow_synthetic_adapters=False` 固定、`run.close` 整合状態のホスト側導出）、およびローカル CLI 導線（`cli.py`: `ctf-mcp-server`, `ctf-mcp-admin`）。
+
+### インストール手順（Windows PowerShell / Python 3.12+）
+
+> [!NOTE]
+> Windows 環境で `libyaml` の C ビルドツールが利用できない場合、依存パッケージ導入時に `PYYAML_FORCE_LIBYAML=0` を設定してください。
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+$env:PYYAML_FORCE_LIBYAML = "0"
+python -m pip install -e ".[dev]"
+```
+
+### テスト実行
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m pytest -v
+```
+
+### CLI 起動・運用手順（`ctf-mcp-admin` / `ctf-mcp-server`）
+
+1. **Run 作成・所有済み成果物の搬入・期待 SHA-256 登録**（秘密値や平文 flag は CLI 引数・ログに含めないこと）:
+
+```powershell
+$env:CTF_MCP_DB_PATH = "$PWD\.local_state\harness.db"
+$env:CTF_MCP_VAULT_ROOT = "$PWD\.local_vault"
+$env:CTF_MCP_CURSOR_HMAC_KEY = "<32文字以上のローカルHMAC鍵>"
+
+ctf-mcp-admin create-run --task-id owned-fixture-1 --scope-revision scope-v1 --auth-ref local-owned-record
+ctf-mcp-admin ingest-artifact --run-id <RUN_ID> --source-root C:\path\to\owned_fixtures --rel-path sample.bin
+ctf-mcp-admin register-expectation --run-id <RUN_ID> --flag-sha256 <64桁小文字SHA256>
+```
+
+2. **クラッシュ照合・ゲスト復帰・状態確認**:
+
+```powershell
+ctf-mcp-admin reconcile
+ctf-mcp-admin describe-run --run-id <RUN_ID>
+ctf-mcp-admin recover-guest --run-id <RUN_ID> --cleanup-verified --note "残存プロセス 0 を確認"
+```
+
+3. **FastMCP サーバー起動**（`StaticArtifactInspectorAdapter` + `LocalCtfVerifier` 標準配線、`allow_synthetic_adapters=False`）:
+
+```powershell
+# stdio モード（CTF_MCP_CURSOR_HMAC_KEY 未設定時は fail-closed）
+ctf-mcp-server --transport stdio --active-run <RUN_ID>
+
+# 認証付き streamable-http モード
+$env:CTF_MCP_AUTH_TOKEN = "<十分な強度のローカルBearerトークン>"
+ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
+```

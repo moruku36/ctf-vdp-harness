@@ -22,6 +22,10 @@ dev = [
     "pytest==9.2.0",
 ]
 
+[project.scripts]
+ctf-mcp-server = "ctf_mcp.cli:server_main"
+ctf-mcp-admin = "ctf_mcp.cli:admin_main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

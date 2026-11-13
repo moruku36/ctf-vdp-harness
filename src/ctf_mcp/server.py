@@ -944,7 +944,14 @@ def build_server_from_env(
         raise ConfigurationError(
             "CTF_MCP_DB_PATH and CTF_MCP_VAULT_ROOT must be configured."
         )
-    config: HarnessConfig | None = load_config_file(config_path) if config_path else None
+    resolved_config_path: str | Path | None = config_path
+    if resolved_config_path is None:
+        env_cfg = str(eff_env.get("CTF_MCP_CONFIG", "")).strip()
+        if env_cfg:
+            resolved_config_path = Path(env_cfg)
+    config: HarnessConfig | None = (
+        load_config_file(resolved_config_path) if resolved_config_path else None
+    )
     if config is not None and not str(eff_env.get("CTF_MCP_PROFILE", "")).strip():
         settings = settings.model_copy(update={"profile": config.profile})
     env_allow_dynamic = _parse_optional_bool_env(eff_env, "CTF_MCP_ALLOW_DYNAMIC")

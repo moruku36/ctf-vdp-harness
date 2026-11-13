@@ -856,6 +856,7 @@ if __name__ != "__main__":
         profile_modes: tuple[RunMode, ...] = (
             RunMode.OFFLINE_CTF,
             RunMode.SCOPED_CTF,
+            RunMode.VDP,
         ),
         limits: CapabilityLimits | None = None,
     ) -> CapabilityDescriptor:

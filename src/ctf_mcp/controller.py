@@ -1086,6 +1086,206 @@ class HarnessController:
             )
         return registered
 
+    def update_run_budget(
+        self,
+        *,
+        run_id: str,
+        principal: PrincipalContext | None = None,
+        max_tool_calls: int | None = None,
+        remaining_calls: int | None = None,
+        add_calls: int | None = None,
+        run_budget_seconds: int | None = None,
+        remaining_ms: int | None = None,
+        max_evidence_bytes_per_run: int | None = None,
+        remaining_bytes: int | None = None,
+        interactive_session_limit: int | None = None,
+        heavy_job_concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        """Update budget limits/remaining allowances on an open run without changing revision."""
+        if remaining_calls is not None and add_calls is not None:
+            raise ContractViolationError(
+                "remaining_calls and add_calls cannot be specified together."
+            )
+
+        for field_name, val in (
+            ("max_tool_calls", max_tool_calls),
+            ("run_budget_seconds", run_budget_seconds),
+            ("max_evidence_bytes_per_run", max_evidence_bytes_per_run),
+            ("interactive_session_limit", interactive_session_limit),
+            ("heavy_job_concurrency", heavy_job_concurrency),
+        ):
+            if val is not None and (isinstance(val, bool) or val <= 0):
+                raise ContractViolationError(f"{field_name} must be > 0 (got {val!r}).")
+
+        for field_name, val in (
+            ("remaining_calls", remaining_calls),
+            ("add_calls", add_calls),
+            ("remaining_ms", remaining_ms),
+            ("remaining_bytes", remaining_bytes),
+        ):
+            if val is not None and (isinstance(val, bool) or val < 0):
+                raise ContractViolationError(f"{field_name} must be >= 0 (got {val!r}).")
+
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            snapshot, eff_principal = self._get_snapshot_and_principal_in_tx(
+                conn, run_id=run_id, principal=principal
+            )
+            if snapshot.manifest.closed_at is not None:
+                raise BudgetExceededError(
+                    f"Cannot update budget for closed run {run_id!r}."
+                )
+
+            old_budget = snapshot.manifest.budget_spec
+            base_max_calls = (
+                max_tool_calls if max_tool_calls is not None else old_budget.max_tool_calls
+            )
+            if remaining_calls is not None:
+                new_remaining_calls = remaining_calls
+                new_max_tool_calls = base_max_calls
+            elif add_calls is not None:
+                new_remaining_calls = snapshot.remaining_calls + add_calls
+                new_max_tool_calls = max(
+                    base_max_calls,
+                    snapshot.usage.tool_calls_used + new_remaining_calls,
+                )
+            elif max_tool_calls is not None and max_tool_calls > old_budget.max_tool_calls:
+                new_max_tool_calls = max_tool_calls
+                new_remaining_calls = snapshot.remaining_calls + (
+                    max_tool_calls - old_budget.max_tool_calls
+                )
+            else:
+                new_max_tool_calls = base_max_calls
+                new_remaining_calls = snapshot.remaining_calls
+
+            new_run_budget_seconds = (
+                run_budget_seconds
+                if run_budget_seconds is not None
+                else old_budget.run_budget_seconds
+            )
+            if remaining_ms is not None:
+                new_remaining_ms = remaining_ms
+            elif (
+                run_budget_seconds is not None
+                and run_budget_seconds > old_budget.run_budget_seconds
+            ):
+                new_remaining_ms = snapshot.remaining_ms + (
+                    (run_budget_seconds - old_budget.run_budget_seconds) * 1000
+                )
+            else:
+                new_remaining_ms = snapshot.remaining_ms
+
+            new_max_evidence_bytes = (
+                max_evidence_bytes_per_run
+                if max_evidence_bytes_per_run is not None
+                else old_budget.max_evidence_bytes_per_run
+            )
+            if remaining_bytes is not None:
+                new_remaining_bytes = remaining_bytes
+            elif (
+                max_evidence_bytes_per_run is not None
+                and max_evidence_bytes_per_run > old_budget.max_evidence_bytes_per_run
+            ):
+                new_remaining_bytes = snapshot.remaining_bytes + (
+                    max_evidence_bytes_per_run - old_budget.max_evidence_bytes_per_run
+                )
+            else:
+                new_remaining_bytes = snapshot.remaining_bytes
+
+            new_budget = old_budget.model_copy(
+                update={
+                    "max_tool_calls": new_max_tool_calls,
+                    "run_budget_seconds": new_run_budget_seconds,
+                    "max_evidence_bytes_per_run": new_max_evidence_bytes,
+                    "interactive_session_limit": (
+                        interactive_session_limit
+                        if interactive_session_limit is not None
+                        else old_budget.interactive_session_limit
+                    ),
+                    "heavy_job_concurrency": (
+                        heavy_job_concurrency
+                        if heavy_job_concurrency is not None
+                        else old_budget.heavy_job_concurrency
+                    ),
+                }
+            )
+            if remaining_calls is not None and new_remaining_calls > new_budget.max_tool_calls:
+                raise ContractViolationError(
+                    f"remaining_calls ({new_remaining_calls}) cannot exceed "
+                    f"max_tool_calls ({new_budget.max_tool_calls})."
+                )
+            if remaining_ms is not None and new_remaining_ms > new_budget.run_budget_seconds * 1000:
+                raise ContractViolationError(
+                    f"remaining_ms ({new_remaining_ms}) cannot exceed "
+                    f"run_budget_seconds * 1000 ({new_budget.run_budget_seconds * 1000})."
+                )
+            if remaining_bytes is not None and new_remaining_bytes > new_budget.max_evidence_bytes_per_run:
+                raise ContractViolationError(
+                    f"remaining_bytes ({new_remaining_bytes}) cannot exceed "
+                    f"max_evidence_bytes_per_run ({new_budget.max_evidence_bytes_per_run})."
+                )
+
+            updated_manifest = snapshot.manifest.model_copy(
+                update={"budget_spec": new_budget}
+            )
+            assert_no_secrets_in_manifest(updated_manifest)
+
+            conn.execute(
+                """
+                UPDATE runs
+                SET budget_spec_json = ?,
+                    manifest_json = ?,
+                    remaining_calls = ?,
+                    remaining_ms = ?,
+                    remaining_bytes = ?
+                WHERE run_id = ?
+                """,
+                (
+                    new_budget.model_dump_json(),
+                    updated_manifest.model_dump_json(),
+                    new_remaining_calls,
+                    new_remaining_ms,
+                    new_remaining_bytes,
+                    run_id,
+                ),
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=eff_principal,
+                    action_id=None,
+                    capability="budget.control",
+                    operation="update_budget",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"max_calls={new_budget.max_tool_calls};"
+                        f"rem_calls={new_remaining_calls};"
+                        f"budget_s={new_budget.run_budget_seconds};"
+                        f"rem_ms={new_remaining_ms};"
+                        f"max_bytes={new_budget.max_evidence_bytes_per_run};"
+                        f"rem_bytes={new_remaining_bytes}"
+                    ),
+                ),
+            )
+
+        return {
+            "run_id": run_id,
+            "revision": snapshot.revision,
+            "max_tool_calls": new_budget.max_tool_calls,
+            "remaining_calls": new_remaining_calls,
+            "run_budget_seconds": new_budget.run_budget_seconds,
+            "remaining_ms": new_remaining_ms,
+            "max_evidence_bytes_per_run": new_budget.max_evidence_bytes_per_run,
+            "remaining_bytes": new_remaining_bytes,
+            "interactive_session_limit": new_budget.interactive_session_limit,
+            "heavy_job_concurrency": new_budget.heavy_job_concurrency,
+        }
+
     def ingest_artifact(
         self,
         *,
@@ -3219,6 +3419,7 @@ def register_default_adapters(
         timeout_seconds=effective_timeout,
         max_output_bytes=max_output_bytes,
         max_decode_bytes=max_decode_bytes,
+        profile_modes=(RunMode.OFFLINE_CTF, RunMode.VDP),
         evidence_vault=controller.evidence_vault,
         require_running_state=require_running_state,
     )
@@ -3375,7 +3576,13 @@ def create_default_controller(
     )
     resolved_allow_dynamic = (
         True
-        if (allow_dynamic is None and session_configured)
+        if (
+            allow_dynamic is None
+            and (
+                session_configured
+                or (config is not None and config.execution.dynamic_execution)
+            )
+        )
         else allow_dynamic
     )
 

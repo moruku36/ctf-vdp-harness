@@ -22,8 +22,10 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,7 @@ from ctf_mcp.cli import admin_main, build_server_parser, server_main
 from ctf_mcp.config import HarnessConfig, load_config_file
 from ctf_mcp.contracts import (
     ActionRequest,
+    BudgetExceededError,
     BudgetSpec,
     ConfigurationError,
     ContractViolationError,
@@ -57,6 +60,10 @@ def _write_harness_config(
     adapters_enabled: Sequence[str] = ("analysis.query",),
     network_enabled: bool = False,
     allowed_targets: Sequence[str] = (),
+    external_submission: bool = False,
+    dynamic_execution: bool = False,
+    max_tool_calls: int = 40,
+    expires_at: str | None = None,
     task_id: str = "task-p6-autowire",
 ) -> Path:
     cfg = {
@@ -73,23 +80,23 @@ def _write_harness_config(
             "task_id": task_id,
             "revision": "scope-p6-1",
             "authorization_reference": "owned-p6-test-scope",
-            "expires_at": None,
+            "expires_at": expires_at,
         },
         "network": {
             "enabled": network_enabled,
             "allowed_targets": list(allowed_targets),
-            "external_submission": False,
+            "external_submission": external_submission,
         },
         "execution": {
             "adapters_enabled": list(adapters_enabled),
             "arbitrary_shell": False,
-            "dynamic_execution": False,
+            "dynamic_execution": dynamic_execution,
             "heavy_job_concurrency": 1,
             "interactive_session_limit": 2,
             "action_timeout_seconds": 30,
             "session_idle_seconds": 900,
             "run_budget_seconds": 600,
-            "max_tool_calls": 40,
+            "max_tool_calls": max_tool_calls,
             "max_output_chars_per_page": 4000,
             "max_evidence_bytes_per_run": 10_485_760,
         },
@@ -690,3 +697,534 @@ def test_interactive_session_posix_gdb_helper_and_fallback(
                 arguments={"artifact_id": ing.artifact_id, "gdb_cmd": "!id"},
             ),
         )
+
+
+def test_update_budget_cli_and_controller_preserves_revision_and_restores_calls(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hmac_hex = secrets.token_hex(32)
+    db_path = tmp_path / "budget.db"
+    vault_root = tmp_path / "budget-vault"
+    cfg_path = _write_harness_config(
+        tmp_path / "budget-cfg.json",
+        profile="offline_ctf",
+        adapters_enabled=("ctf-static-inspector", "ctf-helper-transform"),
+        max_tool_calls=2,
+        task_id="task-budget-update",
+    )
+
+    rc = admin_main(
+        [
+            "create-run",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--config",
+            str(cfg_path),
+            "--run-id",
+            "run-budget-01",
+            "--allowed-capabilities",
+            "analysis.query,helper.transform",
+            "--allowed-execution-classes",
+            "static",
+        ],
+        env={"CTF_MCP_CURSOR_HMAC_KEY": hmac_hex},
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    ws = tmp_path / "ws-budget"
+    ws.mkdir()
+    (ws / "sample.elf").write_bytes(_build_minimal_elf64())
+    rc_ing = admin_main(
+        [
+            "ingest-artifact",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--run-id",
+            "run-budget-01",
+            "--source-root",
+            str(ws),
+            "--rel-path",
+            "sample.elf",
+        ],
+        env={"CTF_MCP_CURSOR_HMAC_KEY": hmac_hex},
+    )
+    assert rc_ing == 0
+    ing_out = json.loads(capsys.readouterr().out)
+    artifact_id = ing_out["artifact_id"]
+
+    srv = build_server_from_env(
+        {
+            "CTF_MCP_DB_PATH": str(db_path),
+            "CTF_MCP_VAULT_ROOT": str(vault_root),
+            "CTF_MCP_TRANSPORT": "stdio",
+            "CTF_MCP_CURSOR_HMAC_KEY": hmac_hex,
+            "CTF_MCP_CONFIG": str(cfg_path),
+        }
+    )
+    srv.set_active_run("run-budget-01")
+    ctrl = srv.controller
+    operator = PrincipalContext(
+        principal_id="local-operator",
+        auth_method="stdio_local",
+        client_kind="OPERATOR_SELECTED",
+        model_label="codex-p6-test",
+    )
+
+    # Consume both of the initial 2 tool calls.
+    for idx in (1, 2):
+        rev = ctrl.runs.get_run_snapshot("run-budget-01").revision
+        env = ctrl.execute_action(
+            principal=operator,
+            request=ActionRequest(
+                run_id="run-budget-01",
+                request_id=f"req-consume-{idx}",
+                expected_revision=rev,
+                capability_name="analysis.query",
+                operation="inspect_header",
+                arguments={"artifact_id": artifact_id},
+            ),
+        )
+        assert env.status.value == "ok"
+
+    rev_before = ctrl.runs.get_run_snapshot("run-budget-01").revision
+    assert ctrl.runs.get_run_snapshot("run-budget-01").remaining_calls == 0
+    with pytest.raises(BudgetExceededError):
+        ctrl.execute_action(
+            principal=operator,
+            request=ActionRequest(
+                run_id="run-budget-01",
+                request_id="req-exhausted-3",
+                expected_revision=rev_before,
+                capability_name="analysis.query",
+                operation="inspect_header",
+                arguments={"artifact_id": artifact_id},
+            ),
+        )
+
+    # Raise max_tool_calls and remaining_calls from 2 -> 500 via admin_main while preserving revision.
+    rc_upd = admin_main(
+        [
+            "update-budget",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--run-id",
+            "run-budget-01",
+            "--max-tool-calls",
+            "500",
+            "--remaining-calls",
+            "500",
+        ],
+        env={"CTF_MCP_CURSOR_HMAC_KEY": hmac_hex},
+    )
+    assert rc_upd == 0
+    upd_json = json.loads(capsys.readouterr().out)
+    assert upd_json["run_id"] == "run-budget-01"
+    assert upd_json["revision"] == rev_before
+    assert upd_json["max_tool_calls"] == 500
+    assert upd_json["remaining_calls"] == 500
+    assert ctrl.runs.get_run_snapshot("run-budget-01").revision == rev_before
+
+    # Caller holding rev_before can immediately execute actions both directly and via FastMCP.
+    direct_after = ctrl.execute_action(
+        principal=operator,
+        request=ActionRequest(
+            run_id="run-budget-01",
+            request_id="req-after-budget-direct",
+            expected_revision=rev_before,
+            capability_name="analysis.query",
+            operation="inspect_header",
+            arguments={"artifact_id": artifact_id},
+        ),
+    )
+    assert direct_after.status.value == "ok"
+
+    rev_after_direct = ctrl.runs.get_run_snapshot("run-budget-01").revision
+
+    async def _call_after_budget() -> dict[str, Any]:
+        async with Client(srv.mcp) as client:
+            res = await client.call_tool(
+                "helper.transform",
+                {
+                    "run_id": "run-budget-01",
+                    "request_id": "req-after-budget-mcp",
+                    "expected_revision": rev_after_direct,
+                    "operation": "xor_bytes",
+                    "arguments": {"data_hex": "666c", "key_hex": "00"},
+                },
+            )
+            return dict(res.structured_content)
+
+    mcp_res = anyio.run(_call_after_budget)
+    assert mcp_res["status"] == "ok"
+
+    # Also verify add_calls, positive delta auto-addition, invalid bounds/conflicts, and audit event.
+    snap_mid = ctrl.runs.get_run_snapshot("run-budget-01")
+    added = ctrl.update_run_budget(
+        run_id="run-budget-01",
+        principal=operator,
+        add_calls=10,
+        run_budget_seconds=1200,
+        max_evidence_bytes_per_run=20_971_520,
+        interactive_session_limit=4,
+        heavy_job_concurrency=2,
+    )
+    assert added["remaining_calls"] == snap_mid.remaining_calls + 10
+    assert added["max_tool_calls"] >= snap_mid.usage.tool_calls_used + added["remaining_calls"]
+    assert added["remaining_ms"] == snap_mid.remaining_ms + 600_000
+    assert added["remaining_bytes"] == snap_mid.remaining_bytes + 10_485_760
+    assert added["interactive_session_limit"] == 4
+    assert added["heavy_job_concurrency"] == 2
+    assert added["revision"] == snap_mid.revision
+
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(
+            run_id="run-budget-01",
+            remaining_calls=10,
+            add_calls=5,
+        )
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(run_id="run-budget-01", max_tool_calls=0)
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(run_id="run-budget-01", remaining_calls=-1)
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(
+            run_id="run-budget-01",
+            max_tool_calls=100,
+            remaining_calls=101,
+        )
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(
+            run_id="run-budget-01",
+            run_budget_seconds=60,
+            remaining_ms=60_001,
+        )
+    with pytest.raises(ContractViolationError):
+        ctrl.update_run_budget(
+            run_id="run-budget-01",
+            max_evidence_bytes_per_run=1024,
+            remaining_bytes=1025,
+        )
+
+    with ctrl.storage.read_connection() as conn:
+        audit_row = conn.execute(
+            "SELECT capability, operation, outcome FROM audit_events "
+            "WHERE run_id = ? AND capability = 'budget.control' ORDER BY timestamp DESC LIMIT 1",
+            ("run-budget-01",),
+        ).fetchone()
+    assert audit_row is not None
+    assert audit_row["operation"] == "update_budget"
+    assert audit_row["outcome"] == "ok"
+
+    ctrl.close_run(principal=operator, run_id="run-budget-01")
+    with pytest.raises(BudgetExceededError):
+        ctrl.update_run_budget(run_id="run-budget-01", add_calls=5)
+
+
+def test_vdp_mode_enables_all_four_tools_while_offline_ctf_denies_net_probe(
+    tmp_path: Path,
+) -> None:
+    class _VdpLocalHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            body = b"vdp-local-health-ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _VdpLocalHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = httpd.server_address[1]
+        hmac_hex = secrets.token_hex(32)
+        db_path = tmp_path / "vdp.db"
+        vault_root = tmp_path / "vdp-vault"
+        cfg_vdp_path = _write_harness_config(
+            tmp_path / "vdp-cfg.json",
+            profile="vdp",
+            adapters_enabled=(
+                "ctf-static-inspector",
+                "ctf-helper-transform",
+                "ctf-interactive-session",
+                "ctf-scoped-http-probe",
+            ),
+            network_enabled=True,
+            allowed_targets=(f"http://127.0.0.1:{port}/",),
+            dynamic_execution=True,
+            expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            task_id="task-vdp-all-tools",
+        )
+
+        # Build single server from env via CTF_MCP_CONFIG (no explicit config_path or allow_dynamic).
+        srv = build_server_from_env(
+            {
+                "CTF_MCP_DB_PATH": str(db_path),
+                "CTF_MCP_VAULT_ROOT": str(vault_root),
+                "CTF_MCP_TRANSPORT": "stdio",
+                "CTF_MCP_CURSOR_HMAC_KEY": hmac_hex,
+                "CTF_MCP_CONFIG": str(cfg_vdp_path),
+            }
+        )
+        assert srv.controller.allow_dynamic is True
+        assert srv.controller.default_mode == RunMode.VDP
+
+        rc_vdp = admin_main(
+            [
+                "create-run",
+                "--db-path",
+                str(db_path),
+                "--vault-root",
+                str(vault_root),
+                "--run-id",
+                "run-vdp-01",
+                "--allowed-capabilities",
+                "analysis.query,helper.transform,session.control,net.probe",
+                "--allowed-execution-classes",
+                "static,dynamic,network",
+            ],
+            env={
+                "CTF_MCP_CURSOR_HMAC_KEY": hmac_hex,
+                "CTF_MCP_CONFIG": str(cfg_vdp_path),
+            },
+        )
+        assert rc_vdp == 0
+
+        ws = tmp_path / "ws-vdp"
+        ws.mkdir()
+        (ws / "target.elf").write_bytes(_build_minimal_elf64())
+        alice = PrincipalContext(
+            principal_id="local-operator",
+            auth_method="stdio_local",
+            client_kind="OPERATOR_SELECTED",
+            model_label="codex-p6-test",
+        )
+        art = srv.controller.ingest_artifact(
+            principal=alice,
+            run_id="run-vdp-01",
+            source_root=ws,
+            rel_path="target.elf",
+            media_type="application/octet-stream",
+        )
+
+        # Create a separate offline_ctf run on the same DB/server without network privileges.
+        rc_off = admin_main(
+            [
+                "create-run",
+                "--db-path",
+                str(db_path),
+                "--vault-root",
+                str(vault_root),
+                "--run-id",
+                "run-offline-01",
+                "--task-id",
+                "task-off-same-srv",
+                "--mode",
+                "offline_ctf",
+                "--auth-ref",
+                "owned-offline-ref",
+                "--allowed-capabilities",
+                "analysis.query,helper.transform,session.control",
+                "--allowed-execution-classes",
+                "static,dynamic",
+            ],
+            env={"CTF_MCP_CURSOR_HMAC_KEY": hmac_hex},
+        )
+        assert rc_off == 0
+
+        async def _verify_both_runs() -> None:
+            srv.set_active_run("run-vdp-01")
+            async with Client(srv.mcp) as client:
+                vdp_tools = {t.name for t in await client.list_tools()}
+                assert {
+                    "analysis.query",
+                    "helper.transform",
+                    "session.control",
+                    "net.probe",
+                }.issubset(vdp_tools)
+
+                rev = srv.controller.runs.get_run_snapshot("run-vdp-01").revision
+                res_analysis = await client.call_tool(
+                    "analysis.query",
+                    {
+                        "run_id": "run-vdp-01",
+                        "request_id": "req-vdp-analysis",
+                        "expected_revision": rev,
+                        "operation": "inspect_header",
+                        "arguments": {"artifact_id": art.artifact_id},
+                    },
+                )
+                assert res_analysis.structured_content["status"] == "ok"
+
+                rev = srv.controller.runs.get_run_snapshot("run-vdp-01").revision
+                res_tf = await client.call_tool(
+                    "helper.transform",
+                    {
+                        "run_id": "run-vdp-01",
+                        "request_id": "req-vdp-tf",
+                        "expected_revision": rev,
+                        "operation": "xor_bytes",
+                        "arguments": {"data_hex": "7664", "key_hex": "00"},
+                    },
+                )
+                assert res_tf.structured_content["status"] == "ok"
+
+                rev = srv.controller.runs.get_run_snapshot("run-vdp-01").revision
+                res_sess_open = await client.call_tool(
+                    "session.control",
+                    {
+                        "run_id": "run-vdp-01",
+                        "request_id": "req-vdp-sess-open",
+                        "expected_revision": rev,
+                        "operation": "open",
+                        "arguments": {"artifact_id": art.artifact_id},
+                    },
+                )
+                assert res_sess_open.structured_content["status"] == "ok"
+                leases = srv.controller.leases.list_leases("run-vdp-01")
+                session_id = leases[-1].session_id
+
+                rev = srv.controller.runs.get_run_snapshot("run-vdp-01").revision
+                res_sess_close = await client.call_tool(
+                    "session.control",
+                    {
+                        "run_id": "run-vdp-01",
+                        "request_id": "req-vdp-sess-close",
+                        "expected_revision": rev,
+                        "operation": "close",
+                        "arguments": {"session_id": session_id},
+                    },
+                )
+                assert res_sess_close.structured_content["status"] == "ok"
+
+                rev = srv.controller.runs.get_run_snapshot("run-vdp-01").revision
+                res_net = await client.call_tool(
+                    "net.probe",
+                    {
+                        "run_id": "run-vdp-01",
+                        "request_id": "req-vdp-net",
+                        "expected_revision": rev,
+                        "operation": "get",
+                        "arguments": {"url": f"http://127.0.0.1:{port}/health"},
+                    },
+                )
+                assert res_net.structured_content["status"] == "ok"
+
+                # Switch active run to offline_ctf on the same server -> net.probe must be hidden & denied.
+                srv.set_active_run("run-offline-01")
+                off_tools = {t.name for t in await client.list_tools()}
+                assert "net.probe" not in off_tools
+
+                off_rev = srv.controller.runs.get_run_snapshot("run-offline-01").revision
+                denied_net = await client.call_tool(
+                    "net.probe",
+                    {
+                        "run_id": "run-offline-01",
+                        "request_id": "req-off-net-denied",
+                        "expected_revision": off_rev,
+                        "operation": "get",
+                        "arguments": {"url": f"http://127.0.0.1:{port}/health"},
+                    },
+                    raise_on_error=False,
+                )
+                assert denied_net.is_error is True
+                assert denied_net.structured_content["status"] == "denied"
+
+        anyio.run(_verify_both_runs)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_ctf_mcp_config_env_fallback_and_cli_network_flags(tmp_path: Path) -> None:
+    hmac_hex = secrets.token_hex(32)
+    db_path = tmp_path / "envcfg.db"
+    vault_root = tmp_path / "envcfg-vault"
+    # Note: session.control is NOT in adapters_enabled; dynamic_execution=True alone enables allow_dynamic.
+    cfg_path = _write_harness_config(
+        tmp_path / "env-vdp.json",
+        profile="vdp",
+        adapters_enabled=("ctf-static-inspector", "ctf-helper-transform"),
+        network_enabled=False,
+        allowed_targets=(),
+        dynamic_execution=True,
+        task_id="task-env-fallback",
+    )
+
+    env_with_cfg = {
+        "CTF_MCP_DB_PATH": str(db_path),
+        "CTF_MCP_VAULT_ROOT": str(vault_root),
+        "CTF_MCP_TRANSPORT": "stdio",
+        "CTF_MCP_CURSOR_HMAC_KEY": hmac_hex,
+        "CTF_MCP_CONFIG": str(cfg_path),
+    }
+    srv = build_server_from_env(env_with_cfg)
+    assert srv.controller.allow_dynamic is True
+    assert srv.controller.default_mode == RunMode.VDP
+    assert srv.controller.config is not None
+    assert srv.controller.config.scope.task_id == "task-env-fallback"
+
+    # admin_main consumes CTF_MCP_CONFIG when --config is omitted, and CLI network flags override config.network.
+    rc_create = admin_main(
+        [
+            "create-run",
+            "--run-id",
+            "run-env-cfg-01",
+            "--allowed-capabilities",
+            "analysis.query,helper.transform,net.probe",
+            "--allowed-execution-classes",
+            "static,dynamic,network",
+            "--network-enabled",
+            "--allowed-target",
+            "http://127.0.0.1:18080/",
+            "--external-submission",
+        ],
+        env=env_with_cfg,
+    )
+    assert rc_create == 0
+
+    scope_v1 = srv.controller.scope_validator.get_active_scope("run-env-cfg-01")
+    assert scope_v1.mode == RunMode.VDP
+    assert scope_v1.network_enabled is True
+    assert scope_v1.allowed_targets == ("http://127.0.0.1:18080/",)
+    assert scope_v1.external_submission is True
+
+    # register-scope also supports --network-enabled, --allowed-target, --external-submission.
+    rc_scope = admin_main(
+        [
+            "register-scope",
+            "--run-id",
+            "run-env-cfg-01",
+            "--scope-revision",
+            "scope-env-v2",
+            "--auth-ref",
+            "owned-env-v2-ref",
+            "--allowed-capabilities",
+            "analysis.query,net.probe",
+            "--allowed-execution-classes",
+            "static,network",
+            "--network-enabled",
+            "--allowed-target",
+            "http://127.0.0.1:18081/",
+            "--external-submission",
+        ],
+        env=env_with_cfg,
+    )
+    assert rc_scope == 0
+
+    scope_v2 = srv.controller.scope_validator.get_active_scope("run-env-cfg-01")
+    assert scope_v2.scope_revision == "scope-env-v2"
+    assert scope_v2.network_enabled is True
+    assert scope_v2.allowed_targets == ("http://127.0.0.1:18081/",)
+    assert scope_v2.external_submission is True

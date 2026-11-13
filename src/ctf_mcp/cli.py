@@ -118,6 +118,10 @@ def _resolve_admin_context(
         )
 
     config_path: Path | None = getattr(args, "config", None)
+    if config_path is None:
+        env_cfg = str(eff_env.get("CTF_MCP_CONFIG", "")).strip()
+        if env_cfg:
+            config_path = Path(env_cfg)
     config = load_config_file(config_path) if config_path is not None else None
     if config is not None and not str(eff_env.get("CTF_MCP_PROFILE", "")).strip():
         settings = settings.model_copy(update={"profile": config.profile})
@@ -300,9 +304,20 @@ def _handle_create_run(args: argparse.Namespace, env: Mapping[str, str] | None) 
         allowed_capabilities=allowed_caps,
         allowed_execution_classes=allowed_exec_classes,
         expires_at=_parse_iso_datetime(expires_raw),
-        network_enabled=bool(config.network.enabled) if config is not None else False,
-        allowed_targets=config.network.allowed_targets if config is not None else (),
-        external_submission=bool(config.network.external_submission) if config is not None else False,
+        network_enabled=(
+            True
+            if args.network_enabled
+            else (bool(config.network.enabled) if config is not None else False)
+        ),
+        allowed_targets=_parse_csv_values(
+            args.allowed_target,
+            default=config.network.allowed_targets if config is not None else (),
+        ),
+        external_submission=(
+            True
+            if args.external_submission
+            else (bool(config.network.external_submission) if config is not None else False)
+        ),
     )
 
     base_budget = config.execution.to_budget_spec() if config is not None else BudgetSpec()
@@ -365,6 +380,9 @@ def _handle_register_scope(args: argparse.Namespace, env: Mapping[str, str] | No
         allowed_capabilities=allowed_caps,
         allowed_execution_classes=allowed_exec_classes,
         expires_at=_parse_iso_datetime(args.expires_at),
+        network_enabled=bool(args.network_enabled),
+        allowed_targets=_parse_csv_values(args.allowed_target, default=()),
+        external_submission=bool(args.external_submission),
     )
     registered = controller.register_scope(
         run_id=args.run_id,
@@ -517,6 +535,25 @@ def _handle_describe_run(args: argparse.Namespace, env: Mapping[str, str] | None
     return 0
 
 
+def _handle_update_budget(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, _, _ = _resolve_admin_context(args, env=env)
+    summary = controller.update_run_budget(
+        run_id=args.run_id,
+        principal=None,
+        max_tool_calls=args.max_tool_calls,
+        remaining_calls=args.remaining_calls,
+        add_calls=args.add_calls,
+        run_budget_seconds=args.run_budget_seconds,
+        remaining_ms=args.remaining_ms,
+        max_evidence_bytes_per_run=args.max_evidence_bytes,
+        remaining_bytes=args.remaining_bytes,
+        interactive_session_limit=args.interactive_session_limit,
+        heavy_job_concurrency=args.heavy_job_concurrency,
+    )
+    _emit_json(summary)
+    return 0
+
+
 def build_admin_parser() -> argparse.ArgumentParser:
     """Build argument parser for ``ctf-mcp-admin`` local operator commands."""
     parser = argparse.ArgumentParser(
@@ -545,6 +582,9 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--max-evidence-bytes", type=int, default=None)
     p_create.add_argument("--heavy-job-concurrency", type=int, default=None)
     p_create.add_argument("--interactive-session-limit", type=int, default=None)
+    p_create.add_argument("--network-enabled", action="store_true", default=False)
+    p_create.add_argument("--allowed-target", action="append", default=None)
+    p_create.add_argument("--external-submission", action="store_true", default=False)
 
     p_scope = subparsers.add_parser("register-scope", help="Register/activate an immutable scope revision.")
     _add_common_admin_flags(p_scope, suppress_defaults=True)
@@ -557,6 +597,9 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_scope.add_argument("--allowed-execution-classes", action="append", default=None)
     p_scope.add_argument("--expires-at", default=None)
     p_scope.add_argument("--no-activate", action="store_true", default=False)
+    p_scope.add_argument("--network-enabled", action="store_true", default=False)
+    p_scope.add_argument("--allowed-target", action="append", default=None)
+    p_scope.add_argument("--external-submission", action="store_true", default=False)
 
     p_ingest = subparsers.add_parser("ingest-artifact", help="Ingest a confined input artifact with SHA-256.")
     _add_common_admin_flags(p_ingest, suppress_defaults=True)
@@ -619,6 +662,22 @@ def build_admin_parser() -> argparse.ArgumentParser:
     _add_common_admin_flags(p_desc, suppress_defaults=True)
     p_desc.add_argument("--run-id", required=True)
 
+    p_budget = subparsers.add_parser(
+        "update-budget",
+        help="Adjust run budget limits and remaining allowances without incrementing run revision.",
+    )
+    _add_common_admin_flags(p_budget, suppress_defaults=True)
+    p_budget.add_argument("--run-id", required=True)
+    p_budget.add_argument("--max-tool-calls", type=int, default=None)
+    p_budget.add_argument("--remaining-calls", type=int, default=None)
+    p_budget.add_argument("--add-calls", type=int, default=None)
+    p_budget.add_argument("--run-budget-seconds", type=int, default=None)
+    p_budget.add_argument("--remaining-ms", type=int, default=None)
+    p_budget.add_argument("--max-evidence-bytes", type=int, default=None)
+    p_budget.add_argument("--remaining-bytes", type=int, default=None)
+    p_budget.add_argument("--interactive-session-limit", type=int, default=None)
+    p_budget.add_argument("--heavy-job-concurrency", type=int, default=None)
+
     return parser
 
 
@@ -638,6 +697,7 @@ def admin_main(
         "reconcile": _handle_reconcile,
         "recover-guest": _handle_recover_guest,
         "describe-run": _handle_describe_run,
+        "update-budget": _handle_update_budget,
     }
     try:
         return handlers[args.command](args, env)

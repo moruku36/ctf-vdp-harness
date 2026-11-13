@@ -23,6 +23,18 @@ from ctf_mcp.adapters.runner import (
     get_os_process_start_id,
     is_os_process_alive,
 )
+from ctf_mcp.adapters.interactive_session import (
+    InteractiveDebugSessionAdapter,
+    create_interactive_session_descriptor,
+)
+from ctf_mcp.adapters.scoped_http_probe import (
+    ScopedHttpProbeAdapter,
+    create_scoped_http_probe_descriptor,
+)
+from ctf_mcp.adapters.transform_helper import (
+    DeterministicTransformAdapter,
+    create_transform_helper_descriptor,
+)
 from ctf_mcp.adapters.static_inspector import (
     FORBIDDEN_OR_UNACCEPTED_OPERATIONS,
     STATIC_INSPECTOR_ADAPTER_COMMIT,
@@ -63,7 +75,13 @@ __all__ = [
     "SYNTHETIC_FLAG_MARKER",
     "SYNTHETIC_SECRET_MARKER",
     "SYNTHETIC_SENSITIVE_MARKER",
+    "DeterministicTransformAdapter",
+    "InteractiveDebugSessionAdapter",
+    "ScopedHttpProbeAdapter",
     "StaticArtifactInspectorAdapter",
+    "create_interactive_session_descriptor",
+    "create_scoped_http_probe_descriptor",
+    "create_transform_helper_descriptor",
     "SubprocessOutcome",
     "SubprocessResult",
     "SubprocessRunner",

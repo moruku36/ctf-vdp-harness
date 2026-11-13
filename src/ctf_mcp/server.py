@@ -63,6 +63,8 @@ SUPPORTED_TOOL_NAMES: tuple[str, ...] = (
     "artifact.inspect",
     "analysis.query",
     "helper.transform",
+    "session.control",
+    "net.probe",
     "evidence.read",
     "hypothesis.update",
     "run.verify",
@@ -195,7 +197,6 @@ class HarnessGateMiddleware(Middleware):
 
         if (
             tool_name in ALWAYS_FORBIDDEN_TOOLS
-            or tool_name == "session.control"
             or tool_name not in SUPPORTED_TOOL_NAMES
         ):
             return _error_tool_result(
@@ -238,7 +239,12 @@ class HarnessGateMiddleware(Middleware):
                     f"Tool {tool_name!r} is hidden or unaccepted for the current "
                     "profile/scope."
                 )
-            code = "scope_expired" if "expired" in reason.lower() else "tool_denied"
+            lower_reason = reason.lower()
+            code = (
+                "scope_expired"
+                if "expired" in lower_reason
+                else ("scope_revoked" if "revoked" in lower_reason else "tool_denied")
+            )
             return _error_tool_result(
                 status="denied",
                 code=code,
@@ -369,7 +375,7 @@ class HarnessMcpServer:
         return self.controller.get_visible_mcp_tool_names(
             principal=principal,
             run_id=run_id,
-            mode=self.controller.default_mode,
+            mode=None if run_id is not None else self.controller.default_mode,
         )
 
     def describe_hidden_reason(
@@ -542,6 +548,66 @@ class HarnessMcpServer:
         ) -> ToolResult:
             return await self._dispatch_action(
                 tool_group="helper.transform",
+                run_id=run_id,
+                request_id=request_id,
+                expected_revision=expected_revision,
+                operation=operation,
+                capability_name=capability_name,
+                arguments=arguments,
+                repeat_of=repeat_of,
+                pre_launch_expired_reason=pre_launch_expired_reason,
+            )
+
+        network_probe_hint = mt.ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            openWorldHint=True,
+        )
+
+        @self.mcp.tool(
+            name="session.control",
+            description="Execute a bounded typed interactive session operation (open, inspect, step, close).",
+            annotations=mutating_hint,
+        )
+        async def session_control(
+            run_id: str,
+            request_id: str,
+            expected_revision: int,
+            operation: str,
+            capability_name: str | None = None,
+            arguments: dict[str, Any] | None = None,
+            repeat_of: str | None = None,
+            pre_launch_expired_reason: str | None = None,
+        ) -> ToolResult:
+            return await self._dispatch_action(
+                tool_group="session.control",
+                run_id=run_id,
+                request_id=request_id,
+                expected_revision=expected_revision,
+                operation=operation,
+                capability_name=capability_name,
+                arguments=arguments,
+                repeat_of=repeat_of,
+                pre_launch_expired_reason=pre_launch_expired_reason,
+            )
+
+        @self.mcp.tool(
+            name="net.probe",
+            description="Execute a scoped HTTP GET/HEAD probe with DNS pinning and per-hop redirect validation.",
+            annotations=network_probe_hint,
+        )
+        async def net_probe(
+            run_id: str,
+            request_id: str,
+            expected_revision: int,
+            operation: str,
+            capability_name: str | None = None,
+            arguments: dict[str, Any] | None = None,
+            repeat_of: str | None = None,
+            pre_launch_expired_reason: str | None = None,
+        ) -> ToolResult:
+            return await self._dispatch_action(
+                tool_group="net.probe",
                 run_id=run_id,
                 request_id=request_id,
                 expected_revision=expected_revision,

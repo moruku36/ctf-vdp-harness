@@ -16,15 +16,21 @@ import sqlite3
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
 from ctf_mcp.adapters import (
     PRODUCTION_DEFAULT_ENABLED as SYNTHETIC_PRODUCTION_DEFAULT_ENABLED,
+    DeterministicTransformAdapter,
+    InteractiveDebugSessionAdapter,
+    ScopedHttpProbeAdapter,
     StaticArtifactInspectorAdapter,
     SyntheticAdapter,
+    create_interactive_session_descriptor,
+    create_scoped_http_probe_descriptor,
+    create_transform_helper_descriptor,
     is_os_process_alive,
 )
 from ctf_mcp.config import (
@@ -39,9 +45,11 @@ from ctf_mcp.contracts import (
     ActionRequest,
     ArtifactRecord,
     AuditEvent,
+    BudgetExceededError,
     BudgetSpec,
     CapabilityDeniedError,
     CapabilityDescriptor,
+    CapabilityLimits,
     ConfigurationError,
     ContractViolationError,
     EnvelopeStatus,
@@ -85,6 +93,7 @@ from ctf_mcp.gateway import (
     CapabilityCatalog,
     IntakeLimits,
     PrincipalAuthenticator,
+    ScopedNetworkPolicyGuard,
     ScopeValidator,
     contains_sensitive_marker,
     get_budget_snapshot_in_tx,
@@ -129,6 +138,8 @@ ACTION_DISPATCH_TOOLS: tuple[str, ...] = (
     "artifact.inspect",
     "analysis.query",
     "helper.transform",
+    "session.control",
+    "net.probe",
 )
 ALWAYS_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
     {
@@ -250,7 +261,11 @@ def _infer_tool_group(descriptor: CapabilityDescriptor) -> str:
         return "helper.transform"
     if name == "session.control" or name.startswith("session."):
         return "session.control"
+    if name == "net.probe" or name.startswith("net."):
+        return "net.probe"
     if set(descriptor.execution_classes) != {ExecutionClass.STATIC}:
+        if ExecutionClass.NETWORK in descriptor.execution_classes:
+            return "net.probe"
         return "session.control"
     return "analysis.query"
 
@@ -325,7 +340,14 @@ def _map_envelope_to_lifecycle_state(
             retryable=False,
         )
         return ActionLifecycleState.CANCELLED, err, summary
-    # Running actions that ended with TOOL_ERROR or unexpected post-launch DENIED map to FAILED.
+    if status == EnvelopeStatus.DENIED:
+        err = envelope.error or ErrorDetail(
+            code="scope_denied",
+            message="Action execution was denied.",
+            retryable=False,
+        )
+        return ActionLifecycleState.DENIED, err, summary
+    # Running actions that ended with TOOL_ERROR settle as FAILED.
     err = envelope.error or ErrorDetail(
         code="tool_execution_failed",
         message=f"Tool failed with status={status.value}.",
@@ -374,6 +396,8 @@ class HarnessController:
         run_manifest_manager: RunManifestManager | None = None,
         hypothesis_manager: HypothesisManager | None = None,
         allow_synthetic_adapters: bool = SYNTHETIC_PRODUCTION_DEFAULT_ENABLED,
+        allow_dynamic: bool | None = None,
+        network_guard: ScopedNetworkPolicyGuard | None = None,
         supervisor_key: str = "harness-supervisor",
         supervisor_instance_id: str | None = None,
         is_process_alive: Callable[[ActionRecord], bool] | None = None,
@@ -409,10 +433,19 @@ class HarnessController:
         else:
             self.authenticator = PrincipalAuthenticator()
 
-        self.scope_validator = scope_validator or ScopeValidator(storage)
+        effective_allow_dynamic = False if allow_dynamic is None else bool(allow_dynamic)
+        self.allow_dynamic = effective_allow_dynamic
+        self.scope_validator = scope_validator or ScopeValidator(
+            storage,
+            allow_dynamic=effective_allow_dynamic,
+        )
         self.catalog = catalog or CapabilityCatalog(
             storage,
-            allow_dynamic=(self.default_mode != RunMode.OFFLINE_CTF),
+            allow_dynamic=effective_allow_dynamic,
+        )
+        self.network_guard = network_guard or ScopedNetworkPolicyGuard(
+            scope_provider=self._load_live_scope_policy,
+            clock=clock,
         )
         self.audit = audit_logger or AuditLogger(storage)
         self.intake = intake_service or ArtifactIntakeService(storage, self.vault_root)
@@ -554,6 +587,86 @@ class HarnessController:
                     ),
                 )
 
+    def _load_live_scope_policy(self, run_id: str) -> ScopePolicy | None:
+        """Load active ScopePolicy from storage (including live revoked_at) for network checks."""
+        with self.storage.read_connection() as conn:
+            run_row = conn.execute(
+                "SELECT scope_revision, closed_at FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                return None
+            if run_row["closed_at"] is not None:
+                raise ScopeDeniedError(f"Run {run_id!r} is closed; scope is no longer active.")
+            scope_row = conn.execute(
+                """
+                SELECT policy_json, revoked_at
+                FROM scopes
+                WHERE run_id = ? AND scope_revision = ?
+                """,
+                (run_id, run_row["scope_revision"]),
+            ).fetchone()
+            if scope_row is None:
+                return None
+            if scope_row["revoked_at"] is not None:
+                raise ScopeDeniedError(
+                    f"Scope revision {run_row['scope_revision']!r} for run {run_id!r} has been revoked.",
+                    code="scope_revoked",
+                    details={"scope_revision": str(run_row["scope_revision"])},
+                )
+            return ScopePolicy.model_validate_json(str(scope_row["policy_json"]))
+
+    def _cleanup_adapter_session_files(
+        self,
+        session_ids: Sequence[str],
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        """Clean up persisted session state files on registered interactive adapters."""
+        clean_ids = [sid for sid in session_ids if isinstance(sid, str) and sid.strip()]
+        if not clean_ids:
+            return
+        with self._lock:
+            adapters = [spec.adapter for spec in self._adapters.values()]
+        for adapter in adapters:
+            cleaner = getattr(adapter, "cleanup_session_files", None)
+            if callable(cleaner):
+                cleaner(clean_ids, run_id=run_id)
+
+    def revoke_scope(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        scope_revision: str | None = None,
+    ) -> int:
+        """Immediately revoke an owned run's active scope and record an audit event."""
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            snapshot = self._get_owned_snapshot_in_tx(conn, principal=principal, run_id=run_id)
+            revoked_count = self.scope_validator.revoke_scope_in_tx(
+                conn,
+                run_id,
+                scope_revision=scope_revision,
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=principal.principal_id,
+                    action_id=None,
+                    capability="scope.control",
+                    operation="revoke_scope",
+                    outcome="revoked",
+                    usage=None,
+                    scope_revision=scope_revision or snapshot.manifest.scope_revision,
+                    destination_summary=f"revoked_count={revoked_count}",
+                ),
+            )
+            return revoked_count
+
     def initialize(self) -> ReconciliationReport:
         """Initialize storage schema, lease/slot tables, descriptors, and reconcile crashes."""
         self.storage.initialize()
@@ -572,6 +685,8 @@ class HarnessController:
                 now=ts,
             )
             self._record_reconciliation_audits_in_tx(conn, report, ts=ts)
+        if report.lost_session_ids:
+            self._cleanup_adapter_session_files(report.lost_session_ids)
         return report
 
     def register_adapter(
@@ -611,15 +726,44 @@ class HarnessController:
         if enabled is not None and bool(enabled) != registered.enabled:
             self.catalog.set_enabled(registered.name, bool(enabled))
             registered = registered.model_copy(update={"enabled": bool(enabled)})
+        if hasattr(adapter, "attach_network_guard"):
+            adapter.attach_network_guard(
+                self.network_guard,
+                policy_provider=self._load_live_scope_policy,
+                override_existing_guard=False,
+            )
+        effective_interactive = bool(
+            is_interactive_session
+            or isinstance(adapter, InteractiveDebugSessionAdapter)
+        )
         with self._lock:
             self._adapters[registered.name] = RegisteredAdapterSpec(
                 descriptor=registered,
                 adapter=adapter,
                 tool_group=effective_group,
                 is_heavy_job=is_heavy_job,
-                is_interactive_session=is_interactive_session,
+                is_interactive_session=effective_interactive,
             )
             self._disabled_or_unaccepted_descriptors.pop(registered.name, None)
+        cleaner = getattr(adapter, "cleanup_session_files", None)
+        if callable(cleaner):
+            with self.storage.transaction() as conn:
+                has_leases = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_leases'"
+                ).fetchone()
+                stale_ids = (
+                    [
+                        str(row["session_id"])
+                        for row in conn.execute(
+                            "SELECT session_id FROM session_leases WHERE state IN ('lost', 'expired', 'closed')"
+                        ).fetchall()
+                        if row["session_id"]
+                    ]
+                    if has_leases is not None
+                    else []
+                )
+            if stale_ids:
+                cleaner(stale_ids)
         return registered
 
     def register_catalog_descriptor(
@@ -1223,6 +1367,7 @@ class HarnessController:
         started: ActionRecord,
         artifact_paths: dict[str, Path],
         source_artifact_hashes: tuple[str, ...] = (),
+        raw_arguments: Mapping[str, Any] | None = None,
         cancel_event: threading.Event | None,
     ) -> tuple[ActionLifecycleState, ResultEnvelope, bool, bytes, _ObservedTelemetry]:
         """Invoke adapter outside SQLite transactions and normalize outcome."""
@@ -1237,6 +1382,10 @@ class HarnessController:
                     adapter.execute_with_capture, "source_artifact_hashes"
                 ):
                     capture_kwargs["source_artifact_hashes"] = source_artifact_hashes
+                if raw_arguments is not None and _supports_kwarg(
+                    adapter.execute_with_capture, "raw_arguments"
+                ):
+                    capture_kwargs["raw_arguments"] = dict(raw_arguments)
                 outcome = adapter.execute_with_capture(started, **capture_kwargs)
                 envelope = outcome.envelope
                 cleanup_confirmed = bool(outcome.cleanup_confirmed)
@@ -1320,6 +1469,15 @@ class HarnessController:
         adapter_spec: RegisteredAdapterSpec | None = None
         active_scope: ScopePolicy | None = None
         artifact_paths: dict[str, Path] = {}
+        source_artifact_hashes: tuple[str, ...] = ()
+        early_denial_env: ResultEnvelope | None = None
+        expired_session_ids: list[str] = []
+        session_operation: str | None = None
+        req_session_id: str | None = None
+        acquired_session_id: str | None = None
+        bound_session_action_id: str | None = None
+        bound_probe_action_id: str | None = None
+        effective_interactive_slot = False
 
         # ---------------- TX1: Replay, Auth/Scope/Catalog, Reserve, Start + Fencing ----------------
         with self.storage.transaction() as conn:
@@ -1419,7 +1577,7 @@ class HarnessController:
                     now=now,
                 )
 
-            # Scope check (captures expired scope reason vs permission denial).
+            # Scope check (captures expired/revoked scope reason vs permission denial).
             try:
                 active_scope = self.scope_validator.validate_action_in_tx(
                     conn,
@@ -1430,10 +1588,11 @@ class HarnessController:
                     now=now,
                 )
             except ScopeDeniedError as exc:
+                msg_lower = str(exc).lower()
                 err_code = (
                     "scope_expired"
-                    if "expired" in str(exc).lower()
-                    else "scope_denied"
+                    if "expired" in msg_lower
+                    else ("scope_revoked" if "revoked" in msg_lower else "scope_denied")
                 )
                 return self._record_denial_in_tx(
                     conn,
@@ -1484,7 +1643,7 @@ class HarnessController:
                     now=now,
                 )
 
-            # Check optimistic revision lock BEFORE mutating budget or inserting action.
+            # Check optimistic revision lock BEFORE mutating budget, leases, or actions.
             if request.expected_revision != snapshot.revision:
                 raise ActionConflictError(
                     f"Run revision mismatch for {request.run_id!r}: "
@@ -1496,107 +1655,309 @@ class HarnessController:
                     },
                 )
 
-            # #29 Rule 2: Single-source run budget reservation (manage_run_budget=False on ActionManager).
-            reservation = reserve_run_budget_in_tx(
-                conn,
-                run_id=request.run_id,
-                capability=validated_cap,
-                is_heavy_job=adapter_spec.is_heavy_job,
-                is_interactive_session=adapter_spec.is_interactive_session,
-                allow_shrink=True,
-            )
-            reserved_sub = self.actions.reserve_action_in_tx(
-                conn,
-                run_id=request.run_id,
-                principal_id=principal.principal_id,
-                request=request,
-                capability=validated_cap,
-                scope_revision=active_scope.scope_revision,
-                sanitized_args=sanitized_args,
-                reserved_ms=reservation.reserved_ms,
-                reserved_bytes=reservation.reserved_bytes,
-                heavy_job_slot=reservation.heavy_job_slot,
-                interactive_session_slot=reservation.interactive_session_slot,
-                manage_run_budget=False,
-                now=now,
-            )
+            artifact_args: dict[str, Any] = dict(request.arguments)
 
-            # Pre-launch expiration path (reserved -> expired -> denied with explicit reason).
-            effective_expiry_reason = pre_launch_expired_reason
-            if (
-                not effective_expiry_reason
-                and active_scope.expires_at is not None
-                and self._now() >= active_scope.expires_at
-            ):
-                effective_expiry_reason = (
-                    f"Scope {active_scope.scope_revision!r} expired prior to launch."
+            # Interactive session pre-validation and idle-lease sweep BEFORE reserving budget.
+            if adapter_spec.tool_group == "session.control":
+                self.leases.ensure_schema()
+                expired_in_tx = self.leases.expire_idle_leases_in_tx(
+                    conn, run_id=request.run_id, now=now
                 )
+                for exp_lease in expired_in_tx:
+                    expired_session_ids.append(exp_lease.session_id)
+                    self.audit.record_sanitized_in_tx(
+                        conn,
+                        AuditEvent(
+                            event_id=f"aud-{uuid4().hex}",
+                            timestamp=now,
+                            run_id=exp_lease.run_id,
+                            principal_id=exp_lease.principal_id,
+                            action_id=None,
+                            capability="session.lease",
+                            operation="expire_idle",
+                            outcome=SessionLeaseState.EXPIRED.value,
+                            usage=None,
+                            scope_revision=active_scope.scope_revision,
+                            destination_summary=(
+                                f"session_id={exp_lease.session_id};"
+                                f"reason={exp_lease.termination_reason}"
+                            ),
+                        ),
+                    )
+                session_operation = request.operation.strip().lower()
+                if session_operation == "open":
+                    run_sess_row = conn.execute(
+                        "SELECT active_sessions FROM runs WHERE run_id = ?",
+                        (request.run_id,),
+                    ).fetchone()
+                    current_sessions = int(run_sess_row["active_sessions"]) if run_sess_row else 0
+                    if current_sessions >= snapshot.manifest.budget_spec.interactive_session_limit:
+                        raise BudgetExceededError(
+                            f"Interactive session limit "
+                            f"({snapshot.manifest.budget_spec.interactive_session_limit}) reached.",
+                            details={
+                                "run_id": request.run_id,
+                                "active_sessions": current_sessions,
+                                "limit": snapshot.manifest.budget_spec.interactive_session_limit,
+                            },
+                        )
+                elif session_operation in ("inspect", "step", "close"):
+                    raw_sid = request.arguments.get("session_id")
+                    req_session_id = str(raw_sid).strip() if isinstance(raw_sid, str) else ""
+                    lease_row = (
+                        conn.execute(
+                            "SELECT * FROM session_leases WHERE session_id = ?",
+                            (req_session_id,),
+                        ).fetchone()
+                        if req_session_id
+                        else None
+                    )
+                    if (
+                        lease_row is None
+                        or str(lease_row["run_id"]) != request.run_id
+                        or str(lease_row["principal_id"]) != principal.principal_id
+                    ):
+                        early_denial_env = self._record_denial_in_tx(
+                            conn,
+                            principal=principal,
+                            request=request,
+                            adapter_revision=validated_cap.adapter_commit,
+                            scope_revision=active_scope.scope_revision,
+                            error_code="session_not_found",
+                            message=(
+                                f"Session {req_session_id!r} was not found for run "
+                                f"{request.run_id!r}."
+                            ),
+                            sanitized_args=sanitized_args,
+                            now=now,
+                        )
+                    else:
+                        lease_state = str(lease_row["state"])
+                        if lease_state == SessionLeaseState.EXPIRED.value:
+                            early_denial_env = self._record_denial_in_tx(
+                                conn,
+                                principal=principal,
+                                request=request,
+                                adapter_revision=validated_cap.adapter_commit,
+                                scope_revision=active_scope.scope_revision,
+                                error_code="session_expired",
+                                message=(
+                                    f"Session {req_session_id!r} expired ("
+                                    f"{lease_row['termination_reason'] or 'idle_timeout'})."
+                                ),
+                                sanitized_args=sanitized_args,
+                                now=now,
+                            )
+                        elif lease_state == SessionLeaseState.LOST.value:
+                            early_denial_env = self._record_denial_in_tx(
+                                conn,
+                                principal=principal,
+                                request=request,
+                                adapter_revision=validated_cap.adapter_commit,
+                                scope_revision=active_scope.scope_revision,
+                                error_code="session_lost",
+                                message=(
+                                    f"Session {req_session_id!r} was lost on supervisor restart."
+                                ),
+                                sanitized_args=sanitized_args,
+                                now=now,
+                            )
+                        elif lease_state == SessionLeaseState.CLOSED.value:
+                            early_denial_env = self._record_denial_in_tx(
+                                conn,
+                                principal=principal,
+                                request=request,
+                                adapter_revision=validated_cap.adapter_commit,
+                                scope_revision=active_scope.scope_revision,
+                                error_code="session_closed",
+                                message=f"Session {req_session_id!r} is already closed.",
+                                sanitized_args=sanitized_args,
+                                now=now,
+                            )
+                        elif lease_state != SessionLeaseState.ACTIVE.value:
+                            early_denial_env = self._record_denial_in_tx(
+                                conn,
+                                principal=principal,
+                                request=request,
+                                adapter_revision=validated_cap.adapter_commit,
+                                scope_revision=active_scope.scope_revision,
+                                error_code="session_invalid_state",
+                                message=(
+                                    f"Session {req_session_id!r} is in invalid state "
+                                    f"{lease_state!r}."
+                                ),
+                                sanitized_args=sanitized_args,
+                                now=now,
+                            )
+                        elif (
+                            not artifact_args.get("artifact_id")
+                            and lease_row["artifact_id"] is not None
+                        ):
+                            artifact_args["artifact_id"] = str(lease_row["artifact_id"])
 
-            if effective_expiry_reason:
-                expiry_reason = sanitize_audit_text(effective_expiry_reason)
-                settle_run_budget_in_tx(
+            # Network preflight BEFORE budget/action mutation so out-of-scope URLs stay clean.
+            preflight_target: Any = None
+            if early_denial_env is None and hasattr(adapter_spec.adapter, "preflight_request"):
+                try:
+                    preflight_target = adapter_spec.adapter.preflight_request(
+                        run_id=request.run_id,
+                        operation=request.operation,
+                        arguments=request.arguments,
+                        policy=active_scope,
+                    )
+                except ScopeDeniedError as exc:
+                    err_code = getattr(exc, "code", None) or "scope_denied"
+                    early_denial_env = self._record_denial_in_tx(
+                        conn,
+                        principal=principal,
+                        request=request,
+                        adapter_revision=validated_cap.adapter_commit,
+                        scope_revision=active_scope.scope_revision,
+                        error_code=str(err_code),
+                        message=str(exc),
+                        sanitized_args=sanitized_args,
+                        now=now,
+                    )
+
+            if early_denial_env is None:
+                # LeaseManager tracks runs.active_sessions across open..close for session.control.
+                effective_interactive_slot = bool(
+                    adapter_spec.is_interactive_session
+                    and adapter_spec.tool_group != "session.control"
+                )
+                # #29 Rule 2: Single-source run budget reservation (manage_run_budget=False on ActionManager).
+                reservation = reserve_run_budget_in_tx(
                     conn,
                     run_id=request.run_id,
-                    reserved_ms=reserved_sub.action.reserved_ms,
-                    reserved_bytes=reserved_sub.action.reserved_bytes,
-                    used_ms=0,
-                    used_bytes=0,
-                    heavy_job_slot=reservation.heavy_job_slot,
-                    interactive_session_slot=reservation.interactive_session_slot,
-                    cleanup_confirmed=True,
+                    capability=validated_cap,
+                    is_heavy_job=adapter_spec.is_heavy_job,
+                    is_interactive_session=effective_interactive_slot,
+                    allow_shrink=True,
                 )
-                expired_sub = self.actions.settle_action_in_tx(
+                reserved_sub = self.actions.reserve_action_in_tx(
                     conn,
-                    action_id=reserved_sub.action.action_id,
-                    target_state=ActionLifecycleState.EXPIRED,
-                    usage=UsageMetrics(wall_ms=0, output_bytes=0),
-                    has_tool_receipt=False,
-                    expiry_reason=expiry_reason,
-                    summary=f"Action expired before launch: {expiry_reason}",
-                    error=ErrorDetail(
-                        code="action_expired",
-                        message=expiry_reason,
-                        retryable=False,
-                    ),
-                    retain_reservation=False,
+                    run_id=request.run_id,
+                    principal_id=principal.principal_id,
+                    request=request,
+                    capability=validated_cap,
+                    scope_revision=active_scope.scope_revision,
+                    sanitized_args=sanitized_args,
+                    reserved_ms=reservation.reserved_ms,
+                    reserved_bytes=reservation.reserved_bytes,
                     heavy_job_slot=reservation.heavy_job_slot,
                     interactive_session_slot=reservation.interactive_session_slot,
                     manage_run_budget=False,
                     now=now,
                 )
-                assert expired_sub.envelope is not None
-                self.audit.record_sanitized_in_tx(
-                    conn,
-                    AuditEvent(
-                        event_id=f"aud-{uuid4().hex}",
-                        timestamp=now,
+
+                # Pre-launch expiration path (reserved -> expired -> denied with explicit reason).
+                effective_expiry_reason = pre_launch_expired_reason
+                if (
+                    not effective_expiry_reason
+                    and active_scope.expires_at is not None
+                    and self._now() >= active_scope.expires_at
+                ):
+                    effective_expiry_reason = (
+                        f"Scope {active_scope.scope_revision!r} expired prior to launch."
+                    )
+
+                if effective_expiry_reason:
+                    expiry_reason = sanitize_audit_text(effective_expiry_reason)
+                    settle_run_budget_in_tx(
+                        conn,
                         run_id=request.run_id,
-                        principal_id=principal.principal_id,
-                        action_id=expired_sub.action.action_id,
-                        capability=request.capability_name,
-                        operation=request.operation,
-                        outcome=expired_sub.envelope.status.value,
+                        reserved_ms=reserved_sub.action.reserved_ms,
+                        reserved_bytes=reserved_sub.action.reserved_bytes,
+                        used_ms=0,
+                        used_bytes=0,
+                        heavy_job_slot=reservation.heavy_job_slot,
+                        interactive_session_slot=reservation.interactive_session_slot,
+                        cleanup_confirmed=True,
+                    )
+                    expired_sub = self.actions.settle_action_in_tx(
+                        conn,
+                        action_id=reserved_sub.action.action_id,
+                        target_state=ActionLifecycleState.EXPIRED,
                         usage=UsageMetrics(wall_ms=0, output_bytes=0),
-                        scope_revision=active_scope.scope_revision,
-                        destination_summary=f"expired_before_launch:{expiry_reason}",
-                    ),
-                )
-                return expired_sub.envelope
+                        has_tool_receipt=False,
+                        expiry_reason=expiry_reason,
+                        summary=f"Action expired before launch: {expiry_reason}",
+                        error=ErrorDetail(
+                            code="action_expired",
+                            message=expiry_reason,
+                            retryable=False,
+                        ),
+                        retain_reservation=False,
+                        heavy_job_slot=reservation.heavy_job_slot,
+                        interactive_session_slot=reservation.interactive_session_slot,
+                        manage_run_budget=False,
+                        now=now,
+                    )
+                    assert expired_sub.envelope is not None
+                    self.audit.record_sanitized_in_tx(
+                        conn,
+                        AuditEvent(
+                            event_id=f"aud-{uuid4().hex}",
+                            timestamp=now,
+                            run_id=request.run_id,
+                            principal_id=principal.principal_id,
+                            action_id=expired_sub.action.action_id,
+                            capability=request.capability_name,
+                            operation=request.operation,
+                            outcome=expired_sub.envelope.status.value,
+                            usage=UsageMetrics(wall_ms=0, output_bytes=0),
+                            scope_revision=active_scope.scope_revision,
+                            destination_summary=f"expired_before_launch:{expiry_reason}",
+                        ),
+                    )
+                    early_denial_env = expired_sub.envelope
+                else:
+                    artifact_paths, source_artifact_hashes = self._resolve_run_artifact_context(
+                        principal=principal,
+                        run_id=request.run_id,
+                        arguments=artifact_args,
+                    )
+                    started = self.actions.start_action_in_tx(
+                        conn,
+                        action_id=reserved_sub.action.action_id,
+                        supervisor_key=self._supervisor_key,
+                        supervisor_instance_id=self._supervisor_instance_id,
+                        process_start_id=f"proc-{uuid4().hex[:12]}",
+                        now=now,
+                    )
+                    if session_operation == "open":
+                        raw_art = artifact_args.get("artifact_id")
+                        lease = self.leases.acquire_lease_in_tx(
+                            conn,
+                            run_id=request.run_id,
+                            principal_id=principal.principal_id,
+                            capability_name=validated_cap.name,
+                            adapter_revision=validated_cap.adapter_commit,
+                            artifact_id=str(raw_art).strip() if isinstance(raw_art, str) and raw_art.strip() else None,
+                            supervisor_instance_id=self._supervisor_instance_id,
+                            now=now,
+                        )
+                        acquired_session_id = lease.session_id
+                        if hasattr(adapter_spec.adapter, "bind_action_session"):
+                            adapter_spec.adapter.bind_action_session(
+                                started.action_id,
+                                lease.session_id,
+                            )
+                            bound_session_action_id = started.action_id
+                    if preflight_target is not None and hasattr(
+                        adapter_spec.adapter, "bind_preflight_target"
+                    ):
+                        adapter_spec.adapter.bind_preflight_target(
+                            started.action_id,
+                            preflight_target,
+                            active_scope,
+                        )
+                        bound_probe_action_id = started.action_id
 
-            artifact_paths, source_artifact_hashes = self._resolve_run_artifact_context(
-                principal=principal,
-                run_id=request.run_id,
-                arguments=request.arguments,
-            )
-
-            started = self.actions.start_action_in_tx(
-                conn,
-                action_id=reserved_sub.action.action_id,
-                supervisor_key=self._supervisor_key,
-                supervisor_instance_id=self._supervisor_instance_id,
-                process_start_id=f"proc-{uuid4().hex[:12]}",
-                now=now,
-            )
+        if expired_session_ids:
+            self._cleanup_adapter_session_files(expired_session_ids, run_id=request.run_id)
+        if early_denial_env is not None:
+            return early_denial_env
 
         # ---------------- Outside TX: Bounded subprocess execution + evidence capture ----------------
         assert started is not None
@@ -1604,19 +1965,129 @@ class HarnessController:
         assert adapter_spec is not None
         assert active_scope is not None
 
-        target_state, normalized_env, cleanup_confirmed, _, telemetry = (
-            self._execute_adapter_outside_tx(
-                adapter=adapter_spec.adapter,
-                started=started,
-                artifact_paths=artifact_paths,
-                source_artifact_hashes=source_artifact_hashes,
-                cancel_event=cancel_event,
+        try:
+            target_state, normalized_env, cleanup_confirmed, _, telemetry = (
+                self._execute_adapter_outside_tx(
+                    adapter=adapter_spec.adapter,
+                    started=started,
+                    artifact_paths=artifact_paths,
+                    source_artifact_hashes=source_artifact_hashes,
+                    raw_arguments=request.arguments,
+                    cancel_event=cancel_event,
+                )
             )
-        )
+        finally:
+            if bound_session_action_id is not None and hasattr(
+                adapter_spec.adapter, "clear_action_session"
+            ):
+                adapter_spec.adapter.clear_action_session(bound_session_action_id)
+            if bound_probe_action_id is not None and hasattr(
+                adapter_spec.adapter, "clear_preflight"
+            ):
+                adapter_spec.adapter.clear_preflight(bound_probe_action_id)
 
         # ---------------- TX2: Settle budget, settle action, cleanup mark, sanitized audit ----------------
         finish_now = self._now()
+        session_ids_to_clean: list[str] = []
         with self.storage.transaction() as conn:
+            if (
+                adapter_spec.tool_group == "net.probe"
+                and target_state == ActionLifecycleState.COMPLETED
+            ):
+                rev_row = conn.execute(
+                    """
+                    SELECT revoked_at FROM scopes
+                    WHERE run_id = ? AND scope_revision = ?
+                    """,
+                    (request.run_id, active_scope.scope_revision),
+                ).fetchone()
+                if rev_row is not None and rev_row["revoked_at"] is not None:
+                    rev_err = ErrorDetail(
+                        code="scope_revoked",
+                        message="Run scope was revoked before network probe settled.",
+                        retryable=False,
+                    )
+                    target_state = ActionLifecycleState.DENIED
+                    normalized_env = ResultEnvelope(
+                        run_id=normalized_env.run_id,
+                        action_id=normalized_env.action_id,
+                        status=EnvelopeStatus.DENIED,
+                        summary="Network probe denied: run scope revoked during execution.",
+                        evidence=(),
+                        truncated=False,
+                        next_cursor=None,
+                        error=rev_err,
+                        usage=normalized_env.usage,
+                        provenance=normalized_env.provenance,
+                    )
+
+            if session_operation == "open" and acquired_session_id is not None:
+                if target_state != ActionLifecycleState.COMPLETED:
+                    lease_row = conn.execute(
+                        "SELECT state FROM session_leases WHERE session_id = ?",
+                        (acquired_session_id,),
+                    ).fetchone()
+                    if (
+                        lease_row is not None
+                        and str(lease_row["state"]) == SessionLeaseState.ACTIVE.value
+                    ):
+                        self.leases.close_lease_in_tx(
+                            conn,
+                            acquired_session_id,
+                            run_id=request.run_id,
+                            reason=f"open_{target_state.value}",
+                            now=finish_now,
+                        )
+                    session_ids_to_clean.append(acquired_session_id)
+            elif session_operation in ("inspect", "step") and req_session_id is not None:
+                lease_row = conn.execute(
+                    "SELECT state, idle_seconds FROM session_leases WHERE session_id = ?",
+                    (req_session_id,),
+                ).fetchone()
+                if (
+                    lease_row is not None
+                    and str(lease_row["state"]) == SessionLeaseState.ACTIVE.value
+                ):
+                    if target_state == ActionLifecycleState.COMPLETED:
+                        new_expires = finish_now + timedelta(seconds=int(lease_row["idle_seconds"]))
+                        conn.execute(
+                            """
+                            UPDATE session_leases
+                            SET last_activity_at = ?, expires_at = ?
+                            WHERE session_id = ? AND state = 'active'
+                            """,
+                            (finish_now.isoformat(), new_expires.isoformat(), req_session_id),
+                        )
+                    elif target_state in (
+                        ActionLifecycleState.TIMEOUT,
+                        ActionLifecycleState.CANCELLED,
+                    ) or not cleanup_confirmed:
+                        self.leases.close_lease_in_tx(
+                            conn,
+                            req_session_id,
+                            run_id=request.run_id,
+                            reason=f"action_{target_state.value}",
+                            now=finish_now,
+                        )
+                        session_ids_to_clean.append(req_session_id)
+            elif session_operation == "close" and req_session_id is not None:
+                lease_row = conn.execute(
+                    "SELECT state FROM session_leases WHERE session_id = ?",
+                    (req_session_id,),
+                ).fetchone()
+                if (
+                    lease_row is not None
+                    and str(lease_row["state"]) == SessionLeaseState.ACTIVE.value
+                ):
+                    self.leases.close_lease_in_tx(
+                        conn,
+                        req_session_id,
+                        run_id=request.run_id,
+                        reason="closed_by_client",
+                        now=finish_now,
+                    )
+                session_ids_to_clean.append(req_session_id)
+
             if telemetry.process_start_id:
                 conn.execute(
                     """
@@ -1695,7 +2166,11 @@ class HarnessController:
                     destination_summary=summarize_arguments(sanitized_args),
                 ),
             )
-            return settled.envelope
+            settled_envelope = settled.envelope
+
+        if session_ids_to_clean:
+            self._cleanup_adapter_session_files(session_ids_to_clean, run_id=request.run_id)
+        return settled_envelope
 
     # ------------------------------------------------------------------
     # Evidence paging & redaction
@@ -2516,6 +2991,13 @@ class HarnessController:
         if output_relpath is not None and self.report_exporter.export_root is None:
             raise ConfigurationError("output_relpath requires export_root to be configured.")
 
+        expired_leases = self.expire_idle_leases(principal=principal, run_id=run_id)
+        if expired_leases:
+            self._cleanup_adapter_session_files(
+                [lease.session_id for lease in expired_leases],
+                run_id=run_id,
+            )
+
         # Step 1: Pre-rollback integrity check.
         with self.storage.read_connection() as conn:
             pre_report = evaluate_close_integrity_in_tx(
@@ -2654,6 +3136,63 @@ class HarnessController:
         )
 
 
+def _register_p4_adapters(
+    controller: HarnessController,
+    *,
+    effective_timeout: int,
+    max_output_bytes: int,
+    max_decode_bytes: int,
+    require_running_state: bool,
+    include_transform_helper: bool = False,
+    transform_helper_enabled: bool = True,
+    include_interactive_session: bool = False,
+    interactive_session_enabled: bool = True,
+    include_scoped_http_probe: bool = False,
+    scoped_http_probe_enabled: bool = True,
+) -> None:
+    """Register optional P4/CTF-09 adapters onto ``controller`` without enabling by default."""
+    _ = require_running_state
+    p4_limits = CapabilityLimits(
+        timeout_seconds=effective_timeout,
+        max_output_bytes=max_output_bytes,
+        max_decode_bytes=max_decode_bytes,
+    )
+    if include_transform_helper:
+        transform = DeterministicTransformAdapter(
+            descriptor=create_transform_helper_descriptor(
+                enabled=transform_helper_enabled,
+                limits=p4_limits,
+            ),
+            evidence_vault=controller.evidence_vault,
+        )
+        controller.register_adapter(transform, tool_group="helper.transform")
+    if include_interactive_session:
+        interactive = InteractiveDebugSessionAdapter(
+            descriptor=create_interactive_session_descriptor(
+                enabled=interactive_session_enabled,
+                limits=p4_limits,
+            ),
+            evidence_vault=controller.evidence_vault,
+            session_root=controller.vault_root / "_sessions",
+        )
+        controller.register_adapter(
+            interactive,
+            tool_group="session.control",
+            is_interactive_session=True,
+        )
+    if include_scoped_http_probe:
+        probe = ScopedHttpProbeAdapter(
+            descriptor=create_scoped_http_probe_descriptor(
+                enabled=scoped_http_probe_enabled,
+                limits=p4_limits,
+            ),
+            evidence_vault=controller.evidence_vault,
+            network_guard=controller.network_guard,
+            policy_provider=controller._load_live_scope_policy,
+        )
+        controller.register_adapter(probe, tool_group="net.probe")
+
+
 def register_default_adapters(
     controller: HarnessController,
     *,
@@ -2662,8 +3201,14 @@ def register_default_adapters(
     max_output_bytes: int = 65_536,
     max_decode_bytes: int = 65_536,
     require_running_state: bool = True,
+    include_transform_helper: bool = False,
+    transform_helper_enabled: bool = True,
+    include_interactive_session: bool = False,
+    interactive_session_enabled: bool = True,
+    include_scoped_http_probe: bool = False,
+    scoped_http_probe_enabled: bool = True,
 ) -> StaticArtifactInspectorAdapter:
-    """Register the default P2 static artifact inspector onto ``controller``."""
+    """Register the default P2 static artifact inspector (and optional P4/CTF-09 adapters)."""
     effective_timeout = timeout_seconds or (
         controller.config.execution.action_timeout_seconds
         if controller.config is not None
@@ -2678,6 +3223,19 @@ def register_default_adapters(
         require_running_state=require_running_state,
     )
     controller.register_adapter(inspector, tool_group="analysis.query")
+    _register_p4_adapters(
+        controller,
+        effective_timeout=effective_timeout,
+        max_output_bytes=max_output_bytes,
+        max_decode_bytes=max_decode_bytes,
+        require_running_state=require_running_state,
+        include_transform_helper=include_transform_helper,
+        transform_helper_enabled=transform_helper_enabled,
+        include_interactive_session=include_interactive_session,
+        interactive_session_enabled=interactive_session_enabled,
+        include_scoped_http_probe=include_scoped_http_probe,
+        scoped_http_probe_enabled=scoped_http_probe_enabled,
+    )
     return inspector
 
 
@@ -2770,9 +3328,17 @@ def create_default_controller(
     runtime_settings: RuntimeSettings | None = None,
     allow_ephemeral_cursor_key: bool = False,
     allow_synthetic_adapters: bool = False,
+    allow_dynamic: bool | None = None,
+    network_guard: ScopedNetworkPolicyGuard | None = None,
     enable_static_inspector: bool | None = None,
     enable_local_verifier: bool = False,
     static_inspector_enabled: bool = True,
+    include_transform_helper: bool = False,
+    transform_helper_enabled: bool = True,
+    include_interactive_session: bool = False,
+    interactive_session_enabled: bool = True,
+    include_scoped_http_probe: bool = False,
+    scoped_http_probe_enabled: bool = True,
     timeout_seconds: int | None = None,
     max_output_bytes: int = 65_536,
     max_decode_bytes: int = 65_536,
@@ -2794,6 +3360,8 @@ def create_default_controller(
         runtime_settings=runtime_settings,
         allow_ephemeral_cursor_key=allow_ephemeral_cursor_key,
         allow_synthetic_adapters=allow_synthetic_adapters,
+        allow_dynamic=allow_dynamic,
+        network_guard=network_guard,
         **controller_kwargs,
     )
     if initialize:
@@ -2831,6 +3399,31 @@ def create_default_controller(
             max_output_bytes=max_output_bytes,
             max_decode_bytes=max_decode_bytes,
             require_running_state=True,
+            include_transform_helper=include_transform_helper,
+            transform_helper_enabled=transform_helper_enabled,
+            include_interactive_session=include_interactive_session,
+            interactive_session_enabled=interactive_session_enabled,
+            include_scoped_http_probe=include_scoped_http_probe,
+            scoped_http_probe_enabled=scoped_http_probe_enabled,
+        )
+    elif include_transform_helper or include_interactive_session or include_scoped_http_probe:
+        effective_timeout = timeout_seconds or (
+            controller.config.execution.action_timeout_seconds
+            if controller.config is not None
+            else 60
+        )
+        _register_p4_adapters(
+            controller,
+            effective_timeout=effective_timeout,
+            max_output_bytes=max_output_bytes,
+            max_decode_bytes=max_decode_bytes,
+            require_running_state=True,
+            include_transform_helper=include_transform_helper,
+            transform_helper_enabled=transform_helper_enabled,
+            include_interactive_session=include_interactive_session,
+            interactive_session_enabled=interactive_session_enabled,
+            include_scoped_http_probe=include_scoped_http_probe,
+            scoped_http_probe_enabled=scoped_http_probe_enabled,
         )
 
     if enable_local_verifier:

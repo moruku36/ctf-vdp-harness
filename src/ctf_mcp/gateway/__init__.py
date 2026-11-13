@@ -34,6 +34,11 @@ from ctf_mcp.gateway.principal import (
     TokenBinding,
     extract_bearer_token,
 )
+from ctf_mcp.gateway.network_guard import (
+    AllowedTargetRule,
+    PinnedNetworkTarget,
+    ScopedNetworkPolicyGuard,
+)
 from ctf_mcp.gateway.scope import ScopeValidator
 
 __all__ = [
@@ -46,6 +51,9 @@ __all__ = [
     "MAX_AUDIT_SUMMARY_CHARS",
     "PrincipalAuthenticator",
     "RunBudgetManager",
+    "AllowedTargetRule",
+    "PinnedNetworkTarget",
+    "ScopedNetworkPolicyGuard",
     "ScopeValidator",
     "TokenBinding",
     "build_capability_descriptor",

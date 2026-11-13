@@ -160,6 +160,7 @@ ACTION_TRANSITIONS: dict[ActionLifecycleState, frozenset[ActionLifecycleState]] 
             ActionLifecycleState.TIMEOUT,
             ActionLifecycleState.CANCELLED,
             ActionLifecycleState.FAILED,
+            ActionLifecycleState.DENIED,
             ActionLifecycleState.RECONCILIATION_REQUIRED,
         }
     ),

@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,6 +31,10 @@ MAX_ARTIFACT_INSPECT_READ_BYTES = 2 * 1024 * 1024
 MAX_MEMORY_SLICE_BYTES = 4096
 MAX_STEP_COUNT = 64
 MAX_TRACE_ENTRIES = 64
+_NATIVE_INSPECT_TIMEOUT_SECONDS = 2.0
+_NATIVE_DISASM_LINES = 12
+_NATIVE_SYMBOL_LIMIT = 20
+_NATIVE_SNIPPET_MAX_CHARS = 1536
 SESSION_CONTROL_ADAPTER_ID = "ctf-interactive-session"
 SESSION_CONTROL_TOOL_NAME = "session.control"
 SESSION_CONTROL_COMMIT = "p4-interactive-session-1"
@@ -316,6 +321,183 @@ def _classify_opcode(chunk: bytes) -> tuple[str, int]:
     return f"byte_{b0:02x}", 1
 
 
+def _run_readonly_native_tool(
+    argv: list[str],
+    *,
+    artifact_path: Path,
+) -> tuple[int, str, str] | None:
+    """Run a fixed read-only native inspection command with shell=False and bounded timeout."""
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            timeout=_NATIVE_INSPECT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    full_path_str = str(artifact_path)
+    safe_name = artifact_path.name or "<artifact>"
+    stdout = (proc.stdout or "").replace(full_path_str, safe_name)[:4096]
+    stderr = (proc.stderr or "").replace(full_path_str, safe_name)[:1024]
+    return proc.returncode, stdout, stderr
+
+
+def _collect_native_elf_metadata(
+    artifact_path: Path,
+    *,
+    elf_format: str,
+    pc: int,
+    include_symbols: bool = True,
+) -> dict[str, Any] | None:
+    """Collect bounded read-only GDB/binutils ELF metadata on POSIX when gdb exists.
+
+    Strictly uses fixed hardcoded argv lists (`shell=False`), never executes target code
+    or user-supplied debugger commands, and preserves deterministic fallback on Windows
+    or environments without `gdb`.
+    """
+    if sys.platform == "win32" or elf_format not in {"ELF32", "ELF64"}:
+        return None
+    gdb_bin = shutil.which("gdb")
+    if not gdb_bin:
+        return None
+    try:
+        st = os.lstat(artifact_path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+
+    readelf_bin = shutil.which("readelf")
+    objdump_bin = shutil.which("objdump")
+    safe_pc = max(0, int(pc))
+
+    gdb_argv = [
+        gdb_bin,
+        "--nx",
+        "--nh",
+        "--batch",
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "info files",
+    ]
+    if include_symbols:
+        gdb_argv.extend(["-ex", "info functions"])
+    if safe_pc > 0:
+        gdb_argv.extend(["-ex", f"x/{_NATIVE_DISASM_LINES}i 0x{safe_pc:x}"])
+    gdb_argv.append(str(artifact_path))
+    gdb_res = _run_readonly_native_tool(gdb_argv, artifact_path=artifact_path)
+
+    entry_verified: str | None = None
+    file_type: str | None = None
+    gdb_symbols: list[str] = []
+    gdb_disasm: list[str] = []
+    gdb_lines: list[str] = []
+
+    if gdb_res is not None:
+        _, gdb_out, _ = gdb_res
+        in_functions = False
+        for raw_line in gdb_out.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if len(gdb_lines) < 24:
+                gdb_lines.append(stripped)
+            if "Entry point:" in stripped and entry_verified is None:
+                entry_verified = stripped.split("Entry point:", 1)[1].strip()
+            elif "file type " in stripped and file_type is None:
+                file_type = stripped.split("file type ", 1)[1].strip().rstrip(".")
+            elif stripped.startswith("All defined functions:") or stripped.startswith("Non-debugging symbols:"):
+                in_functions = True
+                continue
+            elif stripped.startswith("=> 0x") or re.match(r"^0x[0-9a-fA-F]+(?:\s+<[^>]+>)?:\s", stripped):
+                in_functions = False
+                if len(gdb_disasm) < _NATIVE_DISASM_LINES:
+                    gdb_disasm.append(stripped)
+            elif in_functions and len(gdb_symbols) < _NATIVE_SYMBOL_LIMIT:
+                if not stripped.startswith("File "):
+                    gdb_symbols.append(stripped[:160])
+
+    readelf_entry: str | None = None
+    readelf_symbols: list[str] = []
+    if readelf_bin:
+        rh_res = _run_readonly_native_tool(
+            [readelf_bin, "-h", str(artifact_path)],
+            artifact_path=artifact_path,
+        )
+        if rh_res is not None and rh_res[0] == 0:
+            for line in rh_res[1].splitlines():
+                if "Entry point address:" in line:
+                    readelf_entry = line.split("Entry point address:", 1)[1].strip()
+                    break
+        if include_symbols:
+            rs_res = _run_readonly_native_tool(
+                [readelf_bin, "--syms", "--wide", str(artifact_path)],
+                artifact_path=artifact_path,
+            )
+            if rs_res is not None and rs_res[0] == 0:
+                in_symtab = False
+                for line in rs_res[1].splitlines():
+                    s = line.strip()
+                    if s.startswith("Symbol table '.symtab'"):
+                        in_symtab = True
+                        continue
+                    if not in_symtab:
+                        continue
+                    parts = s.split()
+                    if len(parts) >= 8 and parts[3] in {"FUNC", "OBJECT"} and not parts[7].startswith("__"):
+                        entry_label = f"{parts[7]}@0x{parts[1]}"
+                        if entry_label not in readelf_symbols:
+                            readelf_symbols.append(entry_label[:160])
+                        if len(readelf_symbols) >= _NATIVE_SYMBOL_LIMIT:
+                            break
+
+    objdump_disasm: list[str] = []
+    if objdump_bin and safe_pc > 0:
+        stop_pc = safe_pc + 48
+        od_res = _run_readonly_native_tool(
+            [
+                objdump_bin,
+                "-d",
+                f"--start-address=0x{safe_pc:x}",
+                f"--stop-address=0x{stop_pc:x}",
+                str(artifact_path),
+            ],
+            artifact_path=artifact_path,
+        )
+        if od_res is not None and od_res[0] == 0:
+            for line in od_res[1].splitlines():
+                s = line.strip()
+                if re.match(r"^[0-9a-fA-F]+:", s) or (s.startswith("0") and "<" in s and s.endswith(">:")):
+                    objdump_disasm.append(s[:160])
+                    if len(objdump_disasm) >= _NATIVE_DISASM_LINES:
+                        break
+
+    combined_symbols = (readelf_symbols or gdb_symbols)[:_NATIVE_SYMBOL_LIMIT]
+    combined_disasm = (gdb_disasm or objdump_disasm)[:_NATIVE_DISASM_LINES]
+    summary_text = "\n".join(gdb_lines)[:_NATIVE_SNIPPET_MAX_CHARS]
+    return {
+        "source": "posix_gdb_binutils_readonly",
+        "tools": {
+            "gdb": gdb_res is not None,
+            "gdb_returncode": gdb_res[0] if gdb_res is not None else None,
+            "objdump": bool(objdump_bin),
+            "readelf": bool(readelf_bin),
+        },
+        "file_type": file_type,
+        "entry_point_verified": entry_verified or readelf_entry,
+        "pc_inspected": f"0x{safe_pc:x}",
+        "symbols": combined_symbols,
+        "disassembly": combined_disasm,
+        "gdb_summary": summary_text,
+    }
+
+
 def _handle_open(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
     """Initialize a persistent session checkpoint after verifying artifact."""
     artifact_path = Path(str(req["artifact_path"]))
@@ -344,6 +526,12 @@ def _handle_open(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
         "mnemonic": mnemonic,
         "bytes_hex": binascii.hexlify(entry_sample[:stride]).decode("ascii"),
     }
+    native_info = _collect_native_elf_metadata(
+        artifact_path,
+        elf_format=str(meta["format"]),
+        pc=pc,
+        include_symbols=True,
+    )
     session_state = {
         "session_id": str(req["session_id"]),
         "run_id": str(req["run_id"]),
@@ -363,8 +551,10 @@ def _handle_open(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
         "registers": registers,
         "trace": [initial_trace],
     }
+    if native_info is not None:
+        session_state["native_inspection"] = native_info
     _atomic_write_json(state_path, session_state)
-    return {
+    open_result: dict[str, Any] = {
         "ok": True,
         "operation": "open",
         "session_id": session_state["session_id"],
@@ -379,6 +569,9 @@ def _handle_open(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
         "registers": registers,
         "initial_trace": initial_trace,
     }
+    if native_info is not None:
+        open_result["native_inspection"] = native_info
+    return open_result
 
 
 def _load_active_session(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
@@ -417,9 +610,33 @@ def _handle_inspect(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
         result["registers"] = state["registers"]
         result["section_names"] = [s.get("name") for s in sections[:32]]
         result["recent_trace"] = state.get("trace", [])[-5:]
+        native_info = (
+            _collect_native_elf_metadata(
+                Path(str(req["artifact_path"])),
+                elf_format=str(state["format"]),
+                pc=int(state["pc"]),
+                include_symbols=True,
+            )
+            if req.get("artifact_path")
+            else state.get("native_inspection")
+        )
+        if native_info is not None:
+            result["native_inspection"] = native_info
     elif view == "registers":
         result["pc"] = f"0x{int(state['pc']):x}"
         result["registers"] = state["registers"]
+        native_info = (
+            _collect_native_elf_metadata(
+                Path(str(req["artifact_path"])),
+                elf_format=str(state["format"]),
+                pc=int(state["pc"]),
+                include_symbols=False,
+            )
+            if req.get("artifact_path")
+            else state.get("native_inspection")
+        )
+        if native_info is not None:
+            result["native_inspection"] = native_info
     elif view == "sections":
         if section_name is not None:
             matched = [s for s in sections if s.get("name") == section_name]
@@ -512,7 +729,7 @@ def _handle_step(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
     state["trace"] = trace[-MAX_TRACE_ENTRIES:]
     _atomic_write_json(state_path, state)
 
-    return {
+    step_result: dict[str, Any] = {
         "ok": True,
         "operation": "step",
         "session_id": state["session_id"],
@@ -524,6 +741,15 @@ def _handle_step(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
         "registers": registers,
         "steps": new_steps,
     }
+    native_info = _collect_native_elf_metadata(
+        artifact_path,
+        elf_format=str(state.get("format", "")),
+        pc=pc,
+        include_symbols=False,
+    )
+    if native_info is not None:
+        step_result["native_inspection"] = native_info
+    return step_result
 
 
 def _handle_close(req: dict[str, Any], state_path: Path) -> dict[str, Any]:
@@ -815,17 +1041,19 @@ if __name__ != "__main__":
                     payload["offset"] = int(args["offset"])
                 if "length" in args:
                     payload["length"] = int(args["length"])
-                if view == "memory":
+                if view in {"summary", "registers", "memory"}:
                     resolved_path = self._resolve_session_artifact_path(
                         args,
                         artifact_paths=artifact_paths,
                     )
                     if resolved_path is None:
-                        raise ContractViolationError(
-                            "inspect(view='memory') requires an active artifact path",
-                            code="artifact_not_found",
-                        )
-                    payload["artifact_path"] = str(resolved_path)
+                        if view == "memory":
+                            raise ContractViolationError(
+                                "inspect(view='memory') requires an active artifact path",
+                                code="artifact_not_found",
+                            )
+                    else:
+                        payload["artifact_path"] = str(resolved_path)
                 return payload
 
             if op == "step":

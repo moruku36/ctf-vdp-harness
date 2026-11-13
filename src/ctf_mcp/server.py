@@ -915,11 +915,27 @@ def _derive_host_close_checks(
     return child_stopped, unconfirmed_pids, import_completed, import_errors
 
 
+def _parse_optional_bool_env(env: Mapping[str, str], name: str) -> bool | None:
+    """Parse an optional boolean environment variable strictly (1/true vs 0/false)."""
+    raw = str(env.get(name, "")).strip().lower()
+    if not raw:
+        return None
+    if raw in {"1", "true"}:
+        return True
+    if raw in {"0", "false"}:
+        return False
+    raise ConfigurationError(f"{name} must be 1/true or 0/false (got {raw!r}).")
+
+
 def build_server_from_env(
     env: Mapping[str, str] | None = None,
     *,
     config_path: str | Path | None = None,
     allow_ephemeral_cursor_key: bool = False,
+    allow_dynamic: bool | None = None,
+    include_transform_helper: bool | None = None,
+    include_interactive_session: bool | None = None,
+    include_scoped_http_probe: bool | None = None,
 ) -> HarnessMcpServer:
     """Build a fail-closed HarnessController + HarnessMcpServer from environment config."""
     eff_env = env if env is not None else os.environ
@@ -931,6 +947,8 @@ def build_server_from_env(
     config: HarnessConfig | None = load_config_file(config_path) if config_path else None
     if config is not None and not str(eff_env.get("CTF_MCP_PROFILE", "")).strip():
         settings = settings.model_copy(update={"profile": config.profile})
+    env_allow_dynamic = _parse_optional_bool_env(eff_env, "CTF_MCP_ALLOW_DYNAMIC")
+    resolved_allow_dynamic = env_allow_dynamic if allow_dynamic is None else allow_dynamic
     hmac_key = get_cursor_hmac_key(
         eff_env, allow_ephemeral_dev_key=allow_ephemeral_cursor_key
     )
@@ -944,6 +962,10 @@ def build_server_from_env(
         config=config,
         runtime_settings=settings,
         allow_synthetic_adapters=False,
+        allow_dynamic=resolved_allow_dynamic,
+        include_transform_helper=include_transform_helper,
+        include_interactive_session=include_interactive_session,
+        include_scoped_http_probe=include_scoped_http_probe,
         initialize=True,
         enable_local_verifier=False,
     )
@@ -966,9 +988,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host for streamable-http")
     parser.add_argument("--port", type=int, default=8000, help="Bind port for streamable-http")
     parser.add_argument("--path", default="/mcp", help="MCP endpoint path for streamable-http")
+    parser.add_argument(
+        "--allow-dynamic",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to enable ExecutionClass.DYNAMIC capabilities.",
+    )
+    parser.add_argument(
+        "--enable-transform-helper",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register helper.transform adapter.",
+    )
+    parser.add_argument(
+        "--enable-interactive-session",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register session.control interactive session adapter.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    server = build_server_from_env(config_path=args.config)
+    server = build_server_from_env(
+        config_path=args.config,
+        allow_dynamic=True if args.allow_dynamic else None,
+        include_transform_helper=True if args.enable_transform_helper else None,
+        include_interactive_session=True if args.enable_interactive_session else None,
+    )
     server.run(host=args.host, port=args.port, path=args.path)
     return 0
 

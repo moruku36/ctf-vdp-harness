@@ -126,6 +126,17 @@ def _resolve_admin_context(
     cursor_hmac_key = get_cursor_hmac_key(
         eff_env, allow_ephemeral_dev_key=not has_env_key
     )
+    raw_allow_dynamic = str(eff_env.get("CTF_MCP_ALLOW_DYNAMIC", "")).strip().lower()
+    if raw_allow_dynamic in {"1", "true"}:
+        env_allow_dynamic: bool | None = True
+    elif raw_allow_dynamic in {"0", "false"}:
+        env_allow_dynamic = False
+    elif not raw_allow_dynamic:
+        env_allow_dynamic = None
+    else:
+        raise ConfigurationError(
+            f"CTF_MCP_ALLOW_DYNAMIC must be 1/true or 0/false (got {raw_allow_dynamic!r})."
+        )
     storage = Storage(settings.db_path)
     controller = create_default_controller(
         storage=storage,
@@ -136,6 +147,7 @@ def _resolve_admin_context(
         runtime_settings=settings,
         allow_ephemeral_cursor_key=not has_env_key,
         allow_synthetic_adapters=False,
+        allow_dynamic=env_allow_dynamic,
         enable_local_verifier=True,
         initialize=initialize,
     )
@@ -167,10 +179,14 @@ def _build_scope_policy(
     allowed_capabilities: Sequence[str],
     allowed_execution_classes: Sequence[ExecutionClass] = (ExecutionClass.STATIC,),
     expires_at: datetime | None = None,
+    network_enabled: bool = False,
+    allowed_targets: Sequence[str] = (),
+    external_submission: bool = False,
 ) -> ScopePolicy:
     """Construct a fail-closed ScopePolicy with canonical SHA-256 digest."""
     caps = tuple(allowed_capabilities)
     exec_classes = tuple(allowed_execution_classes)
+    targets = tuple(allowed_targets)
     payload = {
         "mode": mode.value,
         "task_id": task_id,
@@ -179,6 +195,9 @@ def _build_scope_policy(
         "allowed_capabilities": list(caps),
         "allowed_execution_classes": [c.value for c in exec_classes],
         "expires_at": expires_at.isoformat() if expires_at is not None else None,
+        "network_enabled": bool(network_enabled),
+        "allowed_targets": list(targets),
+        "external_submission": bool(external_submission),
     }
     return ScopePolicy(
         scope_revision=scope_revision,
@@ -189,9 +208,9 @@ def _build_scope_policy(
         allowed_execution_classes=exec_classes,
         allowed_capabilities=caps,
         expires_at=expires_at,
-        network_enabled=False,
-        allowed_targets=(),
-        external_submission=False,
+        network_enabled=bool(network_enabled),
+        allowed_targets=targets,
+        external_submission=bool(external_submission),
     )
 
 
@@ -281,6 +300,9 @@ def _handle_create_run(args: argparse.Namespace, env: Mapping[str, str] | None) 
         allowed_capabilities=allowed_caps,
         allowed_execution_classes=allowed_exec_classes,
         expires_at=_parse_iso_datetime(expires_raw),
+        network_enabled=bool(config.network.enabled) if config is not None else False,
+        allowed_targets=config.network.allowed_targets if config is not None else (),
+        external_submission=bool(config.network.external_submission) if config is not None else False,
     )
 
     base_budget = config.execution.to_budget_spec() if config is not None else BudgetSpec()
@@ -656,6 +678,24 @@ def build_server_parser() -> argparse.ArgumentParser:
         default=False,
         help="Explicit opt-in for ephemeral cursor HMAC key in local dev only.",
     )
+    parser.add_argument(
+        "--allow-dynamic",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to allow ExecutionClass.DYNAMIC capabilities (or CTF_MCP_ALLOW_DYNAMIC=1).",
+    )
+    parser.add_argument(
+        "--enable-transform-helper",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register helper.transform adapter.",
+    )
+    parser.add_argument(
+        "--enable-interactive-session",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register session.control interactive session adapter.",
+    )
     return parser
 
 
@@ -680,6 +720,9 @@ def server_main(
             eff_env,
             config_path=args.config,
             allow_ephemeral_cursor_key=bool(args.allow_ephemeral_cursor_key),
+            allow_dynamic=True if args.allow_dynamic else None,
+            include_transform_helper=True if args.enable_transform_helper else None,
+            include_interactive_session=True if args.enable_interactive_session else None,
         )
         if server.controller.allow_synthetic_adapters:
             raise ConfigurationError("SyntheticAdapter cannot be enabled in production server CLI.")

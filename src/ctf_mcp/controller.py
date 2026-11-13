@@ -3333,11 +3333,11 @@ def create_default_controller(
     enable_static_inspector: bool | None = None,
     enable_local_verifier: bool = False,
     static_inspector_enabled: bool = True,
-    include_transform_helper: bool = False,
+    include_transform_helper: bool | None = None,
     transform_helper_enabled: bool = True,
-    include_interactive_session: bool = False,
+    include_interactive_session: bool | None = None,
     interactive_session_enabled: bool = True,
-    include_scoped_http_probe: bool = False,
+    include_scoped_http_probe: bool | None = None,
     scoped_http_probe_enabled: bool = True,
     timeout_seconds: int | None = None,
     max_output_bytes: int = 65_536,
@@ -3346,6 +3346,39 @@ def create_default_controller(
     **controller_kwargs: Any,
 ) -> HarnessController:
     """Construct and initialize a ``HarnessController`` with default static inspector."""
+    enabled_adapters = (
+        {
+            str(item).strip()
+            for item in config.execution.adapters_enabled
+            if str(item).strip()
+        }
+        if config is not None
+        else set()
+    )
+    resolved_include_transform_helper = (
+        bool(include_transform_helper)
+        if include_transform_helper is not None
+        else bool(enabled_adapters & {"helper.transform", "ctf-helper-transform"})
+    )
+    session_configured = bool(
+        enabled_adapters & {"session.control", "ctf-interactive-session"}
+    )
+    resolved_include_interactive_session = (
+        bool(include_interactive_session)
+        if include_interactive_session is not None
+        else session_configured
+    )
+    resolved_include_scoped_http_probe = (
+        bool(include_scoped_http_probe)
+        if include_scoped_http_probe is not None
+        else bool(enabled_adapters & {"net.probe", "ctf-scoped-http-probe"})
+    )
+    resolved_allow_dynamic = (
+        True
+        if (allow_dynamic is None and session_configured)
+        else allow_dynamic
+    )
+
     vault_path = Path(vault_root)
     resolved_export_root = (
         Path(export_root) if export_root is not None else (vault_path / "_exports")
@@ -3360,7 +3393,7 @@ def create_default_controller(
         runtime_settings=runtime_settings,
         allow_ephemeral_cursor_key=allow_ephemeral_cursor_key,
         allow_synthetic_adapters=allow_synthetic_adapters,
-        allow_dynamic=allow_dynamic,
+        allow_dynamic=resolved_allow_dynamic,
         network_guard=network_guard,
         **controller_kwargs,
     )
@@ -3399,14 +3432,18 @@ def create_default_controller(
             max_output_bytes=max_output_bytes,
             max_decode_bytes=max_decode_bytes,
             require_running_state=True,
-            include_transform_helper=include_transform_helper,
+            include_transform_helper=resolved_include_transform_helper,
             transform_helper_enabled=transform_helper_enabled,
-            include_interactive_session=include_interactive_session,
+            include_interactive_session=resolved_include_interactive_session,
             interactive_session_enabled=interactive_session_enabled,
-            include_scoped_http_probe=include_scoped_http_probe,
+            include_scoped_http_probe=resolved_include_scoped_http_probe,
             scoped_http_probe_enabled=scoped_http_probe_enabled,
         )
-    elif include_transform_helper or include_interactive_session or include_scoped_http_probe:
+    elif (
+        resolved_include_transform_helper
+        or resolved_include_interactive_session
+        or resolved_include_scoped_http_probe
+    ):
         effective_timeout = timeout_seconds or (
             controller.config.execution.action_timeout_seconds
             if controller.config is not None
@@ -3418,11 +3455,11 @@ def create_default_controller(
             max_output_bytes=max_output_bytes,
             max_decode_bytes=max_decode_bytes,
             require_running_state=True,
-            include_transform_helper=include_transform_helper,
+            include_transform_helper=resolved_include_transform_helper,
             transform_helper_enabled=transform_helper_enabled,
-            include_interactive_session=include_interactive_session,
+            include_interactive_session=resolved_include_interactive_session,
             interactive_session_enabled=interactive_session_enabled,
-            include_scoped_http_probe=include_scoped_http_probe,
+            include_scoped_http_probe=resolved_include_scoped_http_probe,
             scoped_http_probe_enabled=scoped_http_probe_enabled,
         )
 

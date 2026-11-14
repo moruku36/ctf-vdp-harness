@@ -65,6 +65,7 @@ SUPPORTED_TOOL_NAMES: tuple[str, ...] = (
     "helper.transform",
     "session.control",
     "net.probe",
+    "vdp.test",
     "evidence.read",
     "hypothesis.update",
     "run.verify",
@@ -619,6 +620,36 @@ class HarnessMcpServer:
             )
 
         @self.mcp.tool(
+            name="vdp.test",
+            description=(
+                "Execute bounded VDP product tests against a pinned target source commit, "
+                "exact scanner image digest, allowlisted selectors/overlays, and --network=none."
+            ),
+            annotations=mutating_hint,
+        )
+        async def vdp_test(
+            run_id: str,
+            request_id: str,
+            expected_revision: int,
+            operation: str,
+            capability_name: str | None = None,
+            arguments: dict[str, Any] | None = None,
+            repeat_of: str | None = None,
+            pre_launch_expired_reason: str | None = None,
+        ) -> ToolResult:
+            return await self._dispatch_action(
+                tool_group="vdp.test",
+                run_id=run_id,
+                request_id=request_id,
+                expected_revision=expected_revision,
+                operation=operation,
+                capability_name=capability_name,
+                arguments=arguments,
+                repeat_of=repeat_of,
+                pre_launch_expired_reason=pre_launch_expired_reason,
+            )
+
+        @self.mcp.tool(
             name="evidence.read",
             description="Read a bounded EvidencePage using an HMAC-signed cursor.",
             annotations=read_only_hint,
@@ -936,6 +967,7 @@ def build_server_from_env(
     include_transform_helper: bool | None = None,
     include_interactive_session: bool | None = None,
     include_scoped_http_probe: bool | None = None,
+    include_vdp_product_test: bool | None = None,
 ) -> HarnessMcpServer:
     """Build a fail-closed HarnessController + HarnessMcpServer from environment config."""
     eff_env = env if env is not None else os.environ
@@ -973,6 +1005,7 @@ def build_server_from_env(
         include_transform_helper=include_transform_helper,
         include_interactive_session=include_interactive_session,
         include_scoped_http_probe=include_scoped_http_probe,
+        include_vdp_product_test=include_vdp_product_test,
         initialize=True,
         enable_local_verifier=False,
     )
@@ -1013,6 +1046,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=False,
         help="Explicit opt-in to register session.control interactive session adapter.",
     )
+    parser.add_argument(
+        "--enable-vdp-product-test",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register vdp.test bounded product-test adapter.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     server = build_server_from_env(
@@ -1020,6 +1059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_dynamic=True if args.allow_dynamic else None,
         include_transform_helper=True if args.enable_transform_helper else None,
         include_interactive_session=True if args.enable_interactive_session else None,
+        include_vdp_product_test=True if args.enable_vdp_product_test else None,
     )
     server.run(host=args.host, port=args.port, path=args.path)
     return 0

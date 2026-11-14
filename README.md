@@ -7,7 +7,7 @@ A bounded analysis environment for your existing ChatGPT/Codex client, exposed t
 ## What is available
 
 - Local Python runtime: static artifact inspection, run/hypothesis state, paged evidence, digest-based CTF verification and report export.
-- Optional bounded transform helpers, interactive sessions and scoped HTTP probing. Dynamic and network capabilities are disabled by default and require separate enablement and authorization.
+- Optional bounded transform helpers, interactive sessions, scoped HTTP probing and pinned container VDP product tests (`vdp.test` / `vdp.product_test` verifier). Dynamic, network and VDP product-test capabilities are disabled by default and require separate enablement and authorization.
 - Offline synthetic A/B/C/D evaluation, with VDP metrics kept separate from CTF results.
 
 **Status:** version `0.1.0` includes runtime code and [dated acceptance records](docs/README.md#acceptance-records), including an environment-specific WSL2/Codex connection record. These are not proof of live VDP security, production readiness, general client compatibility or improved real-world solve rates. Older design documents describe intended deployment, not completed infrastructure.

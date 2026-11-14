@@ -17,12 +17,14 @@ from ctf_mcp.verification.ctf_local import (
     save_verification_record_in_tx,
 )
 from ctf_mcp.verification.registry import VerifierInfo, VerifierRegistry
+from ctf_mcp.verification.vdp_product_test import VdpProductTestVerifier
 
 __all__ = [
     "CloseIntegrityChecker",
     "CloseIntegrityReport",
     "ExpectedChallengeSpec",
     "LocalCtfVerifier",
+    "VdpProductTestVerifier",
     "VerifierInfo",
     "VerifierRegistry",
     "assert_close_ready",

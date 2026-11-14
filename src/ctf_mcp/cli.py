@@ -20,6 +20,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ctf_mcp.adapters.vdp_product_test import (
+    DEFAULT_VDP_TEST_MAX_CPUS,
+    DEFAULT_VDP_TEST_MAX_MEMORY_MB,
+    DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES,
+    DEFAULT_VDP_TEST_TIMEOUT_SECONDS,
+    WEBLATE_2026_11_2_PROFILE_NAME,
+    VdpOverlaySpec,
+    VdpTargetProfile,
+    build_default_weblate_profile,
+    load_registered_vdp_profiles,
+    save_registered_vdp_profile,
+    validate_vdp_profile_registration,
+)
 from ctf_mcp.config import (
     HarnessConfig,
     get_cursor_hmac_key,
@@ -287,9 +300,17 @@ def _handle_create_run(args: argparse.Namespace, env: Mapping[str, str] | None) 
         if args.expires_at is not None
         else (config.scope.expires_at if config is not None else None)
     )
+    default_caps: tuple[str, ...] = ("analysis.query", "artifact.inspect")
+    if (
+        args.allowed_capabilities is None
+        and mode == RunMode.VDP
+        and config is not None
+        and any(item in {"vdp.test", "ctf-vdp-product-test"} for item in config.execution.adapters_enabled)
+    ):
+        default_caps = ("analysis.query", "artifact.inspect", "vdp.test")
     allowed_caps = _parse_csv_values(
         args.allowed_capabilities,
-        default=("analysis.query", "artifact.inspect"),
+        default=default_caps,
     )
     exec_class_strs = _parse_csv_values(
         args.allowed_execution_classes,
@@ -549,8 +570,197 @@ def _handle_update_budget(args: argparse.Namespace, env: Mapping[str, str] | Non
         remaining_bytes=args.remaining_bytes,
         interactive_session_limit=args.interactive_session_limit,
         heavy_job_concurrency=args.heavy_job_concurrency,
+        action_timeout_seconds=args.action_timeout_seconds,
     )
     _emit_json(summary)
+    return 0
+
+
+def _handle_update_scope(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, _, _ = _resolve_admin_context(args, env=env)
+    allowed_caps = (
+        _parse_csv_values(args.allowed_capabilities, default=())
+        if args.allowed_capabilities
+        else None
+    )
+    add_caps = _parse_csv_values(args.add_capability, default=())
+    exec_classes = (
+        tuple(
+            ExecutionClass(item)
+            for item in _parse_csv_values(args.allowed_execution_classes, default=())
+        )
+        if args.allowed_execution_classes
+        else None
+    )
+    allowed_targets = (
+        _parse_csv_values(args.allowed_target, default=())
+        if args.allowed_target
+        else None
+    )
+    network_enabled: bool | None = None
+    if args.network_enabled:
+        network_enabled = True
+    elif args.disable_network:
+        network_enabled = False
+    summary = controller.update_run_scope(
+        run_id=args.run_id,
+        scope_revision=args.scope_revision,
+        principal=None,
+        allowed_capabilities=allowed_caps,
+        add_capabilities=add_caps,
+        allowed_execution_classes=exec_classes,
+        authorization_reference=args.auth_ref,
+        expires_at=_parse_iso_datetime(args.expires_at) if args.expires_at else None,
+        network_enabled=network_enabled,
+        allowed_targets=allowed_targets,
+    )
+    _emit_json(summary)
+    return 0
+
+
+def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    eff_env = _merge_runtime_env(
+        env=env,
+        db_path=getattr(args, "db_path", None),
+        vault_root=getattr(args, "vault_root", None),
+    )
+    settings = load_runtime_settings(eff_env)
+    if settings.vault_root is None:
+        raise ConfigurationError(
+            "Vault root (--vault-root or CTF_MCP_VAULT_ROOT) must be specified."
+        )
+
+    registered = load_registered_vdp_profiles(settings.vault_root)
+    base_name = args.base_profile or args.profile_name
+    base: VdpTargetProfile | None = None
+    if base_name in registered:
+        base = registered[base_name]
+    elif base_name == WEBLATE_2026_11_2_PROFILE_NAME:
+        base = build_default_weblate_profile()
+    elif args.base_profile:
+        raise ContractViolationError(f"Unknown base VDP profile {args.base_profile!r}.")
+
+    image_ref = args.image_ref or (base.image_ref if base is not None else None)
+    if not image_ref:
+        raise ContractViolationError("--image-ref is required when registering a new VDP profile.")
+    image_digest = args.image_digest or (base.expected_image_digest if base is not None else None)
+    if not image_digest:
+        raise ContractViolationError("--image-digest is required when registering a new VDP profile.")
+    source_commit = args.source_commit or (base.expected_source_commit if base is not None else None)
+    if not source_commit:
+        raise ContractViolationError("--source-commit is required when registering a new VDP profile.")
+
+    profile_revision = args.profile_revision or (
+        base.profile_revision if base is not None else "r1"
+    )
+    checkout_dir = (
+        args.checkout_dir
+        if args.checkout_dir is not None
+        else (base.checkout_dir if base is not None else None)
+    )
+
+    extra_allowed = _parse_csv_values(args.allow_selector, default=())
+    extra_pos = _parse_csv_values(args.positive_selector, default=())
+    extra_neg = _parse_csv_values(args.negative_selector, default=())
+
+    allowed_selectors = tuple(
+        dict.fromkeys([*(base.allowed_test_selectors if base is not None else ()), *extra_allowed])
+    )
+    if not allowed_selectors:
+        raise ContractViolationError("At least one --allow-selector is required.")
+    positive_selectors = tuple(
+        dict.fromkeys([*(base.positive_selectors if base is not None else ()), *extra_pos])
+    )
+    negative_selectors = tuple(
+        dict.fromkeys([*(base.negative_selectors if base is not None else ()), *extra_neg])
+    )
+
+    overlays = dict(base.allowed_overlays) if base is not None else {}
+    if args.overlay_bundle:
+        existing_ov = overlays.get(args.overlay_bundle)
+        host_dir = (
+            args.overlay_host_dir
+            if args.overlay_host_dir is not None
+            else (existing_ov.host_dir if existing_ov is not None else None)
+        )
+        if host_dir is None:
+            raise ContractViolationError(
+                "--overlay-host-dir is required when specifying a new --overlay-bundle."
+            )
+        allowed_files = dict(existing_ov.allowed_files) if existing_ov is not None else {}
+        for raw_pin in args.overlay_file_sha256 or ():
+            fname, sep, digest = str(raw_pin).partition("=")
+            if not sep or not fname.strip() or not digest.strip():
+                raise ContractViolationError(
+                    f"--overlay-file-sha256 must have format NAME=SHA256, got {raw_pin!r}."
+                )
+            allowed_files[fname.strip()] = digest.strip().lower()
+        if not allowed_files:
+            raise ContractViolationError(
+                "--overlay-file-sha256 NAME=SHA256 is required for --overlay-bundle."
+            )
+        overlays[args.overlay_bundle] = VdpOverlaySpec(
+            bundle_name=args.overlay_bundle,
+            host_dir=host_dir,
+            container_target="/src/vdp-test-overlay",
+            allowed_files=allowed_files,
+        )
+    elif args.overlay_host_dir is not None or args.overlay_file_sha256:
+        raise ContractViolationError(
+            "--overlay-bundle is required when specifying --overlay-host-dir or --overlay-file-sha256."
+        )
+
+    expires_at = (
+        _parse_iso_datetime(args.expires_at)
+        if args.expires_at
+        else (base.expires_at if base is not None else None)
+    )
+    profile = VdpTargetProfile(
+        profile_name=args.profile_name,
+        profile_revision=profile_revision,
+        image_ref=image_ref,
+        expected_image_digest=image_digest.strip().lower(),
+        expected_source_commit=source_commit.strip().lower(),
+        checkout_dir=checkout_dir,
+        allowed_test_selectors=allowed_selectors,
+        positive_selectors=positive_selectors,
+        negative_selectors=negative_selectors,
+        allowed_overlays=overlays,
+        max_cpus=(
+            args.max_cpus
+            if args.max_cpus is not None
+            else (base.max_cpus if base is not None else DEFAULT_VDP_TEST_MAX_CPUS)
+        ),
+        max_memory_mb=(
+            args.max_memory_mb
+            if args.max_memory_mb is not None
+            else (base.max_memory_mb if base is not None else DEFAULT_VDP_TEST_MAX_MEMORY_MB)
+        ),
+        max_timeout_seconds=(
+            args.max_timeout_seconds
+            if args.max_timeout_seconds is not None
+            else (
+                base.max_timeout_seconds
+                if base is not None
+                else DEFAULT_VDP_TEST_TIMEOUT_SECONDS
+            )
+        ),
+        max_output_bytes=(
+            args.max_output_bytes
+            if args.max_output_bytes is not None
+            else (base.max_output_bytes if base is not None else DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES)
+        ),
+        expires_at=expires_at,
+    )
+    validated = validate_vdp_profile_registration(profile)
+    saved_path = save_registered_vdp_profile(settings.vault_root, validated)
+    _emit_json(
+        {
+            "status": "registered",
+            "profiles_file": str(saved_path),
+            **validated.to_public_summary(),
+        }
+    )
     return 0
 
 
@@ -677,6 +887,47 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_budget.add_argument("--remaining-bytes", type=int, default=None)
     p_budget.add_argument("--interactive-session-limit", type=int, default=None)
     p_budget.add_argument("--heavy-job-concurrency", type=int, default=None)
+    p_budget.add_argument("--action-timeout-seconds", type=int, default=None)
+
+    p_up_scope = subparsers.add_parser(
+        "update-scope",
+        help="Register and activate an updated scope revision on an open run without incrementing run revision.",
+    )
+    _add_common_admin_flags(p_up_scope, suppress_defaults=True)
+    p_up_scope.add_argument("--run-id", required=True)
+    p_up_scope.add_argument("--scope-revision", required=True)
+    p_up_scope.add_argument("--allowed-capabilities", action="append", default=None)
+    p_up_scope.add_argument("--add-capability", action="append", default=None)
+    p_up_scope.add_argument("--allowed-execution-classes", action="append", default=None)
+    p_up_scope.add_argument("--auth-ref", default=None)
+    p_up_scope.add_argument("--expires-at", default=None)
+    p_up_scope.add_argument("--network-enabled", action="store_true", default=False)
+    p_up_scope.add_argument("--disable-network", action="store_true", default=False)
+    p_up_scope.add_argument("--allowed-target", action="append", default=None)
+
+    p_vdp_reg = subparsers.add_parser(
+        "register-vdp-profile",
+        help="Validate and persist a pinned VDP product-test profile under <vault_root>/_vdp/profiles.json.",
+    )
+    _add_common_admin_flags(p_vdp_reg, suppress_defaults=True)
+    p_vdp_reg.add_argument("--profile-name", required=True)
+    p_vdp_reg.add_argument("--profile-revision", default=None)
+    p_vdp_reg.add_argument("--base-profile", default=None)
+    p_vdp_reg.add_argument("--image-ref", default=None)
+    p_vdp_reg.add_argument("--image-digest", default=None)
+    p_vdp_reg.add_argument("--source-commit", default=None)
+    p_vdp_reg.add_argument("--checkout-dir", type=Path, default=None)
+    p_vdp_reg.add_argument("--allow-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--positive-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--negative-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--overlay-bundle", default=None)
+    p_vdp_reg.add_argument("--overlay-host-dir", type=Path, default=None)
+    p_vdp_reg.add_argument("--overlay-file-sha256", action="append", default=None)
+    p_vdp_reg.add_argument("--max-cpus", type=int, default=None)
+    p_vdp_reg.add_argument("--max-memory-mb", type=int, default=None)
+    p_vdp_reg.add_argument("--max-timeout-seconds", type=int, default=None)
+    p_vdp_reg.add_argument("--max-output-bytes", type=int, default=None)
+    p_vdp_reg.add_argument("--expires-at", default=None)
 
     return parser
 
@@ -698,6 +949,8 @@ def admin_main(
         "recover-guest": _handle_recover_guest,
         "describe-run": _handle_describe_run,
         "update-budget": _handle_update_budget,
+        "update-scope": _handle_update_scope,
+        "register-vdp-profile": _handle_register_vdp_profile,
     }
     try:
         return handlers[args.command](args, env)
@@ -756,6 +1009,12 @@ def build_server_parser() -> argparse.ArgumentParser:
         default=False,
         help="Explicit opt-in to register session.control interactive session adapter.",
     )
+    parser.add_argument(
+        "--enable-vdp-product-test",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in to register vdp.test bounded product-test adapter.",
+    )
     return parser
 
 
@@ -783,6 +1042,7 @@ def server_main(
             allow_dynamic=True if args.allow_dynamic else None,
             include_transform_helper=True if args.enable_transform_helper else None,
             include_interactive_session=True if args.enable_interactive_session else None,
+            include_vdp_product_test=True if args.enable_vdp_product_test else None,
         )
         if server.controller.allow_synthetic_adapters:
             raise ConfigurationError("SyntheticAdapter cannot be enabled in production server CLI.")

@@ -73,8 +73,16 @@ ctf-mcp-admin reconcile
 | `helper.transform` | 上限付きの決定論的変換。`--enable-transform-helper`か実行設定による登録が必要 |
 | `session.control` | 型付きの限定対話操作。アダプタ登録・動的実行の有効化・対応スコープがすべて必要。任意shell／デバッガコマンドではない |
 | `net.probe` | 対象限定HTTP。受入済みで有効なアダプタ、network実行クラス、有効なnetwork方針、`scoped_ctf`／`vdp`で認可された対象が必要 |
+| `vdp.test` | 所有者のWSL2／Linux Dockerホスト上で、ピン留め済みソースコミット・イメージダイジェスト・許可済みセレクタ／オーバーレイ・`--network=none`を検証して製品テスト（`describe_profile`、`run_smoke`、`run_pytest`）を実行。`vdp`プロファイル・動的実行有効化・`vdp.test`スコープ・`ctf-vdp-product-test`または`--enable-vdp-product-test`がすべて必要 |
 
 動的操作には`--allow-dynamic`／`CTF_MCP_ALLOW_DYNAMIC`または対応する実行設定が必要ですが、フラグだけではスコープを許可しません。基準の`offline_ctf`実行設定は動的実行とネットワークを禁止します。過去の明示的なローカルセッション記録は、基準を緩和したり実対象をprobeしたりする許可ではありません。ネットワークの対象・操作・期限の確認と、外部送信の認可は分けます。
+
+### VDP製品テスト（`vdp.test`）とツール公開面の補足
+
+- **実行ホスト前提**: `vdp.test`（`VdpProductTestAdapter`）は、ローカルDocker CLIとピン留め済み製品スキャナDockerイメージ（`docker image inspect`）へ到達できる所有者のWSL2 Ubuntu／Linuxホスト上で動作します。ホスト前提が欠けている場合は`BLOCKED_ENV`（`verdict="environment_failure"`, verifier `INCONCLUSIVE`）を明示返却します。
+- **プロファイル登録と参照**: ターゲットプロファイルは`ctf-mcp-admin register-vdp-profile --profile-name ... --profile-revision ...`で`<vault_root>/_vdp/profiles.json`へ登録・更新します（ワイルドカード・CLIフラグ・裸ディレクトリは拒否）。実行中VDPランでは`run.describe`の`"vdp_profiles"`および`vdp.test(operation="describe_profile")`から、ホストパス（`host_dir`、`checkout_dir`）を除いた許可セレクタ・オーバーレイSHA-256・リソース上限を参照できます。
+- **実行と検証の順序**: `vdp.test(operation="run_smoke", ...)` → `vdp.test(operation="run_pytest", ...)` → `run.verify(verifier_id="vdp.product_test", evidence_ids=[...])`の順に実行します。`VdpProductTestVerifier`は`execution_provenance="harness_docker_isolated"`を要求して外部手元ログやローカルHTTP 200の流用を拒否し、`smoke_passed`、`hypothesis_falsified`、`deviation_reproduced`、`baseline_failed`、`not_executed`、`skipped`、`timeout`、`environment_failure`を厳密分離します（コンテナ内Djangoテストは合成データ・Celery eager設定のため`async_behavior_unverified: true`）。
+- **ツール公開面と静的文字列抽出の既定上限**: `StaticArtifactInspectorAdapter`は`analysis.query`のみで登録され、`artifact.inspect`向けの既定アダプタが未接続のため、`artifact.inspect`はMCP一覧へ公開されません。`analysis.query(operation="extract_strings")`で`max_matches`を省略した場合は安全上限（`--max-matches 40`＋`--soft-byte-budget`）を自動適用し、`output_limit_exceeded`ではなく`status="ok"`, `truncated=True`, `recommended_max_matches`, `next_offset`を返却します（大きな`max_matches`を明示指定した場合は従来通り`partial`／`output_limit_exceeded`となります）。
 
 ランタイムにはSQLite正本のrun状態、リクエスト冪等性、クラッシュ照合・fencing、セッションlease、限定搬入、ページ付き・秘匿化済み証拠、出力処理があります。これらの仕組みと受入の限界は[ハーネス設計](08-analysis-harness.ja.md)、[契約](11-contracts-and-acceptance.ja.md)、[日付付き記録](README.ja.md#受入記録)に記載しており、包括的な安全性認証ではありません。
 

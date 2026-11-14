@@ -28,10 +28,19 @@ from ctf_mcp.adapters import (
     ScopedHttpProbeAdapter,
     StaticArtifactInspectorAdapter,
     SyntheticAdapter,
+    VdpProductTestAdapter,
     create_interactive_session_descriptor,
     create_scoped_http_probe_descriptor,
     create_transform_helper_descriptor,
+    create_vdp_product_test_descriptor,
     is_os_process_alive,
+)
+from ctf_mcp.adapters.vdp_product_test import (
+    DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES,
+    DEFAULT_VDP_TEST_TIMEOUT_SECONDS,
+    VdpTargetProfile,
+    save_registered_vdp_profile,
+    validate_vdp_profile_registration,
 )
 from ctf_mcp.config import (
     HarnessConfig,
@@ -72,6 +81,7 @@ from ctf_mcp.contracts import (
     ScopePolicy,
     UsageMetrics,
     VerificationRecord,
+    canonical_digest,
     lifecycle_to_envelope_status,
 )
 from ctf_mcp.evidence import (
@@ -121,6 +131,7 @@ from ctf_mcp.verification import (
     CloseIntegrityReport,
     ExpectedChallengeSpec,
     LocalCtfVerifier,
+    VdpProductTestVerifier,
     VerifierRegistry,
     evaluate_close_integrity_in_tx,
     load_verifications_for_run,
@@ -140,6 +151,7 @@ ACTION_DISPATCH_TOOLS: tuple[str, ...] = (
     "helper.transform",
     "session.control",
     "net.probe",
+    "vdp.test",
 )
 ALWAYS_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
     {
@@ -263,6 +275,8 @@ def _infer_tool_group(descriptor: CapabilityDescriptor) -> str:
         return "session.control"
     if name == "net.probe" or name.startswith("net."):
         return "net.probe"
+    if name == "vdp.test" or name.startswith("vdp."):
+        return "vdp.test"
     if set(descriptor.execution_classes) != {ExecutionClass.STATIC}:
         if ExecutionClass.NETWORK in descriptor.execution_classes:
             return "net.probe"
@@ -1086,6 +1100,137 @@ class HarnessController:
             )
         return registered
 
+    def update_run_scope(
+        self,
+        *,
+        run_id: str,
+        scope_revision: str,
+        principal: PrincipalContext | None = None,
+        allowed_capabilities: Sequence[str] | None = None,
+        add_capabilities: Sequence[str] = (),
+        allowed_execution_classes: Sequence[ExecutionClass | str] | None = None,
+        authorization_reference: str | None = None,
+        expires_at: datetime | None = None,
+        network_enabled: bool | None = None,
+        allowed_targets: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Register and activate a new immutable scope revision on an open run while preserving ``runs.revision``."""
+        clean_rev = scope_revision.strip()
+        if not clean_rev:
+            raise ContractViolationError("scope_revision cannot be blank.")
+        ts = self._now()
+        with self.storage.transaction() as conn:
+            snapshot, eff_principal = self._get_snapshot_and_principal_in_tx(
+                conn, run_id=run_id, principal=principal
+            )
+            if snapshot.manifest.closed_at is not None:
+                raise ScopeDeniedError(f"Cannot update scope on closed run {run_id!r}.")
+            current_scope = self.scope_validator.get_active_scope_in_tx(
+                conn, run_id, now=ts
+            )
+
+            if allowed_capabilities is not None:
+                caps = tuple(dict.fromkeys(str(c).strip() for c in allowed_capabilities if str(c).strip()))
+            else:
+                caps = tuple(
+                    dict.fromkeys(
+                        [
+                            *current_scope.allowed_capabilities,
+                            *(str(c).strip() for c in add_capabilities if str(c).strip()),
+                        ]
+                    )
+                )
+
+            if allowed_execution_classes is not None:
+                exec_classes = tuple(
+                    c if isinstance(c, ExecutionClass) else ExecutionClass(str(c).strip())
+                    for c in allowed_execution_classes
+                )
+            else:
+                exec_classes = current_scope.allowed_execution_classes
+
+            eff_auth_ref = (
+                authorization_reference.strip()
+                if authorization_reference is not None and authorization_reference.strip()
+                else current_scope.authorization_reference
+            )
+            eff_expires = expires_at if expires_at is not None else current_scope.expires_at
+            eff_net = current_scope.network_enabled if network_enabled is None else bool(network_enabled)
+            eff_targets = (
+                tuple(str(t).strip() for t in allowed_targets if str(t).strip())
+                if allowed_targets is not None
+                else current_scope.allowed_targets
+            )
+            payload = {
+                "mode": current_scope.mode.value,
+                "task_id": current_scope.task_id,
+                "scope_revision": clean_rev,
+                "authorization_reference": eff_auth_ref,
+                "allowed_capabilities": list(caps),
+                "allowed_execution_classes": [c.value for c in exec_classes],
+                "expires_at": eff_expires.isoformat() if eff_expires is not None else None,
+                "network_enabled": eff_net,
+                "allowed_targets": list(eff_targets),
+                "external_submission": current_scope.external_submission,
+            }
+            new_scope = ScopePolicy(
+                scope_revision=clean_rev,
+                scope_sha256=canonical_digest(payload),
+                mode=current_scope.mode,
+                task_id=current_scope.task_id,
+                authorization_reference=eff_auth_ref,
+                allowed_execution_classes=exec_classes,
+                allowed_capabilities=caps,
+                expires_at=eff_expires,
+                network_enabled=eff_net,
+                allowed_targets=eff_targets,
+                external_submission=current_scope.external_submission,
+            )
+            registered = self.scope_validator.register_scope_in_tx(
+                conn, run_id, new_scope, activate=True
+            )
+            updated_manifest = snapshot.manifest.model_copy(
+                update={
+                    "scope_revision": registered.scope_revision,
+                    "scope_sha256": registered.scope_sha256,
+                    "scope_expires_at": registered.expires_at,
+                }
+            )
+            assert_no_secrets_in_manifest(updated_manifest)
+            conn.execute(
+                "UPDATE runs SET scope_revision = ?, manifest_json = ? WHERE run_id = ?",
+                (
+                    registered.scope_revision,
+                    updated_manifest.model_dump_json(),
+                    run_id,
+                ),
+            )
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=ts,
+                    run_id=run_id,
+                    principal_id=eff_principal,
+                    action_id=None,
+                    capability="scope.control",
+                    operation="update_scope",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=registered.scope_revision,
+                    destination_summary=f"caps={','.join(registered.allowed_capabilities)}",
+                ),
+            )
+        return {
+            "run_id": run_id,
+            "revision": snapshot.revision,
+            "mode": registered.mode.value,
+            "scope_revision": registered.scope_revision,
+            "scope_sha256": registered.scope_sha256,
+            "allowed_capabilities": list(registered.allowed_capabilities),
+            "allowed_execution_classes": [c.value for c in registered.allowed_execution_classes],
+        }
+
     def update_run_budget(
         self,
         *,
@@ -1100,6 +1245,7 @@ class HarnessController:
         remaining_bytes: int | None = None,
         interactive_session_limit: int | None = None,
         heavy_job_concurrency: int | None = None,
+        action_timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Update budget limits/remaining allowances on an open run without changing revision."""
         if remaining_calls is not None and add_calls is not None:
@@ -1113,6 +1259,7 @@ class HarnessController:
             ("max_evidence_bytes_per_run", max_evidence_bytes_per_run),
             ("interactive_session_limit", interactive_session_limit),
             ("heavy_job_concurrency", heavy_job_concurrency),
+            ("action_timeout_seconds", action_timeout_seconds),
         ):
             if val is not None and (isinstance(val, bool) or val <= 0):
                 raise ContractViolationError(f"{field_name} must be > 0 (got {val!r}).")
@@ -1196,6 +1343,11 @@ class HarnessController:
                 update={
                     "max_tool_calls": new_max_tool_calls,
                     "run_budget_seconds": new_run_budget_seconds,
+                    "action_timeout_seconds": (
+                        action_timeout_seconds
+                        if action_timeout_seconds is not None
+                        else old_budget.action_timeout_seconds
+                    ),
                     "max_evidence_bytes_per_run": new_max_evidence_bytes,
                     "interactive_session_limit": (
                         interactive_session_limit
@@ -1284,6 +1436,7 @@ class HarnessController:
             "remaining_bytes": new_remaining_bytes,
             "interactive_session_limit": new_budget.interactive_session_limit,
             "heavy_job_concurrency": new_budget.heavy_job_concurrency,
+            "action_timeout_seconds": new_budget.action_timeout_seconds,
         }
 
     def ingest_artifact(
@@ -1353,6 +1506,19 @@ class HarnessController:
             )
         return record
 
+    def register_vdp_profile(
+        self,
+        profile: VdpTargetProfile,
+    ) -> dict[str, Any]:
+        """Validate, persist, and activate a VDP target profile under ``vault_root``."""
+        validated = validate_vdp_profile_registration(profile)
+        save_registered_vdp_profile(self.vault_root, validated)
+        with self._lock:
+            vdp_spec = self._adapters.get("vdp.test")
+        if vdp_spec is not None and hasattr(vdp_spec.adapter, "register_profile"):
+            vdp_spec.adapter.register_profile(validated)
+        return validated.to_public_summary()
+
     def describe_run(
         self,
         *,
@@ -1382,7 +1548,7 @@ class HarnessController:
             self.get_visible_mcp_tool_names(principal=principal, run_id=run_id)
         )
 
-        return {
+        summary: dict[str, Any] = {
             "run_id": run_id,
             "task_id": snapshot.manifest.task_id,
             "mode": snapshot.manifest.mode.value,
@@ -1459,6 +1625,12 @@ class HarnessController:
             "visible_capabilities": [c.name for c in visible_caps],
             "visible_mcp_tools": visible_mcp_tools,
         }
+        if snapshot.manifest.mode == RunMode.VDP:
+            with self._lock:
+                vdp_spec = self._adapters.get("vdp.test")
+            if vdp_spec is not None and hasattr(vdp_spec.adapter, "list_public_profiles"):
+                summary["vdp_profiles"] = vdp_spec.adapter.list_public_profiles()
+        return summary
 
     # ------------------------------------------------------------------
     # Action execution pipeline (TX1 -> adapter capture -> TX2)
@@ -3349,8 +3521,10 @@ def _register_p4_adapters(
     interactive_session_enabled: bool = True,
     include_scoped_http_probe: bool = False,
     scoped_http_probe_enabled: bool = True,
+    include_vdp_product_test: bool = False,
+    vdp_product_test_enabled: bool = True,
 ) -> None:
-    """Register optional P4/CTF-09 adapters onto ``controller`` without enabling by default."""
+    """Register optional P4/CTF-09 and VDP adapters onto ``controller`` without enabling by default."""
     _ = require_running_state
     p4_limits = CapabilityLimits(
         timeout_seconds=effective_timeout,
@@ -3391,6 +3565,25 @@ def _register_p4_adapters(
             policy_provider=controller._load_live_scope_policy,
         )
         controller.register_adapter(probe, tool_group="net.probe")
+    if include_vdp_product_test:
+        vdp_limits = CapabilityLimits(
+            timeout_seconds=max(effective_timeout, DEFAULT_VDP_TEST_TIMEOUT_SECONDS),
+            max_output_bytes=max(max_output_bytes, DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES),
+            max_decode_bytes=max_decode_bytes,
+        )
+        vdp_adapter = VdpProductTestAdapter(
+            descriptor=create_vdp_product_test_descriptor(
+                enabled=vdp_product_test_enabled,
+                limits=vdp_limits,
+            ),
+            evidence_vault=controller.evidence_vault,
+            vault_root=controller.vault_root,
+        )
+        controller.register_adapter(
+            vdp_adapter,
+            tool_group="vdp.test",
+            is_heavy_job=True,
+        )
 
 
 def register_default_adapters(
@@ -3407,8 +3600,10 @@ def register_default_adapters(
     interactive_session_enabled: bool = True,
     include_scoped_http_probe: bool = False,
     scoped_http_probe_enabled: bool = True,
+    include_vdp_product_test: bool = False,
+    vdp_product_test_enabled: bool = True,
 ) -> StaticArtifactInspectorAdapter:
-    """Register the default P2 static artifact inspector (and optional P4/CTF-09 adapters)."""
+    """Register the default P2 static artifact inspector (and optional P4/CTF-09/VDP adapters)."""
     effective_timeout = timeout_seconds or (
         controller.config.execution.action_timeout_seconds
         if controller.config is not None
@@ -3436,6 +3631,8 @@ def register_default_adapters(
         interactive_session_enabled=interactive_session_enabled,
         include_scoped_http_probe=include_scoped_http_probe,
         scoped_http_probe_enabled=scoped_http_probe_enabled,
+        include_vdp_product_test=include_vdp_product_test,
+        vdp_product_test_enabled=vdp_product_test_enabled,
     )
     return inspector
 
@@ -3506,7 +3703,7 @@ def register_default_verifier(
     *,
     replace: bool = False,
 ) -> LocalCtfVerifier:
-    """Register the standard LocalCtfVerifier loaded with any private vault expectations."""
+    """Register LocalCtfVerifier (and VdpProductTestVerifier if absent) onto ``controller``."""
     expected_by_run, expected_by_task = load_verifier_expectations(controller.vault_root)
     verifier = LocalCtfVerifier(
         storage=controller.storage,
@@ -3515,6 +3712,14 @@ def register_default_verifier(
         expected_by_task=expected_by_task,
     )
     controller.register_verifier(verifier, replace=replace)
+    if not controller.verifier_registry.has("vdp.product_test") or replace:
+        controller.register_verifier(
+            VdpProductTestVerifier(
+                storage=controller.storage,
+                vault_root=controller.vault_root,
+            ),
+            replace=True,
+        )
     return verifier
 
 
@@ -3540,6 +3745,8 @@ def create_default_controller(
     interactive_session_enabled: bool = True,
     include_scoped_http_probe: bool | None = None,
     scoped_http_probe_enabled: bool = True,
+    include_vdp_product_test: bool | None = None,
+    vdp_product_test_enabled: bool = True,
     timeout_seconds: int | None = None,
     max_output_bytes: int = 65_536,
     max_decode_bytes: int = 65_536,
@@ -3574,12 +3781,21 @@ def create_default_controller(
         if include_scoped_http_probe is not None
         else bool(enabled_adapters & {"net.probe", "ctf-scoped-http-probe"})
     )
+    vdp_test_configured = bool(
+        enabled_adapters & {"vdp.test", "ctf-vdp-product-test"}
+    )
+    resolved_include_vdp_product_test = (
+        bool(include_vdp_product_test)
+        if include_vdp_product_test is not None
+        else vdp_test_configured
+    )
     resolved_allow_dynamic = (
         True
         if (
             allow_dynamic is None
             and (
                 session_configured
+                or vdp_test_configured
                 or (config is not None and config.execution.dynamic_execution)
             )
         )
@@ -3645,11 +3861,14 @@ def create_default_controller(
             interactive_session_enabled=interactive_session_enabled,
             include_scoped_http_probe=resolved_include_scoped_http_probe,
             scoped_http_probe_enabled=scoped_http_probe_enabled,
+            include_vdp_product_test=resolved_include_vdp_product_test,
+            vdp_product_test_enabled=vdp_product_test_enabled,
         )
     elif (
         resolved_include_transform_helper
         or resolved_include_interactive_session
         or resolved_include_scoped_http_probe
+        or resolved_include_vdp_product_test
     ):
         effective_timeout = timeout_seconds or (
             controller.config.execution.action_timeout_seconds
@@ -3668,8 +3887,17 @@ def create_default_controller(
             interactive_session_enabled=interactive_session_enabled,
             include_scoped_http_probe=resolved_include_scoped_http_probe,
             scoped_http_probe_enabled=scoped_http_probe_enabled,
+            include_vdp_product_test=resolved_include_vdp_product_test,
+            vdp_product_test_enabled=vdp_product_test_enabled,
         )
 
+    controller.register_verifier(
+        VdpProductTestVerifier(
+            storage=controller.storage,
+            vault_root=controller.vault_root,
+        ),
+        replace=True,
+    )
     if enable_local_verifier:
         register_default_verifier(controller)
 

@@ -1441,3 +1441,123 @@ def test_p2_elf32_utf8_text_and_build_server_from_env(tmp_path: Path) -> None:
             assert parsed_txt["sampled_lines"] == 3
 
     asyncio.run(_run())
+
+
+def test_p8_extract_strings_default_safe_sizing_without_output_overflow(tmp_path: Path) -> None:
+    """Omitting max_matches must bound output safely instead of tripping output_limit_exceeded."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    big_lines = [
+        f"OVERFLOW_DEFAULT_TEST_LINE_{idx:05d}_{SYNTHETIC_FLAG_MARKER if idx == 0 else 'PAD_0123456789'}\n\x00"
+        for idx in range(2600)
+    ]
+    (workspace / "overflow_default.bin").write_bytes("".join(big_lines).encode("latin1"))
+
+    # Long tokens to also exercise soft_byte_budget before hard subprocess cap.
+    wide_lines = [
+        f"LONG_TOKEN_{idx:03d}_" + ("A" * 1800) + "\n\x00"
+        for idx in range(25)
+    ]
+    (workspace / "long_tokens.bin").write_bytes("".join(wide_lines).encode("latin1"))
+
+    storage = Storage(tmp_path / "state" / "harness.db")
+    controller = create_default_controller(
+        storage=storage,
+        vault_root=tmp_path / "vault",
+        allow_ephemeral_cursor_key=True,
+    )
+    alice = controller.authenticator.authenticate_stdio(principal_id="alice")
+    manifest = controller.create_run(
+        principal=alice,
+        task_id="task-p8-strings",
+        mode=RunMode.OFFLINE_CTF,
+        scope=_make_scope(task_id="task-p8-strings"),
+        budget=_make_budget(),
+    )
+    ing_big = controller.ingest_artifact(
+        principal=alice,
+        run_id=manifest.run_id,
+        source_root=workspace,
+        rel_path="overflow_default.bin",
+    )
+    ing_long = controller.ingest_artifact(
+        principal=alice,
+        run_id=manifest.run_id,
+        source_root=workspace,
+        rel_path="long_tokens.bin",
+    )
+
+    env_default = controller.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id=manifest.run_id,
+            request_id="req-default-strings",
+            expected_revision=3,
+            capability_name="analysis.query",
+            operation="extract_strings",
+            arguments={
+                "artifact_id": ing_big.artifact_id,
+                "encoding": "ascii",
+                "min_length": 6,
+            },
+        ),
+    )
+    assert env_default.status == EnvelopeStatus.OK
+    assert env_default.error is None
+    assert env_default.truncated is True
+    assert "matches_truncated=True" in env_default.summary
+    assert "recommended_max_matches=40" in env_default.summary
+    assert "next_offset=0x" in env_default.summary
+    assert SYNTHETIC_FLAG_MARKER not in env_default.summary
+    page_default = controller.read_evidence(
+        principal=alice,
+        run_id=manifest.run_id,
+        evidence_id=env_default.evidence[0].id,
+        max_chars=12_000,
+    )
+    assert "# total_matches=40 matches_truncated=true reason=max_matches recommended_max_matches=40 next_offset=0x" in page_default.content
+
+    # Exercise soft_byte_budget stopping cleanly on small max_output_bytes=4096 adapter
+    tiny_adapter = StaticArtifactInspectorAdapter(
+        max_output_bytes=4096,
+        require_running_state=False,
+    )
+    long_action = _make_direct_action(
+        tiny_adapter,
+        run_id=manifest.run_id,
+        action_id="act-long-soft",
+        operation="extract_strings",
+        arguments={"artifact_id": ing_long.artifact_id, "encoding": "ascii", "min_length": 6},
+    )
+    long_outcome = tiny_adapter.execute_with_capture(
+        long_action,
+        artifact_paths={ing_long.artifact_id: workspace / "long_tokens.bin"},
+    )
+    assert long_outcome.envelope.status == EnvelopeStatus.OK
+    assert long_outcome.envelope.truncated is True
+    assert "reason=soft_byte_budget" in long_outcome.envelope.summary
+    assert b"matches_truncated=true reason=soft_byte_budget recommended_max_matches=" in long_outcome.captured_bytes
+
+    # Explicit large max_matches overflow must include recommended_max_matches while never leaking markers.
+    over_action = _make_direct_action(
+        tiny_adapter,
+        run_id=manifest.run_id,
+        action_id="act-explicit-overflow",
+        operation="extract_strings",
+        arguments={
+            "artifact_id": ing_big.artifact_id,
+            "encoding": "ascii",
+            "min_length": 6,
+            "max_matches": 5000,
+        },
+    )
+    over_outcome = tiny_adapter.execute_with_capture(
+        over_action,
+        artifact_paths={ing_big.artifact_id: workspace / "overflow_default.bin"},
+    )
+    assert over_outcome.envelope.status == EnvelopeStatus.PARTIAL
+    assert over_outcome.envelope.error is not None
+    assert over_outcome.envelope.error.code == "output_limit_exceeded"
+    assert "recommended_max_matches=" in over_outcome.envelope.error.message
+    assert SYNTHETIC_FLAG_MARKER not in over_outcome.envelope.summary
+    assert SYNTHETIC_FLAG_MARKER not in over_outcome.envelope.error.message

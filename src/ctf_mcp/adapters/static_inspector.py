@@ -93,6 +93,11 @@ _FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x
 _MAX_CHUNK_BYTES = 65_536
 _MAX_STRING_TOKEN_LEN = 2_048
 _ASCII_RE = re.compile(rb"[\x20-\x7e]+")
+_EXTRACT_FOOTER_TRUNCATED_RE = re.compile(
+    r"^# total_matches=(\d+) matches_truncated=true reason=([a-z_]+) "
+    r"recommended_max_matches=(\d+) next_offset=(0x[0-9a-f]+)$",
+    re.MULTILINE,
+)
 _PEM_RE = re.compile(rb"-----BEGIN [A-Z0-9 ]+-----")
 _BASE64_BLOCK_RE = re.compile(rb"(?:[A-Za-z0-9+/]{32,}={0,2})")
 
@@ -571,12 +576,13 @@ def _op_extract_strings(
     encoding: str,
     min_length: int,
     max_matches: int,
+    soft_byte_budget: int = 0,
 ) -> int:
     """Stream ASCII and/or UTF-16LE printable strings directly to stdout."""
     if size_bytes == 0:
         sys.stdout.write(
             f"# strings offset=0x{offset:08x} encoding={encoding} min_length={min_length} "
-            f"max_matches={max_matches}\n# total_matches=0\n"
+            f"max_matches={max_matches}\n# total_matches=0 matches_truncated=false\n"
         )
         sys.stdout.flush()
         return 0
@@ -585,13 +591,22 @@ def _op_extract_strings(
             f"Requested offset={offset} is >= file_size={size_bytes}."
         )
 
-    sys.stdout.write(
+    header = (
         f"# strings offset=0x{offset:08x} encoding={encoding} min_length={min_length} "
         f"max_matches={max_matches}\n"
     )
+    sys.stdout.write(header)
     sys.stdout.flush()
 
+    bytes_emitted = len(header.encode("utf-8"))
+    footer_reserve = 128 if soft_byte_budget > 256 else 0
+    effective_budget = max(0, soft_byte_budget - footer_reserve) if soft_byte_budget > 0 else 0
+
     emitted = 0
+    stopped = False
+    truncated_reason: str | None = None
+    next_offset: int | None = None
+
     stream.seek(offset)
     pos = offset
     ascii_carry = b""
@@ -600,15 +615,32 @@ def _op_extract_strings(
     utf16_carry = b""
     utf16_carry_offset = pos
 
-    def _emit_line(line: str) -> None:
+    def _try_emit(line: str, match_offset: int) -> bool:
+        nonlocal emitted, bytes_emitted, stopped, truncated_reason, next_offset
+        if stopped:
+            return False
+        if emitted >= max_matches:
+            stopped = True
+            truncated_reason = "max_matches"
+            next_offset = match_offset
+            return False
+        line_bytes = len(line.encode("utf-8"))
+        if effective_budget > 0 and bytes_emitted + line_bytes > effective_budget:
+            stopped = True
+            truncated_reason = "soft_byte_budget"
+            next_offset = match_offset
+            return False
         sys.stdout.write(line)
+        bytes_emitted += line_bytes
+        emitted += 1
+        return True
 
-    while emitted < max_matches:
+    while not stopped:
         chunk = stream.read(_MAX_CHUNK_BYTES)
         if not chunk:
             break
 
-        if encoding in ("ascii", "both") and emitted < max_matches:
+        if encoding in ("ascii", "both") and not stopped:
             work = ascii_carry + chunk
             work_base = ascii_carry_offset if ascii_carry else pos
             # Determine if work ends inside a printable ASCII run so we carry it across chunk boundary.
@@ -627,17 +659,18 @@ def _op_extract_strings(
                 raw_tok = match.group(0)
                 if len(raw_tok) >= min_length:
                     for sub_off in range(0, len(raw_tok), _MAX_STRING_TOKEN_LEN):
-                        if emitted >= max_matches:
-                            break
                         piece = raw_tok[sub_off : sub_off + _MAX_STRING_TOKEN_LEN]
                         if len(piece) >= min_length:
                             abs_off = work_base + match.start() + sub_off
-                            _emit_line(
-                                f"0x{abs_off:08x} [ascii] {piece.decode('ascii')}\n"
-                            )
-                            emitted += 1
+                            if not _try_emit(
+                                f"0x{abs_off:08x} [ascii] {piece.decode('ascii')}\n",
+                                abs_off,
+                            ):
+                                break
+                    if stopped:
+                        break
 
-        if encoding in ("utf-16le", "both") and emitted < max_matches:
+        if encoding in ("utf-16le", "both") and not stopped:
             work16 = utf16_carry + chunk
             work16_base = utf16_carry_offset if utf16_carry else pos
             # Keep trailing printable UTF-16LE tail (including lone half-pair) across chunks.
@@ -663,45 +696,59 @@ def _op_extract_strings(
                 utf16_carry_offset = work16_base + len(work16)
 
             utf16_carry = carry16
-            emitted, lines16 = _extract_utf16le_from_buffer(
+            _, lines16 = _extract_utf16le_from_buffer(
                 process16,
                 base_offset=work16_base,
                 min_length=min_length,
-                max_matches=max_matches,
+                max_matches=max_matches + 1,
                 already_emitted=emitted,
             )
-            for line in lines16:
-                _emit_line(line)
+            for line16 in lines16:
+                abs16 = int(line16.split(" ", 1)[0], 16)
+                if not _try_emit(line16, abs16):
+                    break
 
         sys.stdout.flush()
         pos += len(chunk)
 
     # Flush trailing buffers at EOF.
-    if encoding in ("ascii", "both") and ascii_carry and emitted < max_matches:
+    if encoding in ("ascii", "both") and ascii_carry and not stopped:
         for match in _ASCII_RE.finditer(ascii_carry):
             raw_tok = match.group(0)
             if len(raw_tok) >= min_length:
                 for sub_off in range(0, len(raw_tok), _MAX_STRING_TOKEN_LEN):
-                    if emitted >= max_matches:
-                        break
                     piece = raw_tok[sub_off : sub_off + _MAX_STRING_TOKEN_LEN]
                     if len(piece) >= min_length:
                         abs_off = ascii_carry_offset + match.start() + sub_off
-                        _emit_line(f"0x{abs_off:08x} [ascii] {piece.decode('ascii')}\n")
-                        emitted += 1
+                        if not _try_emit(
+                            f"0x{abs_off:08x} [ascii] {piece.decode('ascii')}\n",
+                            abs_off,
+                        ):
+                            break
+                if stopped:
+                    break
 
-    if encoding in ("utf-16le", "both") and len(utf16_carry) >= 2 and emitted < max_matches:
-        emitted, lines16 = _extract_utf16le_from_buffer(
+    if encoding in ("utf-16le", "both") and len(utf16_carry) >= 2 and not stopped:
+        _, lines16 = _extract_utf16le_from_buffer(
             utf16_carry[: len(utf16_carry) - (len(utf16_carry) % 2)],
             base_offset=utf16_carry_offset,
             min_length=min_length,
-            max_matches=max_matches,
+            max_matches=max_matches + 1,
             already_emitted=emitted,
         )
-        for line in lines16:
-            _emit_line(line)
+        for line16 in lines16:
+            abs16 = int(line16.split(" ", 1)[0], 16)
+            if not _try_emit(line16, abs16):
+                break
 
-    sys.stdout.write(f"# total_matches={emitted}\n")
+    if stopped and next_offset is not None and truncated_reason is not None:
+        rec_max = max(1, emitted)
+        sys.stdout.write(
+            f"# total_matches={emitted} matches_truncated=true reason={truncated_reason} "
+            f"recommended_max_matches={rec_max} next_offset=0x{next_offset:08x}\n"
+        )
+    else:
+        sys.stdout.write(f"# total_matches={emitted} matches_truncated=false\n")
     sys.stdout.flush()
     return emitted
 
@@ -867,7 +914,8 @@ def _worker_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--length", type=int, default=256)
     parser.add_argument("--encoding", default="both")
     parser.add_argument("--min-length", type=int, default=4)
-    parser.add_argument("--max-matches", type=int, default=2000)
+    parser.add_argument("--max-matches", type=int, default=40)
+    parser.add_argument("--soft-byte-budget", type=int, default=0)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-decode-bytes", type=int, default=65_536)
     parser.add_argument("--max-archive-entries", type=int, default=256)
@@ -913,6 +961,8 @@ def _worker_main(argv: list[str] | None = None) -> int:
                     raise _WorkerError("min_length must be between 3 and 64.")
                 if not (1 <= args.max_matches <= 10_000):
                     raise _WorkerError("max_matches must be between 1 and 10000.")
+                if args.soft_byte_budget < 0:
+                    raise _WorkerError("soft_byte_budget must be >= 0.")
                 _op_extract_strings(
                     stream,
                     size_bytes,
@@ -920,6 +970,7 @@ def _worker_main(argv: list[str] | None = None) -> int:
                     encoding=args.encoding,
                     min_length=args.min_length,
                     max_matches=args.max_matches,
+                    soft_byte_budget=args.soft_byte_budget,
                 )
             elif op == "hex_slice":
                 max_slice = min(65_536, args.max_decode_bytes)
@@ -958,15 +1009,18 @@ if __name__ != "__main__":
     from collections.abc import Mapping
 
     from ctf_mcp.adapters.base import BaseAdapter, build_signed_descriptor
-    from ctf_mcp.adapters.runner import SubprocessResult, SubprocessRunner
+    from ctf_mcp.adapters.runner import SubprocessOutcome, SubprocessResult, SubprocessRunner
     from ctf_mcp.contracts import (
         ActionRecord,
         CapabilityDeniedError,
         CapabilityDescriptor,
         CapabilityLimits,
         ContractViolationError,
+        ErrorDetail,
+        EvidenceRef,
         EvidenceVaultPort,
         ExecutionClass,
+        ResultEnvelope,
         RunMode,
     )
 
@@ -1133,6 +1187,12 @@ if __name__ != "__main__":
                     argv.extend(["--min-length", str(int(args["min_length"]))])
                 if "max_matches" in args:
                     argv.extend(["--max-matches", str(int(args["max_matches"]))])
+                else:
+                    _, eff_max_bytes = self.compute_effective_limits(action)
+                    soft_budget = max(512, eff_max_bytes - 512)
+                    argv.extend(
+                        ["--max-matches", "40", "--soft-byte-budget", str(soft_budget)]
+                    )
             elif op == "hex_slice":
                 if "offset" in args:
                     argv.extend(["--offset", str(int(args["offset"]))])
@@ -1160,6 +1220,57 @@ if __name__ != "__main__":
                 f"(outcome={sub_res.outcome.value}, output_bytes={sub_res.output_bytes}, "
                 f"capture_complete={sub_res.capture_complete}, cleanup_confirmed={sub_res.cleanup_confirmed})."
             )
+
+        def _build_envelope(
+            self,
+            action: ActionRecord,
+            sub_res: SubprocessResult,
+            *,
+            evidence_refs: tuple[EvidenceRef, ...] = (),
+        ) -> ResultEnvelope:
+            envelope = super()._build_envelope(action, sub_res, evidence_refs=evidence_refs)
+            if action.operation != "extract_strings":
+                return envelope
+            if sub_res.outcome == SubprocessOutcome.OUTPUT_LIMIT_EXCEEDED:
+                match_lines = sum(
+                    1 for ln in sub_res.stdout.splitlines() if ln.startswith(b"0x")
+                )
+                safe_rec = max(1, match_lines - 1) if match_lines >= 2 else 1
+                hint = (
+                    f" (matches_before_limit={match_lines}, recommended_max_matches={safe_rec})."
+                )
+                new_err = (
+                    envelope.error.model_copy(
+                        update={"message": f"{envelope.error.message}{hint}"}
+                    )
+                    if envelope.error is not None
+                    else None
+                )
+                return envelope.model_copy(
+                    update={
+                        "summary": f"{envelope.summary}{hint}",
+                        "error": new_err,
+                        "truncated": True,
+                    }
+                )
+            if sub_res.outcome == SubprocessOutcome.COMPLETED and sub_res.stdout:
+                tail_text = sub_res.stdout[-512:].decode("utf-8", errors="replace")
+                matched = _EXTRACT_FOOTER_TRUNCATED_RE.search(tail_text)
+                if matched:
+                    reason = matched.group(2)
+                    rec_max = matched.group(3)
+                    next_off = matched.group(4)
+                    note = (
+                        f" (matches_truncated=True, reason={reason}, "
+                        f"recommended_max_matches={rec_max}, next_offset={next_off})."
+                    )
+                    return envelope.model_copy(
+                        update={
+                            "summary": f"{envelope.summary}{note}",
+                            "truncated": True,
+                        }
+                    )
+            return envelope
 
 
 if __name__ == "__main__":

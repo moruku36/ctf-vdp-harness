@@ -31,6 +31,8 @@ These are historical reports for their recorded commits and environments, not ch
 - [P4 Interactive adapter and local network fixtures](../records/p4-interactive-adapter-acceptance.md)
 - [P5 Offline synthetic evaluation](../records/p5-offline-evaluation-acceptance.md)
 - [P0/P6 WSL2 environment and Codex connection](../records/p0-p6-wsl2-codex-environment-acceptance.md)
+- [P7 VDP Weblate product-test adapter](../records/p7-vdp-weblate-product-test-acceptance.md)
+- [P8 VDP daily-workflow and W-02 live acceptance](../records/p8-vdp-daily-workflow-acceptance-2026-11-14.md)
 
 The P5 evaluation compares A (no MCP), B (one stateless inspection), C (stateful harness) and D (C with frozen development guidance), using 10 development and 20 disjoint synthetic holdout tasks. It separates first-attempt `pass@1` from `best_of_k`, keeps VDP vulnerable/fixed pairs outside CTF denominators, and reports regressions and unmeasured API costs. It does not establish real-model or live-target performance gains.
 

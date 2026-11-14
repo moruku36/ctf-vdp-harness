@@ -31,6 +31,13 @@ from ctf_mcp.adapters.scoped_http_probe import (
     ScopedHttpProbeAdapter,
     create_scoped_http_probe_descriptor,
 )
+from ctf_mcp.adapters.vdp_product_test import (
+    VdpOverlaySpec,
+    VdpProductTestAdapter,
+    VdpTargetProfile,
+    build_default_weblate_profile,
+    create_vdp_product_test_descriptor,
+)
 from ctf_mcp.adapters.transform_helper import (
     DeterministicTransformAdapter,
     create_transform_helper_descriptor,
@@ -79,9 +86,14 @@ __all__ = [
     "InteractiveDebugSessionAdapter",
     "ScopedHttpProbeAdapter",
     "StaticArtifactInspectorAdapter",
+    "VdpOverlaySpec",
+    "VdpProductTestAdapter",
+    "VdpTargetProfile",
+    "build_default_weblate_profile",
     "create_interactive_session_descriptor",
     "create_scoped_http_probe_descriptor",
     "create_transform_helper_descriptor",
+    "create_vdp_product_test_descriptor",
     "SubprocessOutcome",
     "SubprocessResult",
     "SubprocessRunner",

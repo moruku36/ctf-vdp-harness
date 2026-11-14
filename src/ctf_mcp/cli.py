@@ -12,8 +12,11 @@ Provides two Fail-Closed console commands with zero shell invocation:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -25,11 +28,13 @@ from ctf_mcp.adapters.vdp_product_test import (
     DEFAULT_VDP_TEST_MAX_MEMORY_MB,
     DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES,
     DEFAULT_VDP_TEST_TIMEOUT_SECONDS,
+    VALID_SELECTOR_ROLES,
     WEBLATE_2026_11_2_PROFILE_NAME,
     VdpOverlaySpec,
     VdpTargetProfile,
     build_default_weblate_profile,
     load_registered_vdp_profiles,
+    run_vdp_environment_check,
     save_registered_vdp_profile,
     validate_vdp_profile_registration,
 )
@@ -618,6 +623,148 @@ def _handle_update_scope(args: argparse.Namespace, env: Mapping[str, str] | None
     return 0
 
 
+_REV_SUFFIX_RE = re.compile(r"^(?P<prefix>.*?)(?:^|-)r(?P<num>\d+)$")
+
+
+def _next_profile_revision(base_revision: str | None) -> str:
+    if not base_revision:
+        return "r1"
+    match = _REV_SUFFIX_RE.match(base_revision.strip())
+    if match:
+        prefix = match.group("prefix")
+        next_num = int(match.group("num")) + 1
+        return f"{prefix}-r{next_num}" if prefix else f"r{next_num}"
+    return f"{base_revision.strip()}-r2"
+
+
+def _hash_overlay_file_on_disk(host_dir: Path, filename: str) -> str:
+    """Hash a regular non-symlink overlay file inside ``host_dir``."""
+    try:
+        dir_st = os.lstat(host_dir)
+    except FileNotFoundError as exc:
+        raise ContractViolationError(f"Overlay host directory {host_dir!s} does not exist.") from exc
+    if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+        raise ContractViolationError(f"Overlay host directory {host_dir!s} must be a non-symlink directory.")
+    target = host_dir / filename
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError as exc:
+        raise ContractViolationError(f"Overlay file {filename!r} not found in {host_dir!s}.") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ContractViolationError(f"Overlay file {filename!r} must be a regular non-symlink file.")
+    digest = hashlib.sha256()
+    with open(target, "rb") as handle:
+        while chunk := handle.read(65_536):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compute_vdp_profile_diff(
+    base: VdpTargetProfile | None,
+    candidate: VdpTargetProfile,
+) -> dict[str, Any]:
+    """Compute a concise operator review diff between ``base`` and ``candidate`` profiles."""
+    if base is None:
+        roles = candidate.resolve_selector_roles()
+        return {
+            "is_new_profile": True,
+            "base_revision": None,
+            "new_revision": candidate.profile_revision,
+            "added_selectors": [
+                {"selector": sel, "role": roles.get(sel, "unassigned")}
+                for sel in candidate.allowed_test_selectors
+            ],
+            "removed_selectors": [],
+            "role_changes": [],
+            "added_overlays": {
+                k: {"container_target": v.container_target, "allowed_files": dict(v.allowed_files)}
+                for k, v in sorted(candidate.allowed_overlays.items())
+            },
+            "updated_overlays": {},
+            "pinned_changes": {},
+        }
+
+    base_set = set(base.allowed_test_selectors)
+    cand_set = set(candidate.allowed_test_selectors)
+    base_roles = base.resolve_selector_roles()
+    cand_roles = candidate.resolve_selector_roles()
+
+    added_selectors = [
+        {"selector": s, "role": cand_roles.get(s, "unassigned")}
+        for s in candidate.allowed_test_selectors
+        if s not in base_set
+    ]
+    removed_selectors = [
+        {"selector": s, "role": base_roles.get(s, "unassigned")}
+        for s in base.allowed_test_selectors
+        if s not in cand_set
+    ]
+    role_changes = [
+        {"selector": s, "from": base_roles.get(s, "unassigned"), "to": cand_roles.get(s, "unassigned")}
+        for s in candidate.allowed_test_selectors
+        if s in base_set and base_roles.get(s, "unassigned") != cand_roles.get(s, "unassigned")
+    ]
+
+    added_overlays: dict[str, Any] = {}
+    updated_overlays: dict[str, Any] = {}
+    for bname, spec in sorted(candidate.allowed_overlays.items()):
+        old = base.allowed_overlays.get(bname)
+        if old is None:
+            added_overlays[bname] = {
+                "container_target": spec.container_target,
+                "allowed_files": dict(spec.allowed_files),
+            }
+        elif old.allowed_files != spec.allowed_files or old.host_dir != spec.host_dir:
+            updated_overlays[bname] = {
+                "before_files": dict(old.allowed_files),
+                "after_files": dict(spec.allowed_files),
+            }
+
+    pinned_changes: dict[str, Any] = {}
+    for field_name in (
+        "image_ref",
+        "expected_image_digest",
+        "expected_source_commit",
+        "max_cpus",
+        "max_memory_mb",
+        "max_timeout_seconds",
+        "max_output_bytes",
+    ):
+        before_val = getattr(base, field_name)
+        after_val = getattr(candidate, field_name)
+        if before_val != after_val:
+            pinned_changes[field_name] = {"before": before_val, "after": after_val}
+    before_exp = base.expires_at.isoformat() if base.expires_at else None
+    after_exp = candidate.expires_at.isoformat() if candidate.expires_at else None
+    if before_exp != after_exp:
+        pinned_changes["expires_at"] = {"before": before_exp, "after": after_exp}
+
+    return {
+        "is_new_profile": False,
+        "base_revision": base.profile_revision,
+        "new_revision": candidate.profile_revision,
+        "added_selectors": added_selectors,
+        "removed_selectors": removed_selectors,
+        "role_changes": role_changes,
+        "added_overlays": added_overlays,
+        "updated_overlays": updated_overlays,
+        "pinned_changes": pinned_changes,
+    }
+
+
+def _has_nonempty_profile_diff(diff: Mapping[str, Any]) -> bool:
+    if diff.get("is_new_profile"):
+        return True
+    return bool(
+        diff.get("added_selectors")
+        or diff.get("removed_selectors")
+        or diff.get("role_changes")
+        or diff.get("added_overlays")
+        or diff.get("updated_overlays")
+        or diff.get("pinned_changes")
+    )
+
+
 def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
     eff_env = _merge_runtime_env(
         env=env,
@@ -650,9 +797,6 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
     if not source_commit:
         raise ContractViolationError("--source-commit is required when registering a new VDP profile.")
 
-    profile_revision = args.profile_revision or (
-        base.profile_revision if base is not None else "r1"
-    )
     checkout_dir = (
         args.checkout_dir
         if args.checkout_dir is not None
@@ -661,21 +805,91 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
 
     extra_allowed = _parse_csv_values(args.allow_selector, default=())
     extra_pos = _parse_csv_values(args.positive_selector, default=())
-    extra_neg = _parse_csv_values(args.negative_selector, default=())
+    extra_neg = _parse_csv_values(
+        [*(args.negative_selector or ()), *(getattr(args, "defense_selector", None) or ())],
+        default=(),
+    )
+    extra_anom = _parse_csv_values(getattr(args, "anomaly_repro_selector", None), default=())
+    extra_env_sels = _parse_csv_values(getattr(args, "env_check_selector", None), default=())
+
+    explicit_role_assignments: dict[str, str] = {}
+    for item in getattr(args, "selector_role", None) or ():
+        sel_raw, sep, role_raw = str(item).partition("=")
+        sel_s = sel_raw.strip()
+        role_s = role_raw.strip()
+        if not sep or not sel_s or role_s not in VALID_SELECTOR_ROLES:
+            raise ContractViolationError(
+                f"--selector-role must be SELECTOR=ROLE with ROLE in {VALID_SELECTOR_ROLES}, got {item!r}."
+            )
+        explicit_role_assignments[sel_s] = role_s
+
+    role_override_selectors = (
+        set(extra_pos)
+        | set(extra_neg)
+        | set(extra_anom)
+        | set(extra_env_sels)
+        | set(explicit_role_assignments.keys())
+    )
 
     allowed_selectors = tuple(
-        dict.fromkeys([*(base.allowed_test_selectors if base is not None else ()), *extra_allowed])
+        dict.fromkeys(
+            [
+                *(base.allowed_test_selectors if base is not None else ()),
+                *extra_allowed,
+                *extra_pos,
+                *extra_neg,
+                *extra_anom,
+                *extra_env_sels,
+                *explicit_role_assignments.keys(),
+            ]
+        )
     )
     if not allowed_selectors:
-        raise ContractViolationError("At least one --allow-selector is required.")
+        raise ContractViolationError("At least one selector (--allow-selector or role selector) is required.")
+
     positive_selectors = tuple(
-        dict.fromkeys([*(base.positive_selectors if base is not None else ()), *extra_pos])
+        dict.fromkeys(
+            [
+                *(s for s in (base.positive_selectors if base is not None else ()) if s not in role_override_selectors),
+                *extra_pos,
+                *(s for s, r in explicit_role_assignments.items() if r == "positive_control"),
+            ]
+        )
     )
     negative_selectors = tuple(
-        dict.fromkeys([*(base.negative_selectors if base is not None else ()), *extra_neg])
+        dict.fromkeys(
+            [
+                *(s for s in (base.negative_selectors if base is not None else ()) if s not in role_override_selectors),
+                *extra_neg,
+                *(s for s, r in explicit_role_assignments.items() if r == "defense_check"),
+            ]
+        )
     )
+    anomaly_repro_selectors = tuple(
+        dict.fromkeys(
+            [
+                *(s for s in (base.anomaly_repro_selectors if base is not None else ()) if s not in role_override_selectors),
+                *extra_anom,
+                *(s for s, r in explicit_role_assignments.items() if r == "anomaly_repro"),
+            ]
+        )
+    )
+    env_check_selectors = tuple(
+        dict.fromkeys(
+            [
+                *(s for s in (base.env_check_selectors if base is not None else ()) if s not in role_override_selectors),
+                *extra_env_sels,
+                *(s for s, r in explicit_role_assignments.items() if r == "env_check"),
+            ]
+        )
+    )
+    selector_roles = dict(base.selector_roles) if base is not None else {}
+    for s in role_override_selectors:
+        selector_roles.pop(s, None)
+    selector_roles.update(explicit_role_assignments)
 
     overlays = dict(base.allowed_overlays) if base is not None else {}
+    overlay_verified_on_disk: dict[str, bool] = {}
     if args.overlay_bundle:
         existing_ov = overlays.get(args.overlay_bundle)
         host_dir = (
@@ -688,26 +902,58 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
                 "--overlay-host-dir is required when specifying a new --overlay-bundle."
             )
         allowed_files = dict(existing_ov.allowed_files) if existing_ov is not None else {}
-        for raw_pin in args.overlay_file_sha256 or ():
-            fname, sep, digest = str(raw_pin).partition("=")
-            if not sep or not fname.strip() or not digest.strip():
+
+        def _pin_overlay_entry(raw_entry: str, *, default_auto: bool) -> None:
+            fname, sep, digest = str(raw_entry).partition("=")
+            fname_clean = fname.strip()
+            digest_clean = digest.strip().lower() if sep else ("auto" if default_auto else "")
+            if not fname_clean or not digest_clean:
                 raise ContractViolationError(
-                    f"--overlay-file-sha256 must have format NAME=SHA256, got {raw_pin!r}."
+                    f"Invalid overlay pin {raw_entry!r}; expected NAME=SHA256 or NAME=auto."
                 )
-            allowed_files[fname.strip()] = digest.strip().lower()
+            if digest_clean == "auto":
+                digest_clean = _hash_overlay_file_on_disk(host_dir, fname_clean)
+                overlay_verified_on_disk[args.overlay_bundle] = True
+            elif (host_dir / fname_clean).exists():
+                actual_sha = _hash_overlay_file_on_disk(host_dir, fname_clean)
+                if actual_sha != digest_clean:
+                    raise ContractViolationError(
+                        f"On-disk SHA-256 mismatch for overlay file {fname_clean!r}: "
+                        f"disk={actual_sha}, provided={digest_clean}."
+                    )
+                overlay_verified_on_disk[args.overlay_bundle] = True
+            allowed_files[fname_clean] = digest_clean
+
+        for fname_raw in getattr(args, "overlay_file", None) or ():
+            _pin_overlay_entry(fname_raw, default_auto=True)
+
+        for raw_pin in args.overlay_file_sha256 or ():
+            _pin_overlay_entry(raw_pin, default_auto=False)
+
         if not allowed_files:
             raise ContractViolationError(
-                "--overlay-file-sha256 NAME=SHA256 is required for --overlay-bundle."
+                "--overlay-file or --overlay-file-sha256 NAME=SHA256 is required for --overlay-bundle."
             )
+        # If host_dir exists on disk, verify every pinned file in this bundle is clean.
+        if host_dir.exists() and not overlay_verified_on_disk.get(args.overlay_bundle):
+            for fname_clean, exp_sha in allowed_files.items():
+                actual_sha = _hash_overlay_file_on_disk(host_dir, fname_clean)
+                if actual_sha != exp_sha:
+                    raise ContractViolationError(
+                        f"On-disk SHA-256 mismatch for overlay file {fname_clean!r}: "
+                        f"disk={actual_sha}, expected={exp_sha}."
+                    )
+            overlay_verified_on_disk[args.overlay_bundle] = True
+
         overlays[args.overlay_bundle] = VdpOverlaySpec(
             bundle_name=args.overlay_bundle,
             host_dir=host_dir,
             container_target="/src/vdp-test-overlay",
             allowed_files=allowed_files,
         )
-    elif args.overlay_host_dir is not None or args.overlay_file_sha256:
+    elif args.overlay_host_dir is not None or args.overlay_file_sha256 or getattr(args, "overlay_file", None):
         raise ContractViolationError(
-            "--overlay-bundle is required when specifying --overlay-host-dir or --overlay-file-sha256."
+            "--overlay-bundle is required when specifying --overlay-host-dir, --overlay-file, or --overlay-file-sha256."
         )
 
     expires_at = (
@@ -715,9 +961,12 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
         if args.expires_at
         else (base.expires_at if base is not None else None)
     )
-    profile = VdpTargetProfile(
+    provisional_revision = args.profile_revision or (
+        base.profile_revision if base is not None else "r1"
+    )
+    candidate = VdpTargetProfile(
         profile_name=args.profile_name,
-        profile_revision=profile_revision,
+        profile_revision=provisional_revision,
         image_ref=image_ref,
         expected_image_digest=image_digest.strip().lower(),
         expected_source_commit=source_commit.strip().lower(),
@@ -725,6 +974,9 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
         allowed_test_selectors=allowed_selectors,
         positive_selectors=positive_selectors,
         negative_selectors=negative_selectors,
+        anomaly_repro_selectors=anomaly_repro_selectors,
+        env_check_selectors=env_check_selectors,
+        selector_roles=selector_roles,
         allowed_overlays=overlays,
         max_cpus=(
             args.max_cpus
@@ -752,16 +1004,75 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
         ),
         expires_at=expires_at,
     )
-    validated = validate_vdp_profile_registration(profile)
-    saved_path = save_registered_vdp_profile(settings.vault_root, validated)
-    _emit_json(
-        {
-            "status": "registered",
-            "profiles_file": str(saved_path),
-            **validated.to_public_summary(),
-        }
-    )
+    validated = validate_vdp_profile_registration(candidate)
+    diff = _compute_vdp_profile_diff(base, validated)
+    has_diff = _has_nonempty_profile_diff(diff)
+
+    if base is not None and has_diff:
+        if args.profile_revision is None:
+            bumped_rev = _next_profile_revision(base.profile_revision)
+            validated = validated.model_copy(update={"profile_revision": bumped_rev})
+            diff["new_revision"] = bumped_rev
+        elif args.profile_revision == base.profile_revision:
+            raise ContractViolationError(
+                f"--profile-revision {args.profile_revision!r} matches existing revision while profile changed; "
+                "provide a new revision or omit --profile-revision to auto-increment."
+            )
+
+    summary_payload: dict[str, Any] = {
+        "status": "dry_run_validated" if args.dry_run else "registered",
+        "dry_run": bool(args.dry_run),
+        "previous_revision": base.profile_revision if base is not None else None,
+        "limits": {
+            "max_cpus": validated.max_cpus,
+            "max_memory_mb": validated.max_memory_mb,
+            "max_timeout_seconds": validated.max_timeout_seconds,
+            "max_output_bytes": validated.max_output_bytes,
+            "network_mode": "none",
+        },
+        "diff": diff,
+        "overlay_verified_on_disk": overlay_verified_on_disk,
+        **validated.to_public_summary(),
+    }
+    if not args.dry_run:
+        saved_path = save_registered_vdp_profile(settings.vault_root, validated)
+        summary_payload["profiles_file"] = str(saved_path)
+
+    _emit_json(summary_payload)
     return 0
+
+
+def _handle_check_vdp_env(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    eff_env = _merge_runtime_env(
+        env=env,
+        db_path=getattr(args, "db_path", None),
+        vault_root=getattr(args, "vault_root", None),
+    )
+    settings = load_runtime_settings(eff_env)
+    profiles: dict[str, VdpTargetProfile] = {
+        WEBLATE_2026_11_2_PROFILE_NAME: build_default_weblate_profile()
+    }
+    if settings.vault_root is not None:
+        profiles.update(load_registered_vdp_profiles(settings.vault_root))
+
+    profile_name = args.profile_name or WEBLATE_2026_11_2_PROFILE_NAME
+    profile = profiles.get(profile_name)
+    if profile is None:
+        hint = next((p for p in profiles.values() if p.profile_revision == profile_name), None)
+        if hint is not None:
+            raise ContractViolationError(
+                f"{profile_name!r} is a profile_revision; pass --profile-name {hint.profile_name!r}."
+            )
+        raise ContractViolationError(f"Unknown VDP profile {profile_name!r}.")
+
+    report = run_vdp_environment_check(
+        profile,
+        docker_bin=args.docker_bin,
+        overlay_bundle=args.overlay_bundle,
+        include_host_paths=True,
+    )
+    _emit_json(report)
+    return 0 if report["healthy"] else 1
 
 
 def build_admin_parser() -> argparse.ArgumentParser:
@@ -920,14 +1231,43 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_vdp_reg.add_argument("--allow-selector", action="append", default=None)
     p_vdp_reg.add_argument("--positive-selector", action="append", default=None)
     p_vdp_reg.add_argument("--negative-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--defense-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--anomaly-repro-selector", action="append", default=None)
+    p_vdp_reg.add_argument("--env-check-selector", action="append", default=None)
+    p_vdp_reg.add_argument(
+        "--selector-role",
+        action="append",
+        default=None,
+        help="Assign an explicit selector role as SELECTOR=ROLE (positive_control|defense_check|anomaly_repro|env_check).",
+    )
     p_vdp_reg.add_argument("--overlay-bundle", default=None)
     p_vdp_reg.add_argument("--overlay-host-dir", type=Path, default=None)
     p_vdp_reg.add_argument("--overlay-file-sha256", action="append", default=None)
+    p_vdp_reg.add_argument(
+        "--overlay-file",
+        action="append",
+        default=None,
+        help="Pin an overlay file under --overlay-host-dir as REL_PATH=auto or REL_PATH=SHA256.",
+    )
     p_vdp_reg.add_argument("--max-cpus", type=int, default=None)
     p_vdp_reg.add_argument("--max-memory-mb", type=int, default=None)
     p_vdp_reg.add_argument("--max-timeout-seconds", type=int, default=None)
     p_vdp_reg.add_argument("--max-output-bytes", type=int, default=None)
     p_vdp_reg.add_argument("--expires-at", default=None)
+    p_vdp_reg.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the profile, inspect the diff, and emit JSON without writing profiles.json.",
+    )
+
+    p_vdp_check = subparsers.add_parser(
+        "check-vdp-env",
+        help="Verify pinned VDP profile expiry, Docker image digest, git checkout HEAD, and overlay file SHA-256s.",
+    )
+    _add_common_admin_flags(p_vdp_check, suppress_defaults=True)
+    p_vdp_check.add_argument("--profile-name", default="weblate")
+    p_vdp_check.add_argument("--overlay-bundle", default=None)
+    p_vdp_check.add_argument("--docker-bin", default="docker")
 
     return parser
 
@@ -951,6 +1291,7 @@ def admin_main(
         "update-budget": _handle_update_budget,
         "update-scope": _handle_update_scope,
         "register-vdp-profile": _handle_register_vdp_profile,
+        "check-vdp-env": _handle_check_vdp_env,
     }
     try:
         return handlers[args.command](args, env)

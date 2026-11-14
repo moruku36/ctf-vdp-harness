@@ -56,12 +56,20 @@ from ctf_mcp.contracts import (
     UsageMetrics,
 )
 from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
+from ctf_mcp.vdp_fixtures.local_git_http import redact_sensitive_text, redact_structure
 
 VDP_PRODUCT_TEST_CAPABILITY_NAME = "vdp.test"
 VDP_PRODUCT_TEST_ADAPTER_ID = "ctf-vdp-product-test"
-VDP_PRODUCT_TEST_ADAPTER_COMMIT = "p8vdp01a2b3c4d5e"
+VDP_PRODUCT_TEST_ADAPTER_COMMIT = "p9vdp02c3d4e5f6"
+VALID_SELECTOR_ROLES: tuple[str, ...] = (
+    "positive_control",
+    "defense_check",
+    "anomaly_repro",
+    "env_check",
+)
 VDP_PRODUCT_TEST_OPERATIONS: tuple[str, ...] = (
     "describe_profile",
+    "check_environment",
     "run_smoke",
     "run_pytest",
 )
@@ -135,6 +143,49 @@ VDP_PRODUCT_TEST_ARG_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "string",
                 "pattern": "^[A-Za-z0-9_./:-]{3,240}$",
+            },
+        },
+        "anomaly_repro_selectors": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_./:-]{3,240}$",
+            },
+        },
+        "env_check_selectors": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_./:-]{3,240}$",
+            },
+        },
+        "selector_roles": {
+            "type": "object",
+            "maxProperties": 20,
+            "additionalProperties": {
+                "type": "string",
+                "enum": list(VALID_SELECTOR_ROLES),
+            },
+        },
+        "test_context": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "sender_auth_state": {"type": "string", "maxLength": 160},
+                "config_creation_path": {"type": "string", "maxLength": 160},
+                "target_component": {"type": "string", "maxLength": 160},
+                "confirmed_conditions": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "string", "maxLength": 240},
+                },
+                "unverified_conditions": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "string", "maxLength": 240},
+                },
             },
         },
         "baseline_evidence_ref": {
@@ -248,6 +299,9 @@ class VdpTargetProfile(StrictModel):
     allowed_test_selectors: tuple[str, ...]
     positive_selectors: tuple[str, ...] = ()
     negative_selectors: tuple[str, ...] = ()
+    anomaly_repro_selectors: tuple[str, ...] = ()
+    env_check_selectors: tuple[str, ...] = ()
+    selector_roles: dict[str, str] = Field(default_factory=dict)
     allowed_overlays: dict[str, VdpOverlaySpec] = Field(default_factory=dict)
     max_cpus: int = Field(default=DEFAULT_VDP_TEST_MAX_CPUS, ge=1)
     max_memory_mb: int = Field(default=DEFAULT_VDP_TEST_MAX_MEMORY_MB, ge=512)
@@ -255,8 +309,33 @@ class VdpTargetProfile(StrictModel):
     max_output_bytes: int = Field(default=DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES, ge=1024)
     expires_at: datetime | None = None
 
+    def resolve_selector_role(self, selector: str) -> str | None:
+        """Return canonical test role for ``selector`` if configured."""
+        explicit = self.selector_roles.get(selector)
+        if explicit in VALID_SELECTOR_ROLES:
+            return explicit
+        if selector in self.anomaly_repro_selectors:
+            return "anomaly_repro"
+        if selector in self.env_check_selectors:
+            return "env_check"
+        if selector in self.negative_selectors:
+            return "defense_check"
+        if selector in self.positive_selectors:
+            return "positive_control"
+        return None
+
+    def resolve_selector_roles(self) -> dict[str, str]:
+        """Return selector -> role mapping for all allowlisted selectors."""
+        resolved: dict[str, str] = {}
+        for sel in self.allowed_test_selectors:
+            role = self.resolve_selector_role(sel)
+            if role is not None:
+                resolved[sel] = role
+        return resolved
+
     def to_public_summary(self) -> dict[str, Any]:
         """Return sanitized profile metadata omitting internal host directory paths."""
+        resolved_roles = self.resolve_selector_roles()
         return {
             "profile_name": self.profile_name,
             "profile_revision": self.profile_revision,
@@ -267,6 +346,13 @@ class VdpTargetProfile(StrictModel):
             "allowed_test_selectors": list(self.allowed_test_selectors),
             "positive_selectors": list(self.positive_selectors),
             "negative_selectors": list(self.negative_selectors),
+            "anomaly_repro_selectors": list(self.anomaly_repro_selectors),
+            "env_check_selectors": list(self.env_check_selectors),
+            "selector_roles": resolved_roles,
+            "active_tests": [
+                {"selector": sel, "role": resolved_roles.get(sel, "unassigned")}
+                for sel in self.allowed_test_selectors
+            ],
             "allowed_overlays": {
                 name: {
                     "bundle_name": spec.bundle_name,
@@ -284,7 +370,7 @@ class VdpTargetProfile(StrictModel):
 
 
 def validate_vdp_profile_registration(profile: VdpTargetProfile) -> VdpTargetProfile:
-    """Validate strict selector, digest, commit, overlay SHA-256, and bound constraints before saving."""
+    """Validate strict selector, role, digest, commit, overlay SHA-256, and bound constraints before saving."""
     if not _PROFILE_NAME_RE.fullmatch(profile.profile_name):
         raise ContractViolationError(
             f"Invalid profile_name {profile.profile_name!r}."
@@ -298,17 +384,76 @@ def validate_vdp_profile_registration(profile: VdpTargetProfile) -> VdpTargetPro
     allowed_set = set(cleaned_allowed)
     cleaned_pos = tuple(dict.fromkeys(validate_vdp_selector_format(s) for s in profile.positive_selectors))
     cleaned_neg = tuple(dict.fromkeys(validate_vdp_selector_format(s) for s in profile.negative_selectors))
+    cleaned_anom = tuple(dict.fromkeys(validate_vdp_selector_format(s) for s in profile.anomaly_repro_selectors))
+    cleaned_env = tuple(dict.fromkeys(validate_vdp_selector_format(s) for s in profile.env_check_selectors))
 
-    for sel in cleaned_pos:
+    for label, group in (
+        ("positive_selector", cleaned_pos),
+        ("negative_selector", cleaned_neg),
+        ("anomaly_repro_selector", cleaned_anom),
+        ("env_check_selector", cleaned_env),
+    ):
+        for sel in group:
+            if sel not in allowed_set:
+                raise ContractViolationError(
+                    f"{label} {sel!r} must be present in allowed_test_selectors."
+                )
+
+    cleaned_roles: dict[str, str] = {}
+    for raw_sel, raw_role in profile.selector_roles.items():
+        sel = validate_vdp_selector_format(raw_sel)
         if sel not in allowed_set:
             raise ContractViolationError(
-                f"positive_selector {sel!r} must be present in allowed_test_selectors."
+                f"selector_roles key {sel!r} must be present in allowed_test_selectors."
             )
-    for sel in cleaned_neg:
-        if sel not in allowed_set:
+        role = str(raw_role).strip()
+        if role not in VALID_SELECTOR_ROLES:
             raise ContractViolationError(
-                f"negative_selector {sel!r} must be present in allowed_test_selectors."
+                f"Invalid selector role {raw_role!r} for {sel!r}; expected one of {VALID_SELECTOR_ROLES}."
             )
+        cleaned_roles[sel] = role
+
+    # Ensure anomaly_repro / env_check do not overlap with defense_check or positive_control,
+    # while keeping W-02 self-contained positive+negative dual membership valid.
+    pos_set = set(cleaned_pos)
+    neg_set = set(cleaned_neg)
+    anom_set = set(cleaned_anom)
+    env_set = set(cleaned_env)
+    for sel, role in cleaned_roles.items():
+        if role == "anomaly_repro":
+            anom_set.add(sel)
+        elif role == "env_check":
+            env_set.add(sel)
+        elif role == "positive_control":
+            pos_set.add(sel)
+        elif role == "defense_check":
+            neg_set.add(sel)
+
+    if anom_set & env_set:
+        raise ContractViolationError(
+            "A selector cannot be assigned to both anomaly_repro and env_check."
+        )
+    if (anom_set | env_set) & (pos_set | neg_set):
+        conflict = sorted((anom_set | env_set) & (pos_set | neg_set))
+        raise ContractViolationError(
+            f"Selectors {conflict!r} have conflicting role assignments."
+        )
+    for sel in cleaned_allowed:
+        if sel in cleaned_roles:
+            continue
+        if sel in anom_set:
+            cleaned_roles[sel] = "anomaly_repro"
+        elif sel in env_set:
+            cleaned_roles[sel] = "env_check"
+        elif sel in neg_set:
+            cleaned_roles[sel] = "defense_check"
+        elif sel in pos_set:
+            cleaned_roles[sel] = "positive_control"
+
+    cleaned_pos = tuple(dict.fromkeys([*cleaned_pos, *(s for s, r in cleaned_roles.items() if r == "positive_control")]))
+    cleaned_neg = tuple(dict.fromkeys([*cleaned_neg, *(s for s, r in cleaned_roles.items() if r == "defense_check")]))
+    cleaned_anom = tuple(dict.fromkeys([*cleaned_anom, *(s for s, r in cleaned_roles.items() if r == "anomaly_repro")]))
+    cleaned_env = tuple(dict.fromkeys([*cleaned_env, *(s for s, r in cleaned_roles.items() if r == "env_check")]))
 
     normalized_overlays: dict[str, VdpOverlaySpec] = {}
     for key, spec in profile.allowed_overlays.items():
@@ -346,6 +491,9 @@ def validate_vdp_profile_registration(profile: VdpTargetProfile) -> VdpTargetPro
             "allowed_test_selectors": cleaned_allowed,
             "positive_selectors": cleaned_pos,
             "negative_selectors": cleaned_neg,
+            "anomaly_repro_selectors": cleaned_anom,
+            "env_check_selectors": cleaned_env,
+            "selector_roles": cleaned_roles,
             "allowed_overlays": normalized_overlays,
         }
     )
@@ -520,6 +668,10 @@ class _ValidatedPlan(StrictModel):
     test_selectors: tuple[str, ...]
     positive_selectors: tuple[str, ...]
     negative_selectors: tuple[str, ...]
+    anomaly_repro_selectors: tuple[str, ...] = ()
+    env_check_selectors: tuple[str, ...] = ()
+    selector_roles: dict[str, str] = Field(default_factory=dict)
+    test_context: dict[str, Any] = Field(default_factory=dict)
     overlay_bundle: str | None = None
     overlay_host_dir: str | None = None
     overlay_container_target: str | None = None
@@ -645,6 +797,191 @@ _SHORT_SUMMARY_RE = re.compile(
     r"^(PASSED|FAILED|ERROR|SKIPPED)\s+([^\s]+\.py::[^\s]+)\b",
     re.MULTILINE,
 )
+_EVIDENCE_MARKER_RE = re.compile(r"^VDP_EVIDENCE_MARKER:\s*(\{.*\})\s*$", re.MULTILINE)
+
+
+class _VerdictResult(StrictModel):
+    """Structured outcome classification produced from pytest results and selector roles."""
+
+    verdict: str
+    verdict_reason: str
+    positive_passed: int = 0
+    positive_failed: int = 0
+    negative_passed: int = 0
+    negative_failed: int = 0
+    anomaly_repro_passed: int = 0
+    anomaly_repro_failed: int = 0
+    env_check_passed: int = 0
+    env_check_failed: int = 0
+
+
+def _extract_evidence_markers(text: str) -> dict[str, Any]:
+    """Parse and merge redacted ``VDP_EVIDENCE_MARKER:{json}`` lines from stdout."""
+    merged: dict[str, Any] = {}
+    scenarios: list[Any] = []
+    confirmed: list[str] = []
+    unverified: list[str] = []
+    for raw_json in _EVIDENCE_MARKER_RE.findall(text):
+        try:
+            obj = json.loads(raw_json)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        clean_obj = redact_structure(obj)
+        for key in ("sender_auth_state", "config_creation_path", "target_component", "stage_verification", "state_diff"):
+            if key in clean_obj and clean_obj[key] is not None:
+                merged[key] = clean_obj[key]
+        if isinstance(clean_obj.get("scenario_comparisons"), list):
+            scenarios.extend(clean_obj["scenario_comparisons"])
+        if isinstance(clean_obj.get("confirmed_conditions"), list):
+            confirmed.extend(str(x) for x in clean_obj["confirmed_conditions"] if x)
+        if isinstance(clean_obj.get("unverified_conditions"), list):
+            unverified.extend(str(x) for x in clean_obj["unverified_conditions"] if x)
+    if scenarios:
+        merged["scenario_comparisons"] = scenarios
+    if confirmed:
+        merged["confirmed_conditions"] = list(dict.fromkeys(confirmed))
+    if unverified:
+        merged["unverified_conditions"] = list(dict.fromkeys(unverified))
+    return merged
+
+
+def _build_execution_context_and_conclusion(
+    *,
+    plan: _ValidatedPlan,
+    verdict_res: _VerdictResult,
+    parsed: Mapping[str, Any],
+    marker_data: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build structured execution context and confirmed/unverified condition summaries."""
+    ctx_arg = redact_structure(dict(plan.test_context))
+    sender_auth_state = str(
+        marker_data.get("sender_auth_state")
+        or ctx_arg.get("sender_auth_state")
+        or "unspecified"
+    )
+    config_creation_path = str(
+        marker_data.get("config_creation_path")
+        or ctx_arg.get("config_creation_path")
+        or "unspecified"
+    )
+    target_component = str(
+        marker_data.get("target_component")
+        or ctx_arg.get("target_component")
+        or "unspecified"
+    )
+
+    raw_stage = marker_data.get("stage_verification")
+    stage_verification: dict[str, bool | None] = {
+        "update_scheduled": (
+            raw_stage.get("update_scheduled") if isinstance(raw_stage, Mapping) else None
+        ),
+        "sync_completed": (
+            raw_stage.get("sync_completed") if isinstance(raw_stage, Mapping) else None
+        ),
+        "data_changed": (
+            raw_stage.get("data_changed") if isinstance(raw_stage, Mapping) else None
+        ),
+    }
+
+    execution_context: dict[str, Any] = {
+        "sender_auth_state": sender_auth_state,
+        "config_creation_path": config_creation_path,
+        "target_component": target_component,
+        "stage_verification": stage_verification,
+        "scenario_comparisons": list(marker_data.get("scenario_comparisons") or []),
+        "state_diff": dict(marker_data.get("state_diff") or {}),
+    }
+
+    confirmed: list[str] = []
+    unverified: list[str] = []
+    verdict = verdict_res.verdict
+
+    if verdict_res.positive_passed >= 1:
+        confirmed.append("baseline_positive_control_passed")
+    if verdict == "smoke_passed":
+        confirmed.append("product_smoke_passed")
+    elif verdict == "hypothesis_falsified":
+        confirmed.append("defense_check_passed:boundary_defended_under_test_conditions")
+        unverified.append("celery_eager_test_settings_async_unverified")
+    elif verdict == "anomaly_observed":
+        confirmed.append("anomaly_repro_passed:specified_behavior_observed")
+        low_path = config_creation_path.lower()
+        if config_creation_path == "unspecified" or "bypass" in low_path or "direct_model_save" in low_path:
+            unverified.append("normal_ui_api_config_reachability_unverified")
+        else:
+            confirmed.append(f"config_creation_path:{config_creation_path}")
+        if stage_verification["update_scheduled"] is True:
+            confirmed.append("stage_update_scheduled_confirmed")
+        elif stage_verification["update_scheduled"] is None:
+            unverified.append("stage_update_scheduled_unverified")
+        if stage_verification["sync_completed"] is True:
+            confirmed.append("stage_sync_completed_confirmed")
+        else:
+            unverified.append("stage_sync_completed_unverified")
+        if stage_verification["data_changed"] is True:
+            confirmed.append("stage_data_changed_confirmed")
+        else:
+            unverified.append("stage_data_changed_unverified")
+        unverified.append("vulnerability_eligibility_and_impact_require_separate_assessment")
+    elif verdict == "inconclusive" and int(parsed.get("failed_count") or 0) > 0:
+        unverified.append("assertion_failure_root_cause_uninspected")
+        unverified.append("setup_or_assertion_failure_not_vulnerability_proof")
+    elif verdict in {"skipped", "not_executed", "timeout", "environment_failure"}:
+        unverified.append(f"non_conclusive_execution:{verdict}")
+
+    for item in marker_data.get("confirmed_conditions") or ():
+        confirmed.append(str(item))
+    for item in ctx_arg.get("confirmed_conditions") or ():
+        confirmed.append(str(item))
+    for item in marker_data.get("unverified_conditions") or ():
+        unverified.append(str(item))
+    for item in ctx_arg.get("unverified_conditions") or ():
+        unverified.append(str(item))
+
+    confirmed = list(dict.fromkeys(confirmed))
+    unverified = list(dict.fromkeys(unverified))
+
+    if verdict == "anomaly_observed":
+        all_e2e_confirmed = (
+            "normal_ui_api_config_reachability_unverified" not in unverified
+            and stage_verification["update_scheduled"] is True
+            and stage_verification["sync_completed"] is True
+            and stage_verification["data_changed"] is True
+        )
+        summary_ja = (
+            "通常設定経路での異常挙動・更新予約・同期完了・データ変更を確認済み（脆弱性該当性と影響評価は別判定）"
+            if all_e2e_confirmed
+            else "照合等の指定した異常挙動は再現したが、通常設定での到達と実害（同期完了・データ変更）は未確認"
+        )
+    elif verdict == "hypothesis_falsified":
+        summary_ja = "指定したテスト条件では防御境界が守られたことを確認済み"
+    elif verdict == "baseline_failed":
+        summary_ja = "正常系（ベースライン）が不成立のため、防御確認・異常再現とも未成立"
+    elif verdict == "inconclusive":
+        summary_ja = (
+            "失敗したアサーションと原因を確認するまで inconclusive"
+            "（セットアップ失敗やアサーション失敗を脆弱性の証拠にしない）"
+        )
+    elif verdict == "smoke_passed":
+        summary_ja = "公式 smoke チェックが成功"
+    elif verdict == "env_check_passed":
+        summary_ja = "環境確認テストが成功（防御確認や異常再現は別実行）"
+    elif verdict == "baseline_passed":
+        summary_ja = "正常系（ベースライン）チェックのみ成功"
+    else:
+        summary_ja = (
+            f"未確定状態（verdict={verdict}）のため、防御成功にも異常再現にも数えない"
+        )
+
+    conclusion_status = {
+        "confirmed_conditions": confirmed,
+        "unverified_conditions": unverified,
+        "finding_qualification": "separate_assessment_required_not_judged_from_pass_count",
+        "summary_ja": summary_ja,
+    }
+    return execution_context, conclusion_status
 
 
 def _parse_pytest_counts_line(line: str) -> dict[str, int]:
@@ -761,8 +1098,11 @@ def _classify_verdict(
     parsed: Mapping[str, Any],
     positive_selectors: tuple[str, ...],
     negative_selectors: tuple[str, ...],
-) -> tuple[str, str, int, int, int, int]:
-    """Classify run outcome without conflating baseline failures with defense success."""
+    anomaly_repro_selectors: tuple[str, ...] = (),
+    env_check_selectors: tuple[str, ...] = (),
+    has_valid_baseline_ref: bool = False,
+) -> _VerdictResult:
+    """Classify run outcome strictly by selector roles without conflating failures with defense/repro."""
     collected = int(parsed["collected_count"])
     passed = int(parsed["passed_count"])
     failed = int(parsed["failed_count"])
@@ -771,163 +1111,205 @@ def _classify_verdict(
     sel_outcomes = parsed["selector_outcomes"]
 
     if outcome == SubprocessOutcome.TIMEOUT:
-        return (
-            "timeout",
-            "Execution exceeded bounded wall-clock timeout and was terminated.",
-            0,
-            0,
-            0,
-            0,
+        return _VerdictResult(
+            verdict="timeout",
+            verdict_reason="Execution exceeded bounded wall-clock timeout and was terminated.",
         )
     if outcome == SubprocessOutcome.CANCELLED:
-        return (
-            "not_executed",
-            "Execution was cancelled before completion.",
-            0,
-            0,
-            0,
-            0,
+        return _VerdictResult(
+            verdict="not_executed",
+            verdict_reason="Execution was cancelled before completion.",
         )
     if not cleanup_confirmed:
-        return (
-            "environment_failure",
-            "Child process or Docker container cleanup could not be confirmed.",
-            0,
-            0,
-            0,
-            0,
+        return _VerdictResult(
+            verdict="environment_failure",
+            verdict_reason="Child process or Docker container cleanup could not be confirmed.",
         )
 
     if operation == "run_smoke":
         if exit_code == 0 and passed > 0 and failed == 0 and error == 0 and skipped == 0:
-            return (
-                "smoke_passed",
-                f"Official scanner smoke passed ({passed} checks passed across smoke sessions).",
-                passed,
-                0,
-                0,
-                0,
+            return _VerdictResult(
+                verdict="smoke_passed",
+                verdict_reason=f"Official scanner smoke passed ({passed} checks passed across smoke sessions).",
+                positive_passed=passed,
             )
-        return (
-            "environment_failure",
-            f"Official scanner smoke failed (exit_code={exit_code}, passed={passed}, failed={failed}, skipped={skipped}, error={error}).",
-            0,
-            0,
-            0,
-            0,
+        return _VerdictResult(
+            verdict="environment_failure",
+            verdict_reason=(
+                f"Official scanner smoke failed (exit_code={exit_code}, passed={passed}, "
+                f"failed={failed}, skipped={skipped}, error={error})."
+            ),
         )
 
     pos_passed = sum(1 for s in positive_selectors if sel_outcomes.get(s) == "passed")
     pos_failed = sum(1 for s in positive_selectors if sel_outcomes.get(s) in {"failed", "error"})
     neg_passed = sum(1 for s in negative_selectors if sel_outcomes.get(s) == "passed")
     neg_failed = sum(1 for s in negative_selectors if sel_outcomes.get(s) in {"failed", "error"})
+    anom_passed = sum(1 for s in anomaly_repro_selectors if sel_outcomes.get(s) == "passed")
+    anom_failed = sum(1 for s in anomaly_repro_selectors if sel_outcomes.get(s) in {"failed", "error"})
+    env_passed = sum(1 for s in env_check_selectors if sel_outcomes.get(s) == "passed")
+    env_failed = sum(1 for s in env_check_selectors if sel_outcomes.get(s) in {"failed", "error"})
+
+    base_counts = dict(
+        positive_passed=pos_passed,
+        positive_failed=pos_failed,
+        negative_passed=neg_passed,
+        negative_failed=neg_failed,
+        anomaly_repro_passed=anom_passed,
+        anomaly_repro_failed=anom_failed,
+        env_check_passed=env_passed,
+        env_check_failed=env_failed,
+    )
+
+    if exit_code in {125, 126, 127}:
+        return _VerdictResult(
+            verdict="environment_failure",
+            verdict_reason=f"Container or test runner environment failed (outcome={outcome.value}, exit_code={exit_code}).",
+            **base_counts,
+        )
 
     # Pytest exit codes >= 2 indicate internal error, usage error, interrupted, or zero items collected.
     if exit_code is None or exit_code >= 2 or error > 0:
         if collected == 0 and (exit_code in {0, 5} or "collected 0 items" in str(parsed)):
-            return (
-                "not_executed",
-                "Pytest collected 0 items; no product test cases executed.",
-                pos_passed,
-                pos_failed,
-                neg_passed,
-                neg_failed,
+            return _VerdictResult(
+                verdict="not_executed",
+                verdict_reason="Pytest collected 0 items; no product test cases executed.",
+                **base_counts,
             )
-        return (
-            "environment_failure",
-            f"Product test runner encountered environment/setup failure (exit_code={exit_code}, errors={error}).",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+        return _VerdictResult(
+            verdict="environment_failure",
+            verdict_reason=f"Product test runner encountered environment/setup failure (exit_code={exit_code}, errors={error}).",
+            **base_counts,
         )
 
-    if collected == 0:
-        return (
-            "not_executed",
-            "Pytest collected 0 items; no product test cases executed.",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+    if collected == 0 or (passed == 0 and failed == 0 and skipped == 0 and error == 0):
+        return _VerdictResult(
+            verdict="not_executed",
+            verdict_reason="Pytest collected 0 items; no product test cases executed.",
+            **base_counts,
         )
 
-    if skipped > 0 or any(v == "skipped" for v in sel_outcomes.values() if isinstance(v, str)):
-        return (
-            "skipped",
-            f"At least one selected test was skipped (skipped={skipped}); skipped checks do not establish defense.",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+    has_skips = skipped > 0 or any(v == "skipped" for v in sel_outcomes.values() if isinstance(v, str))
+    if has_skips:
+        if passed == 0 and failed == 0:
+            return _VerdictResult(
+                verdict="skipped",
+                verdict_reason=(
+                    f"Selected product tests were skipped (skipped={skipped}); "
+                    "skipping is neither defense success nor anomaly reproduction."
+                ),
+                **base_counts,
+            )
+        return _VerdictResult(
+            verdict="inconclusive",
+            verdict_reason=(
+                f"Test execution included skipped items (skipped={skipped}); "
+                "refusing to count partial execution as defense success or anomaly reproduction."
+            ),
+            **base_counts,
         )
 
-    # Critical guard (Requirement 4): if positive control failed or was absent while evaluating negative controls,
-    # NEVER classify negative no-change as defense success / hypothesis_falsified.
+    # Critical baseline guard: failed positive control invalidates both defense checks and anomaly observations.
     if pos_failed > 0:
-        return (
-            "baseline_failed",
-            "Positive control failed; negative no-change cannot be classified as defense success.",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+        return _VerdictResult(
+            verdict="baseline_failed",
+            verdict_reason=(
+                "Baseline positive control failed; boundary defense or anomaly reproduction "
+                "cannot be concluded when normal operation fails."
+            ),
+            **base_counts,
         )
 
-    if negative_selectors and pos_passed == 0:
-        return (
-            "baseline_failed",
-            "No passing positive control established; negative test pass cannot count as defense success.",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+    # P0 rule: Any assertion failure requires root-cause inspection -> inconclusive (never auto-proof of vulnerability).
+    if failed > 0 or neg_failed > 0 or anom_failed > 0 or env_failed > 0:
+        return _VerdictResult(
+            verdict="inconclusive",
+            verdict_reason=(
+                "One or more test assertions failed; inspect the failed assertion and root cause "
+                "before concluding boundary failure or vulnerability reproduction. Setup or assertion "
+                "failure is not proof of a vulnerability."
+            ),
+            **base_counts,
         )
 
-    if neg_failed > 0 and pos_passed >= 1 and error == 0:
-        return (
-            "deviation_reproduced",
-            "Positive control passed and negative permission check failed (deviation reproduced under synthetic test settings).",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
+    if passed > 0 and exit_code == 0:
+        if (
+            env_check_selectors
+            and not positive_selectors
+            and not negative_selectors
+            and not anomaly_repro_selectors
+            and env_passed >= len(env_check_selectors)
+        ):
+            return _VerdictResult(
+                verdict="env_check_passed",
+                verdict_reason=f"Environment check test(s) passed ({env_passed} passed).",
+                **base_counts,
+            )
+
+        baseline_ok = pos_passed >= 1 or has_valid_baseline_ref
+        if (negative_selectors or anomaly_repro_selectors) and not baseline_ok:
+            return _VerdictResult(
+                verdict="baseline_failed",
+                verdict_reason=(
+                    "No passing positive control established (in this run or via baseline_evidence_ref); "
+                    "refusing to classify defense success or anomaly reproduction without a verified baseline."
+                ),
+                **base_counts,
+            )
+
+        if anomaly_repro_selectors and anom_passed >= 1:
+            if anom_passed < len(anomaly_repro_selectors):
+                return _VerdictResult(
+                    verdict="inconclusive",
+                    verdict_reason="Not all requested anomaly_repro selectors completed and passed.",
+                    **base_counts,
+                )
+            return _VerdictResult(
+                verdict="anomaly_observed",
+                verdict_reason=(
+                    "Baseline positive control and anomaly reproduction test(s) passed: specified "
+                    "anomalous behavior was observed under test conditions. Vulnerability qualification, "
+                    "normal-configuration reachability, and real impact require separate assessment."
+                ),
+                **base_counts,
+            )
+
+        if negative_selectors and neg_passed >= 1:
+            if neg_passed < len(negative_selectors):
+                return _VerdictResult(
+                    verdict="inconclusive",
+                    verdict_reason="Not all requested defense_check selectors completed and passed.",
+                    **base_counts,
+                )
+            return _VerdictResult(
+                verdict="hypothesis_falsified",
+                verdict_reason=(
+                    "Positive control and defense check test(s) passed under test conditions "
+                    "(boundary defended under tested conditions)."
+                ),
+                **base_counts,
+            )
+
+        if positive_selectors and pos_passed >= 1:
+            return _VerdictResult(
+                verdict="baseline_passed",
+                verdict_reason=f"Positive baseline check(s) passed ({pos_passed} passed).",
+                **base_counts,
+            )
+
+        return _VerdictResult(
+            verdict="inconclusive",
+            verdict_reason=(
+                "Executed tests succeeded but no selector roles were assigned; assign test roles "
+                "(positive_control / defense_check / anomaly_repro / env_check) before classifying outcome."
+            ),
+            **base_counts,
         )
 
-    if (
-        negative_selectors
-        and pos_passed >= 1
-        and pos_failed == 0
-        and neg_passed >= 1
-        and neg_failed == 0
-        and exit_code == 0
-    ):
-        return (
-            "hypothesis_falsified",
-            "Positive control and negative permission controls passed under synthetic test settings (hypothesis falsified).",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
-        )
-
-    if positive_selectors and not negative_selectors and pos_passed >= 1 and failed == 0 and exit_code == 0:
-        return (
-            "baseline_passed",
-            f"Positive baseline check(s) passed ({pos_passed} passed).",
-            pos_passed,
-            pos_failed,
-            neg_passed,
-            neg_failed,
-        )
-
-    return (
-        "environment_failure",
-        f"Unclassified test outcome (exit_code={exit_code}, passed={passed}, failed={failed}, skipped={skipped}).",
-        pos_passed,
-        pos_failed,
-        neg_passed,
-        neg_failed,
+    return _VerdictResult(
+        verdict="environment_failure",
+        verdict_reason=f"Unclassified test outcome (exit_code={exit_code}, passed={passed}, failed={failed}, skipped={skipped}).",
+        **base_counts,
     )
 
 
@@ -955,13 +1337,408 @@ def _encode_bounded_evidence_json(payload: dict[str, Any], max_bytes: int) -> tu
     if best_bytes is not None:
         return best_bytes, True
 
-    # Extreme tiny cap fallback: clear excerpt and selector details if needed, then clamp safely.
     bounded["log_excerpt"] = ""
     candidate = json.dumps(bounded, indent=2, ensure_ascii=False).encode("utf-8")
     if len(candidate) <= max_bytes:
         return candidate, True
+    if "execution_context" in bounded and isinstance(bounded["execution_context"], dict):
+        bounded["execution_context"] = {
+            **bounded["execution_context"],
+            "scenario_comparisons": [],
+            "state_diff": {},
+        }
+        candidate = json.dumps(bounded, indent=2, ensure_ascii=False).encode("utf-8")
+        if len(candidate) <= max_bytes:
+            return candidate, True
     bounded["selector_outcomes"] = {}
     return json.dumps(bounded, ensure_ascii=False).encode("utf-8")[:max_bytes], True
+
+
+def _resolve_plan_selector_groups(
+    *,
+    profile: VdpTargetProfile,
+    raw_selectors: tuple[str, ...],
+    allowed_set: set[str],
+    arguments: Mapping[str, Any],
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    dict[str, str],
+]:
+    """Validate and resolve per-selector roles without allowing silent role inversion."""
+    pos_arg = arguments.get("positive_selectors")
+    neg_arg = arguments.get("negative_selectors")
+    anom_arg = arguments.get("anomaly_repro_selectors")
+    env_arg = arguments.get("env_check_selectors")
+    roles_arg = arguments.get("selector_roles")
+
+    profile_roles = profile.resolve_selector_roles()
+    dual_pos_neg = set(profile.positive_selectors) & set(profile.negative_selectors)
+    raw_set = set(raw_selectors)
+
+    def _validate_arg_list(arg_val: Any, label: str) -> tuple[str, ...] | None:
+        if arg_val is None:
+            return None
+        cleaned = tuple(str(x).strip() for x in arg_val)
+        for s in cleaned:
+            if s not in allowed_set or (raw_selectors and s not in raw_set):
+                raise ScopeDeniedError(
+                    f"{label} {s!r} must be allowlisted and included in test_selectors.",
+                    code="selector_not_allowlisted",
+                )
+        return cleaned
+
+    pos_list = _validate_arg_list(pos_arg, "positive_selector")
+    neg_list = _validate_arg_list(neg_arg, "negative_selector")
+    anom_list = _validate_arg_list(anom_arg, "anomaly_repro_selector")
+    env_list = _validate_arg_list(env_arg, "env_check_selector")
+
+    caller_roles: dict[str, str] = {}
+    if isinstance(roles_arg, Mapping):
+        for raw_s, raw_r in roles_arg.items():
+            sel = str(raw_s).strip()
+            role = str(raw_r).strip()
+            if sel not in allowed_set or (raw_selectors and sel not in raw_set):
+                raise ScopeDeniedError(
+                    f"selector_roles key {sel!r} must be allowlisted and included in test_selectors.",
+                    code="selector_not_allowlisted",
+                )
+            if role not in VALID_SELECTOR_ROLES:
+                raise ScopeDeniedError(
+                    f"Unsupported selector role {role!r} for {sel!r}.",
+                    code="selector_role_conflict",
+                )
+            caller_roles[sel] = role
+
+    def _check_profile_conflict(sel: str, requested_role: str) -> None:
+        registered = profile_roles.get(sel)
+        if registered is None:
+            return
+        if sel in dual_pos_neg and requested_role in {"positive_control", "defense_check"}:
+            return
+        if registered != requested_role:
+            raise ScopeDeniedError(
+                f"Selector {sel!r} is registered with role {registered!r} and cannot be run as {requested_role!r}.",
+                code="selector_role_conflict",
+                details={"selector": sel, "registered_role": registered, "requested_role": requested_role},
+            )
+
+    for sel, role in caller_roles.items():
+        _check_profile_conflict(sel, role)
+    for role, group in (
+        ("positive_control", pos_list or ()),
+        ("defense_check", neg_list or ()),
+        ("anomaly_repro", anom_list or ()),
+        ("env_check", env_list or ()),
+    ):
+        for sel in group:
+            _check_profile_conflict(sel, role)
+            prev = caller_roles.get(sel)
+            if prev is not None and prev != role and sel not in dual_pos_neg:
+                raise ScopeDeniedError(
+                    f"Conflicting roles {prev!r} and {role!r} supplied for selector {sel!r}.",
+                    code="selector_role_conflict",
+                )
+            caller_roles.setdefault(sel, role)
+
+    effective_roles: dict[str, str] = {}
+    for sel in raw_selectors:
+        role = caller_roles.get(sel) or profile_roles.get(sel)
+        if role is not None:
+            effective_roles[sel] = role
+
+    pos_selectors = (
+        pos_list
+        if pos_list is not None
+        else tuple(
+            s
+            for s in raw_selectors
+            if (s in profile.positive_selectors or effective_roles.get(s) == "positive_control")
+            and effective_roles.get(s) not in {"anomaly_repro", "env_check"}
+        )
+    )
+    neg_selectors = (
+        neg_list
+        if neg_list is not None
+        else tuple(
+            s
+            for s in raw_selectors
+            if (s in profile.negative_selectors or effective_roles.get(s) == "defense_check")
+            and effective_roles.get(s) not in {"anomaly_repro", "env_check"}
+        )
+    )
+    anom_selectors = (
+        anom_list
+        if anom_list is not None
+        else tuple(
+            s
+            for s in raw_selectors
+            if s in profile.anomaly_repro_selectors or effective_roles.get(s) == "anomaly_repro"
+        )
+    )
+    env_selectors = (
+        env_list
+        if env_list is not None
+        else tuple(
+            s
+            for s in raw_selectors
+            if s in profile.env_check_selectors or effective_roles.get(s) == "env_check"
+        )
+    )
+    return pos_selectors, neg_selectors, anom_selectors, env_selectors, effective_roles
+
+
+def run_vdp_environment_check(
+    profile: VdpTargetProfile,
+    *,
+    runner: SubprocessRunner | None = None,
+    docker_bin: str | None = None,
+    git_bin: str | None = None,
+    overlay_bundle: str | None = None,
+    include_host_paths: bool = False,
+    clock: Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Run fast non-destructive preflight checks for profile, Docker image, checkout, and overlays."""
+    sub_runner = runner or SubprocessRunner()
+    now = (clock or (lambda: datetime.now(UTC)))()
+    checks: dict[str, str] = {
+        "profile": "ok",
+        "docker_image": "ok",
+        "checkout": "skipped",
+        "overlays": "ok",
+    }
+    issues: list[dict[str, str]] = []
+
+    if profile.expires_at is not None and now >= profile.expires_at:
+        checks["profile"] = "failed"
+        issues.append(
+            {
+                "component": "profile",
+                "code": "target_profile_expired",
+                "cause": f"Profile {profile.profile_name!r} expired at {profile.expires_at.isoformat()}.",
+                "remediation": (
+                    f"Re-register {profile.profile_name!r} with a future --expires-at using "
+                    "`ctf-mcp-admin register-vdp-profile`."
+                ),
+            }
+        )
+
+    # 1. Docker CLI + daemon + pinned image digest
+    resolved_docker = docker_bin.strip() if docker_bin is not None else (shutil.which("docker") or "")
+    if not resolved_docker:
+        checks["docker_image"] = "failed"
+        issues.append(
+            {
+                "component": "docker_image",
+                "code": "docker_cli_missing",
+                "cause": "Docker CLI is not available on PATH / configured host.",
+                "remediation": "Install/enable Docker CLI in the execution host environment.",
+            }
+        )
+    else:
+        inspect_res = sub_runner.run(
+            [resolved_docker, "image", "inspect", "--format", "{{.Id}}", profile.image_ref],
+            timeout_seconds=15.0,
+            max_output_bytes=4096,
+        )
+        if inspect_res.outcome != SubprocessOutcome.COMPLETED or inspect_res.returncode != 0:
+            err_msg = inspect_res.stderr.decode("utf-8", errors="replace").strip() or "docker image inspect failed"
+            checks["docker_image"] = "failed"
+            issues.append(
+                {
+                    "component": "docker_image",
+                    "code": "docker_image_unavailable",
+                    "cause": f"Could not inspect {profile.image_ref!r}: {err_msg[:200]}",
+                    "remediation": (
+                        f"Ensure Docker daemon is running and image {profile.image_ref!r} "
+                        f"({profile.expected_image_digest}) is built or loaded."
+                    ),
+                }
+            )
+        else:
+            observed_digest = inspect_res.stdout.decode("utf-8", errors="replace").strip().lower()
+            if observed_digest != profile.expected_image_digest:
+                checks["docker_image"] = "failed"
+                issues.append(
+                    {
+                        "component": "docker_image",
+                        "code": "image_digest_mismatch",
+                        "cause": (
+                            f"Image {profile.image_ref!r} digest {observed_digest!r} "
+                            f"mismatches pinned {profile.expected_image_digest!r}."
+                        ),
+                        "remediation": (
+                            "Rebuild/tag the pinned scanner image or register an explicit profile revision "
+                            "if the image update is intentional."
+                        ),
+                    }
+                )
+
+    # 2. Local checkout commit & clean tracked tree (when configured)
+    resolved_git = git_bin.strip() if git_bin is not None else (shutil.which("git") or "")
+    if profile.checkout_dir is not None:
+        if not profile.checkout_dir.exists():
+            checks["checkout"] = "failed"
+            loc = str(profile.checkout_dir) if include_host_paths else "<checkout_dir>"
+            issues.append(
+                {
+                    "component": "checkout",
+                    "code": "checkout_dir_missing",
+                    "cause": f"Configured checkout directory {loc} does not exist.",
+                    "remediation": (
+                        f"Clone/checkout commit {profile.expected_source_commit} at the pinned checkout_dir "
+                        "or clear --checkout-dir if checking out elsewhere."
+                    ),
+                }
+            )
+        elif not resolved_git:
+            checks["checkout"] = "failed"
+            issues.append(
+                {
+                    "component": "checkout",
+                    "code": "git_cli_missing",
+                    "cause": "Git CLI is unavailable to verify checkout commit.",
+                    "remediation": "Install `git` on the execution host.",
+                }
+            )
+        else:
+            head_res = sub_runner.run(
+                [resolved_git, "-C", str(profile.checkout_dir), "rev-parse", "HEAD"],
+                timeout_seconds=10.0,
+                max_output_bytes=4096,
+            )
+            actual_head = head_res.stdout.decode("utf-8", errors="replace").strip().lower()
+            if head_res.outcome != SubprocessOutcome.COMPLETED or head_res.returncode != 0:
+                checks["checkout"] = "failed"
+                issues.append(
+                    {
+                        "component": "checkout",
+                        "code": "checkout_git_error",
+                        "cause": "Unable to read HEAD commit from configured checkout_dir.",
+                        "remediation": "Verify checkout_dir is a valid Git worktree.",
+                    }
+                )
+            elif actual_head != profile.expected_source_commit:
+                checks["checkout"] = "failed"
+                issues.append(
+                    {
+                        "component": "checkout",
+                        "code": "source_commit_mismatch",
+                        "cause": (
+                            f"Checkout HEAD {actual_head!r} mismatches pinned {profile.expected_source_commit!r}."
+                        ),
+                        "remediation": f"Run `git checkout {profile.expected_source_commit}` in checkout_dir.",
+                    }
+                )
+            else:
+                dirty_res = sub_runner.run(
+                    [resolved_git, "-C", str(profile.checkout_dir), "status", "--porcelain", "--untracked-files=no"],
+                    timeout_seconds=10.0,
+                    max_output_bytes=8192,
+                )
+                if dirty_res.returncode == 0 and dirty_res.stdout.strip():
+                    checks["checkout"] = "failed"
+                    issues.append(
+                        {
+                            "component": "checkout",
+                            "code": "checkout_dirty",
+                            "cause": "Pinned source checkout has uncommitted tracked modifications.",
+                            "remediation": "Restore clean tracked tree (`git checkout -- .`) before product testing.",
+                        }
+                    )
+                else:
+                    checks["checkout"] = "ok"
+
+    # 3. Overlay bundle integrity checks
+    target_bundles = (
+        [overlay_bundle]
+        if overlay_bundle is not None
+        else sorted(profile.allowed_overlays.keys())
+    )
+    checked_overlays: dict[str, dict[str, Any]] = {}
+    for bname in target_bundles:
+        spec = profile.allowed_overlays.get(bname)
+        if spec is None:
+            checks["overlays"] = "failed"
+            checked_overlays[bname] = {"status": "failed", "code": "overlay_not_allowlisted"}
+            issues.append(
+                {
+                    "component": f"overlay:{bname}",
+                    "code": "overlay_not_allowlisted",
+                    "cause": f"Overlay bundle {bname!r} is not allowlisted in profile {profile.profile_name!r}.",
+                    "remediation": "Specify an allowlisted overlay_bundle or register this bundle via `ctf-mcp-admin register-vdp-profile`.",
+                }
+            )
+            continue
+        try:
+            real_dir, observed = _inspect_overlay_directory(spec, require_exists=True)
+        except ScopeDeniedError as exc:
+            checks["overlays"] = "failed"
+            err_detail = str(exc) if include_host_paths else redact_sensitive_text(str(exc))
+            checked_overlays[bname] = {"status": "failed", "code": exc.code, "details": exc.details}
+            issues.append(
+                {
+                    "component": f"overlay:{bname}",
+                    "code": exc.code,
+                    "cause": err_detail,
+                    "remediation": (
+                        f"Restore expected files for bundle {bname!r}, or run "
+                        f"`ctf-mcp-admin register-vdp-profile --profile-name {profile.profile_name} "
+                        f"--overlay-bundle {bname} --dry-run` if the update is intentional."
+                    ),
+                }
+            )
+            continue
+        if real_dir is None:
+            checks["overlays"] = "failed"
+            loc = str(spec.host_dir) if include_host_paths else "<overlay_host_dir>"
+            checked_overlays[bname] = {"status": "failed", "code": "overlay_missing"}
+            issues.append(
+                {
+                    "component": f"overlay:{bname}",
+                    "code": "overlay_missing",
+                    "cause": (
+                        f"Overlay bundle {bname!r} directory or pinned file(s) missing at {loc}."
+                    ),
+                    "remediation": (
+                        f"Ensure overlay files {sorted(spec.allowed_files.keys())} exist in {loc}."
+                    ),
+                }
+            )
+        else:
+            entry_info: dict[str, Any] = {
+                "status": "ok",
+                "file_hashes": observed,
+            }
+            if include_host_paths:
+                entry_info["host_dir"] = str(real_dir)
+            checked_overlays[bname] = entry_info
+
+    healthy = (
+        checks["profile"] == "ok"
+        and checks["docker_image"] == "ok"
+        and checks["checkout"] in {"ok", "skipped"}
+        and checks["overlays"] == "ok"
+    )
+    resolved_roles = profile.resolve_selector_roles()
+    return {
+        "schema": "vdp-environment-check/1",
+        "checked_at": now.isoformat(),
+        "profile_name": profile.profile_name,
+        "profile_revision": profile.profile_revision,
+        "expected_source_commit": profile.expected_source_commit,
+        "expected_image_digest": profile.expected_image_digest,
+        "healthy": healthy,
+        "checks": checks,
+        "checked_overlays": checked_overlays,
+        "active_tests": [
+            {"selector": s, "role": resolved_roles.get(s, "unassigned")}
+            for s in profile.allowed_test_selectors
+        ],
+        "issues": issues,
+    }
 
 
 class VdpProductTestAdapter(BaseAdapter):
@@ -1056,19 +1833,51 @@ class VdpProductTestAdapter(BaseAdapter):
             )
 
         profile_name = str(arguments.get("target_profile") or "").strip()
-        profile = self.get_profiles().get(profile_name)
+        all_profiles = self.get_profiles()
+        profile = all_profiles.get(profile_name)
         if profile is None:
+            hint_profile = next(
+                (p for p in all_profiles.values() if p.profile_revision == profile_name),
+                None,
+            )
+            if hint_profile is not None:
+                raise ScopeDeniedError(
+                    (
+                        f"target_profile {profile_name!r} is a profile_revision, not a profile_name. "
+                        f"Pass target_profile={hint_profile.profile_name!r} instead."
+                    ),
+                    code="target_profile_denied",
+                    details={
+                        "target_profile": profile_name,
+                        "hint_profile_name": hint_profile.profile_name,
+                        "profile_revision": hint_profile.profile_revision,
+                    },
+                )
             raise ScopeDeniedError(
                 f"target_profile {profile_name!r} is not allowlisted on this host.",
                 code="target_profile_denied",
             )
-        if profile.expires_at is not None and self._clock() >= profile.expires_at:
+        if operation != "check_environment" and profile.expires_at is not None and self._clock() >= profile.expires_at:
             raise ScopeDeniedError(
                 f"target_profile {profile_name!r} expired at {profile.expires_at.isoformat()}.",
                 code="target_profile_expired",
             )
 
-        if operation == "describe_profile":
+        if operation in {"describe_profile", "check_environment"}:
+            if operation == "check_environment":
+                net_arg = arguments.get("network_mode")
+                if net_arg is not None and str(net_arg).strip().lower() != "none":
+                    raise ScopeDeniedError(
+                        f"vdp.test requires network_mode='none', got {net_arg!r}.",
+                        code="network_mode_denied",
+                    )
+            overlay_arg = arguments.get("overlay_bundle")
+            overlay_bundle_opt = str(overlay_arg).strip() if overlay_arg else None
+            if overlay_bundle_opt is not None and overlay_bundle_opt not in profile.allowed_overlays:
+                raise ScopeDeniedError(
+                    f"overlay_bundle {overlay_bundle_opt!r} is not allowlisted for profile {profile_name!r}.",
+                    code="overlay_not_allowlisted",
+                )
             return _ValidatedPlan(
                 profile_name=profile.profile_name,
                 profile_revision=profile.profile_revision,
@@ -1079,7 +1888,11 @@ class VdpProductTestAdapter(BaseAdapter):
                 test_selectors=(),
                 positive_selectors=(),
                 negative_selectors=(),
-                overlay_bundle=None,
+                anomaly_repro_selectors=(),
+                env_check_selectors=(),
+                selector_roles={},
+                test_context={},
+                overlay_bundle=overlay_bundle_opt,
                 overlay_host_dir=None,
                 overlay_container_target=None,
                 overlay_file_hashes={},
@@ -1173,29 +1986,16 @@ class VdpProductTestAdapter(BaseAdapter):
                 overlay_container_target = overlay_spec.container_target
                 overlay_file_hashes = hashes
 
-        pos_arg = arguments.get("positive_selectors")
-        neg_arg = arguments.get("negative_selectors")
-        if pos_arg is not None:
-            pos_selectors = tuple(str(x).strip() for x in pos_arg)
-            for s in pos_selectors:
-                if s not in allowed_set or (raw_selectors and s not in raw_selectors):
-                    raise ScopeDeniedError(
-                        f"positive_selector {s!r} must be allowlisted and included in test_selectors.",
-                        code="selector_not_allowlisted",
-                    )
-        else:
-            pos_selectors = tuple(s for s in raw_selectors if s in set(profile.positive_selectors))
-
-        if neg_arg is not None:
-            neg_selectors = tuple(str(x).strip() for x in neg_arg)
-            for s in neg_selectors:
-                if s not in allowed_set or (raw_selectors and s not in raw_selectors):
-                    raise ScopeDeniedError(
-                        f"negative_selector {s!r} must be allowlisted and included in test_selectors.",
-                        code="selector_not_allowlisted",
-                    )
-        else:
-            neg_selectors = tuple(s for s in raw_selectors if s in set(profile.negative_selectors))
+        pos_selectors, neg_selectors, anom_selectors, env_selectors, effective_roles = (
+            _resolve_plan_selector_groups(
+                profile=profile,
+                raw_selectors=raw_selectors,
+                allowed_set=allowed_set,
+                arguments=arguments,
+            )
+        )
+        raw_ctx = arguments.get("test_context")
+        test_context = redact_structure(dict(raw_ctx)) if isinstance(raw_ctx, Mapping) else {}
 
         cpus = min(
             int(arguments.get("cpus") or profile.max_cpus),
@@ -1221,6 +2021,10 @@ class VdpProductTestAdapter(BaseAdapter):
             test_selectors=raw_selectors,
             positive_selectors=pos_selectors,
             negative_selectors=neg_selectors,
+            anomaly_repro_selectors=anom_selectors,
+            env_check_selectors=env_selectors,
+            selector_roles=effective_roles,
+            test_context=test_context,
             overlay_bundle=overlay_bundle,
             overlay_host_dir=overlay_host_dir,
             overlay_container_target=overlay_container_target,
@@ -1361,6 +2165,39 @@ class VdpProductTestAdapter(BaseAdapter):
             peak_rss_bytes=peak_rss_bytes,
         )
 
+    def _has_valid_baseline_evidence(
+        self,
+        *,
+        action: ActionRecord,
+        plan: _ValidatedPlan,
+    ) -> bool:
+        """Check whether ``baseline_evidence_ref`` points to a complete passing positive baseline."""
+        if not plan.baseline_evidence_ref or self._evidence_vault is None:
+            return False
+        read_fn = getattr(self._evidence_vault, "read_view_bytes", None)
+        if not callable(read_fn):
+            return False
+        try:
+            view, raw = read_fn(
+                run_id=action.run_id,
+                principal_id=action.principal_id,
+                evidence_id=plan.baseline_evidence_ref,
+            )
+            if not getattr(view, "capture_complete", False):
+                return False
+            parsed = json.loads(raw.decode("utf-8", errors="strict"))
+        except Exception:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        return (
+            parsed.get("schema") == "vdp-product-test-evidence/1"
+            and parsed.get("source_commit") == plan.source_commit
+            and parsed.get("image_digest") == plan.image_digest
+            and int(parsed.get("positive_passed") or 0) >= 1
+            and int(parsed.get("positive_failed") or 0) == 0
+        )
+
     def execute_with_capture(
         self,
         action: ActionRecord,
@@ -1394,7 +2231,7 @@ class VdpProductTestAdapter(BaseAdapter):
                 operation=action.operation,
                 arguments=action.sanitized_args,
                 policy=fallback_policy,
-                require_overlay_exists=True,
+                require_overlay_exists=(action.operation != "check_environment"),
             )
 
         profile = self.get_profiles()[plan.profile_name]
@@ -1424,6 +2261,70 @@ class VdpProductTestAdapter(BaseAdapter):
                     f"selectors={len(profile.allowed_test_selectors)} "
                     f"overlays={len(profile.allowed_overlays)}."
                 ),
+                evidence=evidence_refs,
+                truncated=not capture_complete,
+                next_cursor=None,
+                error=None,
+                usage=UsageMetrics(wall_ms=0, output_bytes=len(encoded)),
+                provenance=ProvenanceInfo(
+                    adapter_revision=self._descriptor.adapter_commit,
+                    scope_revision=action.scope_revision,
+                ),
+            )
+            norm_sub = self._build_synthetic_subprocess_result(
+                outcome=SubprocessOutcome.COMPLETED,
+                returncode=0,
+                data=encoded,
+                wall_ms=0,
+                capture_complete=capture_complete,
+                omission_reason=omission_reason,
+                cleanup_confirmed=True,
+            )
+            return AdapterExecutionOutcome(
+                envelope=envelope,
+                subprocess_result=norm_sub,
+                captured_bytes=encoded,
+                capture_complete=capture_complete,
+                omission_reason=omission_reason,
+                cleanup_confirmed=True,
+            )
+
+        if plan.operation == "check_environment":
+            env_report = run_vdp_environment_check(
+                profile,
+                runner=self._runner,
+                docker_bin=self._resolve_docker_bin(),
+                git_bin=shutil.which("git"),
+                overlay_bundle=plan.overlay_bundle,
+                include_host_paths=False,
+                clock=self._clock,
+            )
+            encoded, capture_complete, omission_reason, evidence_refs = self._store_json_evidence(
+                action=action,
+                payload=env_report,
+                max_bytes=max_bytes,
+                force_incomplete_reason=None,
+                source_hashes=(),
+            )
+            if env_report["healthy"]:
+                summary = (
+                    f"vdp.test:check_environment ok "
+                    f"(profile={profile.profile_name} revision={profile.profile_revision}, "
+                    f"overlays={len(env_report['checked_overlays'])}, "
+                    f"tests={len(env_report['active_tests'])})."
+                )
+            else:
+                issue_codes = ", ".join(item["code"] for item in env_report["issues"])
+                summary = (
+                    f"vdp.test:check_environment unhealthy "
+                    f"(profile={profile.profile_name}, issues=[{issue_codes}]). "
+                    "Inspect evidence for cause and remediation."
+                )
+            envelope = ResultEnvelope(
+                run_id=action.run_id,
+                action_id=action.action_id,
+                status=EnvelopeStatus.OK,
+                summary=summary,
                 evidence=evidence_refs,
                 truncated=not capture_complete,
                 next_cursor=None,
@@ -1611,14 +2512,17 @@ class VdpProductTestAdapter(BaseAdapter):
 
         finished_at = self._clock().isoformat()
         combined_raw = (sub_res.stdout + sub_res.stderr).decode("utf-8", errors="replace")
+        combined_redacted = redact_sensitive_text(combined_raw)
         overall_cleanup = bool(sub_res.cleanup_confirmed and container_cleanup_confirmed)
 
         parsed = _parse_pytest_output(
-            combined_raw,
+            combined_redacted,
             requested_selectors=plan.test_selectors,
             operation=plan.operation,
         )
-        verdict, verdict_reason, pos_passed, pos_failed, neg_passed, neg_failed = _classify_verdict(
+        marker_data = _extract_evidence_markers(combined_redacted) if plan.operation == "run_pytest" else {}
+        has_valid_baseline_ref = self._has_valid_baseline_evidence(action=action, plan=plan)
+        verdict_res = _classify_verdict(
             operation=plan.operation,
             outcome=sub_res.outcome,
             exit_code=sub_res.returncode,
@@ -1626,6 +2530,17 @@ class VdpProductTestAdapter(BaseAdapter):
             parsed=parsed,
             positive_selectors=plan.positive_selectors,
             negative_selectors=plan.negative_selectors,
+            anomaly_repro_selectors=plan.anomaly_repro_selectors,
+            env_check_selectors=plan.env_check_selectors,
+            has_valid_baseline_ref=has_valid_baseline_ref,
+        )
+        verdict = verdict_res.verdict
+        verdict_reason = verdict_res.verdict_reason
+        execution_context, conclusion_status = _build_execution_context_and_conclusion(
+            plan=plan,
+            verdict_res=verdict_res,
+            parsed=parsed,
+            marker_data=marker_data,
         )
 
         raw_truncated = not sub_res.capture_complete or sub_res.outcome == SubprocessOutcome.OUTPUT_LIMIT_EXCEEDED
@@ -1654,10 +2569,17 @@ class VdpProductTestAdapter(BaseAdapter):
             "error_count": parsed["error_count"],
             "positive_selectors": list(plan.positive_selectors),
             "negative_selectors": list(plan.negative_selectors),
-            "positive_passed": pos_passed,
-            "positive_failed": pos_failed,
-            "negative_passed": neg_passed,
-            "negative_failed": neg_failed,
+            "anomaly_repro_selectors": list(plan.anomaly_repro_selectors),
+            "env_check_selectors": list(plan.env_check_selectors),
+            "selector_roles": dict(plan.selector_roles),
+            "positive_passed": verdict_res.positive_passed,
+            "positive_failed": verdict_res.positive_failed,
+            "negative_passed": verdict_res.negative_passed,
+            "negative_failed": verdict_res.negative_failed,
+            "anomaly_repro_passed": verdict_res.anomaly_repro_passed,
+            "anomaly_repro_failed": verdict_res.anomaly_repro_failed,
+            "env_check_passed": verdict_res.env_check_passed,
+            "env_check_failed": verdict_res.env_check_failed,
             "selector_outcomes": parsed["selector_outcomes"],
             "overlay_bundle": plan.overlay_bundle,
             "overlay_file_hashes": overlay_file_hashes,
@@ -1666,10 +2588,12 @@ class VdpProductTestAdapter(BaseAdapter):
             "async_behavior_unverified": True,
             "verdict": verdict,
             "verdict_reason": verdict_reason,
+            "execution_context": execution_context,
+            "conclusion_status": conclusion_status,
             "container_cleanup_confirmed": container_cleanup_confirmed,
             "process_cleanup_confirmed": sub_res.cleanup_confirmed,
             "log_truncated": raw_truncated,
-            "log_excerpt": combined_raw,
+            "log_excerpt": combined_redacted,
         }
 
         force_incomplete = (
@@ -1728,8 +2652,9 @@ class VdpProductTestAdapter(BaseAdapter):
             )
             truncated = not capture_complete
         else:
-            # Structured verdict ("smoke_passed", "hypothesis_falsified", "deviation_reproduced",
-            # "baseline_failed", "skipped", "not_executed", "baseline_passed") is preserved in OK envelope.
+            # Structured verdict ("smoke_passed", "hypothesis_falsified", "anomaly_observed",
+            # "inconclusive", "baseline_failed", "skipped", "not_executed", "baseline_passed",
+            # "env_check_passed") is preserved in OK envelope.
             env_status = EnvelopeStatus.OK
             err = None
             truncated = not capture_complete
@@ -1738,7 +2663,8 @@ class VdpProductTestAdapter(BaseAdapter):
             f"vdp.test:{action.operation} verdict={verdict} "
             f"(exit={sub_res.returncode}, collected={parsed['collected_count']}, "
             f"passed={parsed['passed_count']}, failed={parsed['failed_count']}, "
-            f"skipped={parsed['skipped_count']}, cleanup={overall_cleanup})."
+            f"skipped={parsed['skipped_count']}, cleanup={overall_cleanup}). "
+            f"{conclusion_status['summary_ja']}"
         )
         envelope = ResultEnvelope(
             run_id=action.run_id,
@@ -1796,6 +2722,13 @@ class VdpProductTestAdapter(BaseAdapter):
         error_message: str,
         sub_outcome: SubprocessOutcome,
     ) -> AdapterExecutionOutcome:
+        verdict_res = _VerdictResult(verdict=verdict, verdict_reason=verdict_reason)
+        execution_context, conclusion_status = _build_execution_context_and_conclusion(
+            plan=plan,
+            verdict_res=verdict_res,
+            parsed={"collected_count": 0, "passed_count": 0, "failed_count": 0, "skipped_count": 0, "error_count": 0},
+            marker_data={},
+        )
         payload: dict[str, Any] = {
             "schema": "vdp-product-test-evidence/1",
             "profile_name": plan.profile_name,
@@ -1821,10 +2754,17 @@ class VdpProductTestAdapter(BaseAdapter):
             "error_count": 0,
             "positive_selectors": list(plan.positive_selectors),
             "negative_selectors": list(plan.negative_selectors),
+            "anomaly_repro_selectors": list(plan.anomaly_repro_selectors),
+            "env_check_selectors": list(plan.env_check_selectors),
+            "selector_roles": dict(plan.selector_roles),
             "positive_passed": 0,
             "positive_failed": 0,
             "negative_passed": 0,
             "negative_failed": 0,
+            "anomaly_repro_passed": 0,
+            "anomaly_repro_failed": 0,
+            "env_check_passed": 0,
+            "env_check_failed": 0,
             "selector_outcomes": {},
             "overlay_bundle": plan.overlay_bundle,
             "overlay_file_hashes": plan.overlay_file_hashes,
@@ -1833,10 +2773,12 @@ class VdpProductTestAdapter(BaseAdapter):
             "async_behavior_unverified": True,
             "verdict": verdict,
             "verdict_reason": verdict_reason,
+            "execution_context": execution_context,
+            "conclusion_status": conclusion_status,
             "container_cleanup_confirmed": True,
             "process_cleanup_confirmed": True,
             "log_truncated": False,
-            "log_excerpt": error_message,
+            "log_excerpt": redact_sensitive_text(error_message),
         }
         encoded, capture_complete, omission_reason, evidence_refs = self._store_json_evidence(
             action=action,
@@ -1884,6 +2826,7 @@ __all__ = [
     "DEFAULT_VDP_TEST_MAX_MEMORY_MB",
     "DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES",
     "DEFAULT_VDP_TEST_TIMEOUT_SECONDS",
+    "VALID_SELECTOR_ROLES",
     "VDP_PROFILES_RELPATH",
     "VDP_PRODUCT_TEST_ADAPTER_COMMIT",
     "VDP_PRODUCT_TEST_ADAPTER_ID",
@@ -1905,6 +2848,7 @@ __all__ = [
     "build_default_weblate_profile",
     "create_vdp_product_test_descriptor",
     "load_registered_vdp_profiles",
+    "run_vdp_environment_check",
     "save_registered_vdp_profile",
     "validate_vdp_profile_registration",
     "validate_vdp_selector_format",

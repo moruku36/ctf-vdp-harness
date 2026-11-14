@@ -782,10 +782,17 @@ def test_vdp_product_test_verdicts_and_verifier_gates(tmp_path: Path) -> None:
     assert ver_ok.status == VerificationStatus.PASSED
     assert "outcome_state:hypothesis_falsified" in ver_ok.checks_performed
 
-    # 5. Deviation reproduced + verifier PASSED
+    # 5. Failed defense_check test must stay inconclusive (never auto-promote to reproduced) + verifier INCONCLUSIVE
     env_repro = _run_case("r-repro", "deviation_reproduced")
-    assert "deviation_reproduced" in env_repro.summary
+    assert "inconclusive" in env_repro.summary
     repro_eid = env_repro.evidence[0].id
+    _, repro_raw = controller.evidence_vault.read_view_bytes(
+        run_id="run-verdicts",
+        principal_id=alice.principal_id,
+        evidence_id=repro_eid,
+    )
+    repro_payload = json.loads(repro_raw.decode("utf-8"))
+    assert repro_payload["verdict"] == "inconclusive"
     ver_repro = controller.verify_run(
         principal=alice,
         run_id="run-verdicts",
@@ -793,8 +800,9 @@ def test_vdp_product_test_verdicts_and_verifier_gates(tmp_path: Path) -> None:
         evidence_ids=(smoke_eid, repro_eid),
         claim="deviation_reproduced",
     )
-    assert ver_repro.status == VerificationStatus.PASSED
-    assert "outcome_state:deviation_reproduced" in ver_repro.checks_performed
+    assert ver_repro.status == VerificationStatus.INCONCLUSIVE
+    assert "outcome_state:inconclusive" in ver_repro.checks_performed
+    assert "assertion_failure_requires_inspection" in ver_repro.checks_performed
 
     # 6. Non-product-test JSON evidence (simulating net.probe HTTP 200) MUST NOT pass vdp.product_test
     probe_manifest = controller.evidence_vault.store_raw(
@@ -1475,3 +1483,552 @@ def test_p8_w02_overlay_blocked_env_and_provenance_enforcement(tmp_path: Path) -
     )
     assert ver_spoof.status == VerificationStatus.FAILED
     assert "execution_provenance:unverified_external" in ver_spoof.checks_performed
+
+
+def _init_git_repo(repo_dir: Path) -> str:
+    """Create a clean git repository with one commit and return its full SHA."""
+    import subprocess
+
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "README.txt").write_text("fixture repo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_dir), "init"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.invalid"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Harness Test"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo_dir), "add", "README.txt"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo_dir), "commit", "-m", "initial"], check=True, capture_output=True, text=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return head.stdout.strip().lower()
+
+
+def _write_env_and_role_fake_docker(tmp_path: Path, *, image_digest: str) -> tuple[Path, Path]:
+    """Create an executable fake docker CLI driven by a sibling state JSON file."""
+    state_path = tmp_path / "fake_docker_roles.state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version_fail": False,
+                "inspect_fail": False,
+                "image_digest": image_digest,
+                "mode": "pass_selected",
+                "marker_json": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    script_py = tmp_path / "fake_docker_roles.py"
+    script_py.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+STATE_PATH = Path({str(state_path)!r})
+state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+args = sys.argv[1:]
+
+if args == ["--version"]:
+    if state.get("version_fail"):
+        sys.stderr.write("docker unavailable\\n")
+        sys.exit(1)
+    sys.stdout.write("Docker version 27.1.0, build fake\\n")
+    sys.exit(0)
+
+if args[:2] == ["image", "inspect"]:
+    if state.get("inspect_fail"):
+        sys.stderr.write("Error: No such image\\n")
+        sys.exit(1)
+    sys.stdout.write(str(state.get("image_digest", "")) + "\\n")
+    sys.exit(0)
+
+if args[:1] == ["ps"]:
+    sys.exit(0)
+
+if args[:1] == ["rm"]:
+    sys.exit(0)
+
+if args[:1] == ["run"]:
+    mode = state.get("mode", "pass_selected")
+    if "-rA" in args:
+        selectors = args[args.index("-rA") + 1 :]
+    else:
+        selectors = ["smoke::test_smoke"]
+    if mode == "smoke_pass":
+        sys.stdout.write("collected 1 item\\nPASSED smoke::test_smoke\\n==== 1 passed in 0.10s ====\\n")
+        sys.exit(0)
+    if mode == "pass_selected":
+        sys.stdout.write(f"collected {{len(selectors)}} items\\n")
+        for sel in selectors:
+            sys.stdout.write(f"PASSED {{sel}}\\n")
+        marker = state.get("marker_json") or ""
+        if marker:
+            sys.stdout.write(f"VDP_EVIDENCE_MARKER:{{marker}}\\n")
+        sys.stdout.write(f"==== {{len(selectors)}} passed in 0.25s ====\\n")
+        sys.exit(0)
+    if mode == "fail_first_selected":
+        sys.stdout.write(f"collected {{len(selectors)}} items\\n")
+        if selectors:
+            sys.stdout.write(f"FAILED {{selectors[0]}}\\n")
+            for sel in selectors[1:]:
+                sys.stdout.write(f"PASSED {{sel}}\\n")
+        sys.stdout.write("==== 1 failed in 0.20s ====\\n")
+        sys.exit(1)
+
+sys.stderr.write(f"Unexpected fake docker args: {{args}}\\n")
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        cmd_path = tmp_path / "fake_docker_roles.cmd"
+        cmd_path.write_text(f'@echo off\r\n"{sys.executable}" "{script_py}" %*\r\n', encoding="utf-8")
+        return cmd_path, state_path
+    script_py.chmod(0o755)
+    return script_py, state_path
+
+
+def _setup_custom_vdp_harness(
+    tmp_path: Path,
+    *,
+    fake_docker: Path,
+    profile: VdpTargetProfile,
+    run_id: str = "run-vdp-roles",
+) -> tuple[Any, PrincipalContext, Path, Path]:
+    from ctf_mcp.adapters.vdp_product_test import save_registered_vdp_profile
+
+    db_path = tmp_path / "state" / "harness.db"
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir(parents=True, exist_ok=True)
+    save_registered_vdp_profile(vault_root, profile)
+
+    storage = Storage(db_path)
+    storage.initialize()
+    controller = create_default_controller(
+        storage=storage,
+        vault_root=vault_root,
+        cursor_hmac_key=secrets.token_bytes(32),
+        allow_dynamic=True,
+        include_vdp_product_test=False,
+        initialize=True,
+    )
+    vdp_adapter = VdpProductTestAdapter(
+        descriptor=create_vdp_product_test_descriptor(
+            enabled=True,
+            limits=CapabilityLimits(timeout_seconds=60, max_output_bytes=128_000, max_decode_bytes=65_536),
+        ),
+        evidence_vault=controller.evidence_vault,
+        runner=SubprocessRunner(),
+        profiles={profile.profile_name: profile},
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+    )
+    controller.register_adapter(vdp_adapter, tool_group="vdp.test", is_heavy_job=True)
+
+    alice = _make_principal("alice")
+    scope = _make_scope(mode=RunMode.VDP, task_id="task-vdp-roles")
+    controller.create_run(
+        principal=alice,
+        task_id="task-vdp-roles",
+        mode=RunMode.VDP,
+        scope=scope,
+        budget=BudgetSpec(run_budget_seconds=600, action_timeout_seconds=120, max_tool_calls=50, heavy_job_concurrency=1),
+        run_id=run_id,
+    )
+    return controller, alice, db_path, vault_root
+
+
+def test_selector_roles_anomaly_observed_and_evidence_redaction(tmp_path: Path) -> None:
+    """anomaly_repro PASS yields anomaly_observed (never hypothesis_falsified) with redacted context and limitations."""
+    from ctf_mcp.adapters.vdp_product_test import VdpOverlaySpec, VdpTargetProfile, validate_vdp_profile_registration
+
+    checkout_dir = tmp_path / "checkout"
+    source_commit = _init_git_repo(checkout_dir)
+    overlay_dir = tmp_path / "overlay-custom"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    test_file = overlay_dir / "test_custom.py"
+    test_file.write_text("def test_pos(): pass\ndef test_anomaly(): pass\ndef test_env(): pass\n", encoding="utf-8")
+    test_sha = sha256_bytes(test_file.read_bytes())
+
+    fake_digest = "sha256:" + ("a" * 64)
+    pos_sel = "/src/vdp-test-overlay/test_custom.py::test_pos"
+    anomaly_sel = "/src/vdp-test-overlay/test_custom.py::test_anomaly"
+    env_sel = "/src/vdp-test-overlay/test_custom.py::test_env"
+
+    profile = validate_vdp_profile_registration(
+        VdpTargetProfile(
+            profile_name="custom-app",
+            profile_revision="custom-rev-1",
+            image_ref="custom-app:test",
+            expected_image_digest=fake_digest,
+            expected_source_commit=source_commit,
+            checkout_dir=checkout_dir,
+            allowed_test_selectors=(pos_sel, anomaly_sel, env_sel),
+            positive_selectors=(pos_sel,),
+            anomaly_repro_selectors=(anomaly_sel,),
+            env_check_selectors=(env_sel,),
+            allowed_overlays={
+                "bundle-custom": VdpOverlaySpec(
+                    bundle_name="bundle-custom",
+                    host_dir=overlay_dir,
+                    container_target="/src/vdp-test-overlay",
+                    allowed_files={"test_custom.py": test_sha},
+                )
+            },
+        )
+    )
+    fake_docker, state_path = _write_env_and_role_fake_docker(tmp_path, image_digest=fake_digest)
+    ctrl, alice, _, _ = _setup_custom_vdp_harness(tmp_path, fake_docker=fake_docker, profile=profile)
+
+    def _set_state(**updates: Any) -> None:
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        current.update(updates)
+        state_path.write_text(json.dumps(current), encoding="utf-8")
+
+    # 1. Smoke baseline
+    _set_state(mode="smoke_pass", marker_json="")
+    smoke_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-vdp-roles",
+            request_id="req-smoke",
+            expected_revision=ctrl.runs.get_run_snapshot("run-vdp-roles").revision,
+            capability_name="vdp.test",
+            operation="run_smoke",
+            arguments={
+                "target_profile": "custom-app",
+                "source_commit": source_commit,
+                "image_digest": fake_digest,
+            },
+        ),
+    )
+    assert smoke_env.status == EnvelopeStatus.OK
+    smoke_eid = smoke_env.evidence[0].id
+
+    # 2. anomaly_repro PASS + VDP_EVIDENCE_MARKER with sensitive token -> anomaly_observed, redacted, limitations populated
+    marker_payload = {
+        "sender_auth_state": "unauthenticated_vs_credentialed",
+        "config_creation_path": "ui_api_clean",
+        "target_component": "component/demo-target",
+        "stage_verification": {
+            "update_scheduled": True,
+            "sync_completed": False,
+            "data_changed": False,
+        },
+        "auth_header": "Bearer super-secret-should-redact",
+    }
+    _set_state(mode="pass_selected", marker_json=json.dumps(marker_payload))
+    anomaly_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-vdp-roles",
+            request_id="req-anomaly",
+            expected_revision=ctrl.runs.get_run_snapshot("run-vdp-roles").revision,
+            capability_name="vdp.test",
+            operation="run_pytest",
+            arguments={
+                "target_profile": "custom-app",
+                "source_commit": source_commit,
+                "image_digest": fake_digest,
+                "test_selectors": [pos_sel, anomaly_sel],
+                "positive_selectors": [pos_sel],
+                "anomaly_repro_selectors": [anomaly_sel],
+                "overlay_bundle": "bundle-custom",
+            },
+        ),
+    )
+    assert anomaly_env.status == EnvelopeStatus.OK
+    anomaly_eid = anomaly_env.evidence[0].id
+    _, anomaly_raw = ctrl.evidence_vault.read_view_bytes(
+        run_id="run-vdp-roles",
+        principal_id=alice.principal_id,
+        evidence_id=anomaly_eid,
+    )
+    anomaly_data = json.loads(anomaly_raw.decode("utf-8"))
+    assert anomaly_data["verdict"] == "anomaly_observed"
+    assert "anomaly_observed" in anomaly_env.summary
+    assert "super-secret-should-redact" not in json.dumps(anomaly_data)
+    assert anomaly_data["execution_context"]["sender_auth_state"] == "unauthenticated_vs_credentialed"
+    assert anomaly_data["execution_context"]["stage_verification"]["update_scheduled"] is True
+    assert anomaly_data["execution_context"]["stage_verification"]["sync_completed"] is False
+    assert anomaly_data["conclusion_status"]["unverified_conditions"]
+
+    # Falsified claim MUST fail when anomaly_repro observed an anomaly
+    ver_wrong_claim = ctrl.verify_run(
+        principal=alice,
+        run_id="run-vdp-roles",
+        verifier_id="vdp.product_test",
+        evidence_ids=(smoke_eid, anomaly_eid),
+        claim="hypothesis_falsified",
+    )
+    assert ver_wrong_claim.status == VerificationStatus.FAILED
+
+    ver_anomaly = ctrl.verify_run(
+        principal=alice,
+        run_id="run-vdp-roles",
+        verifier_id="vdp.product_test",
+        evidence_ids=(smoke_eid, anomaly_eid),
+        claim="anomaly_observed",
+    )
+    assert ver_anomaly.status == VerificationStatus.PASSED
+    assert ver_anomaly.limitations
+
+    # 3. Overriding anomaly_repro selector via negative_selectors is denied with selector_role_conflict
+    conflict_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-vdp-roles",
+            request_id="req-role-conflict",
+            expected_revision=ctrl.runs.get_run_snapshot("run-vdp-roles").revision,
+            capability_name="vdp.test",
+            operation="run_pytest",
+            arguments={
+                "target_profile": "custom-app",
+                "source_commit": source_commit,
+                "image_digest": fake_digest,
+                "test_selectors": [pos_sel, anomaly_sel],
+                "positive_selectors": [pos_sel],
+                "negative_selectors": [anomaly_sel],
+                "overlay_bundle": "bundle-custom",
+            },
+        ),
+    )
+    assert conflict_env.status == EnvelopeStatus.DENIED
+    assert conflict_env.error is not None
+    assert conflict_env.error.code == "selector_role_conflict"
+
+    # 4. env_check selector PASS -> env_check_passed, verifier INCONCLUSIVE
+    _set_state(mode="pass_selected", marker_json="")
+    env_check_res = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-vdp-roles",
+            request_id="req-env-sel",
+            expected_revision=ctrl.runs.get_run_snapshot("run-vdp-roles").revision,
+            capability_name="vdp.test",
+            operation="run_pytest",
+            arguments={
+                "target_profile": "custom-app",
+                "source_commit": source_commit,
+                "image_digest": fake_digest,
+                "test_selectors": [env_sel],
+                "env_check_selectors": [env_sel],
+                "overlay_bundle": "bundle-custom",
+            },
+        ),
+    )
+    assert env_check_res.status == EnvelopeStatus.OK
+    env_check_eid = env_check_res.evidence[0].id
+    _, env_check_raw = ctrl.evidence_vault.read_view_bytes(
+        run_id="run-vdp-roles",
+        principal_id=alice.principal_id,
+        evidence_id=env_check_eid,
+    )
+    env_check_data = json.loads(env_check_raw.decode("utf-8"))
+    assert env_check_data["verdict"] == "env_check_passed"
+    ver_env = ctrl.verify_run(
+        principal=alice,
+        run_id="run-vdp-roles",
+        verifier_id="vdp.product_test",
+        evidence_ids=(smoke_eid, env_check_eid),
+    )
+    assert ver_env.status == VerificationStatus.INCONCLUSIVE
+
+
+def test_admin_profile_dry_run_tamper_and_check_environment(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """register-vdp-profile --dry-run, tamper rejection, describe_run active_tests, and check-vdp-env work end-to-end."""
+    from ctf_mcp.adapters.vdp_product_test import VdpTargetProfile, validate_vdp_profile_registration
+
+    checkout_dir = tmp_path / "checkout-cli"
+    source_commit = _init_git_repo(checkout_dir)
+    overlay_dir = tmp_path / "overlay-cli"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    test_file = overlay_dir / "test_registered.py"
+    test_file.write_text("def test_pos(): pass\ndef test_def(): pass\n", encoding="utf-8")
+    fake_digest = "sha256:" + ("b" * 64)
+
+    base_profile = validate_vdp_profile_registration(
+        VdpTargetProfile(
+            profile_name="cli-app",
+            profile_revision="cli-r1",
+            image_ref="cli-app:test",
+            expected_image_digest=fake_digest,
+            expected_source_commit=source_commit,
+            checkout_dir=checkout_dir,
+            allowed_test_selectors=("/src/vdp-test-overlay/test_registered.py::test_pos",),
+            positive_selectors=("/src/vdp-test-overlay/test_registered.py::test_pos",),
+        )
+    )
+    fake_docker, _ = _write_env_and_role_fake_docker(tmp_path, image_digest=fake_digest)
+    ctrl, alice, db_path, vault_root = _setup_custom_vdp_harness(
+        tmp_path, fake_docker=fake_docker, profile=base_profile, run_id="run-cli-env"
+    )
+    monkeypatch.setenv("CTF_MCP_CURSOR_HMAC_KEY", "test-cursor-key-1234")
+    capsys.readouterr()
+
+    # 1. Dry-run adding defense selector + overlay file with =auto must NOT mutate profiles.json
+    profiles_json_path = vault_root / "_vdp" / "profiles.json"
+    before_bytes = profiles_json_path.read_bytes()
+    new_sel = "/src/vdp-test-overlay/test_registered.py::test_def"
+    rc_dry = admin_main(
+        [
+            "register-vdp-profile",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--profile-name",
+            "cli-app",
+            "--defense-selector",
+            new_sel,
+            "--overlay-bundle",
+            "cli-overlay",
+            "--overlay-host-dir",
+            str(overlay_dir),
+            "--overlay-file",
+            "test_registered.py=auto",
+            "--dry-run",
+        ]
+    )
+    assert rc_dry == 0
+    dry_out = json.loads(capsys.readouterr().out)
+    assert dry_out["status"] == "dry_run_validated"
+    assert dry_out["dry_run"] is True
+    assert dry_out["previous_revision"] == "cli-r1"
+    assert dry_out["profile_revision"] == "cli-r2"
+    assert dry_out["overlay_verified_on_disk"] == {"cli-overlay": True}
+    assert {"selector": new_sel, "role": "defense_check"} in dry_out["diff"]["added_selectors"]
+    assert profiles_json_path.read_bytes() == before_bytes
+
+    # 2. Live registration persists revision bump and exposes active_tests in run.describe
+    rc_reg = admin_main(
+        [
+            "register-vdp-profile",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--profile-name",
+            "cli-app",
+            "--defense-selector",
+            new_sel,
+            "--overlay-bundle",
+            "cli-overlay",
+            "--overlay-host-dir",
+            str(overlay_dir),
+            "--overlay-file",
+            "test_registered.py=auto",
+        ]
+    )
+    assert rc_reg == 0
+    reg_out = json.loads(capsys.readouterr().out)
+    assert reg_out["status"] == "registered"
+    assert reg_out["profile_revision"] == "cli-r2"
+
+    desc = ctrl.describe_run(principal=alice, run_id="run-cli-env")
+    profiles_by_name = {item["profile_name"]: item for item in desc["vdp_profiles"]}
+    active_roles = {item["selector"]: item["role"] for item in profiles_by_name["cli-app"]["active_tests"]}
+    assert active_roles[new_sel] == "defense_check"
+
+    # 3. Passing profile_revision instead of profile_name yields a helpful hint
+    hint_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-cli-env",
+            request_id="req-rev-hint",
+            expected_revision=ctrl.runs.get_run_snapshot("run-cli-env").revision,
+            capability_name="vdp.test",
+            operation="check_environment",
+            arguments={"target_profile": "cli-r2"},
+        ),
+    )
+    assert hint_env.status == EnvelopeStatus.DENIED
+    assert hint_env.error is not None
+    assert "cli-app" in hint_env.error.message
+
+    # 4. Healthy check_environment via vdp.test + check-vdp-env CLI
+    chk_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-cli-env",
+            request_id="req-check-ok",
+            expected_revision=ctrl.runs.get_run_snapshot("run-cli-env").revision,
+            capability_name="vdp.test",
+            operation="check_environment",
+            arguments={"target_profile": "cli-app", "overlay_bundle": "cli-overlay"},
+        ),
+    )
+    assert chk_env.status == EnvelopeStatus.OK
+    _, chk_raw = ctrl.evidence_vault.read_view_bytes(
+        run_id="run-cli-env",
+        principal_id=alice.principal_id,
+        evidence_id=chk_env.evidence[0].id,
+    )
+    chk_data = json.loads(chk_raw.decode("utf-8"))
+    assert chk_data["healthy"] is True
+    assert chk_data["issues"] == []
+
+    rc_chk_ok = admin_main(
+        [
+            "check-vdp-env",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--profile-name",
+            "cli-app",
+            "--docker-bin",
+            str(fake_docker),
+        ]
+    )
+    assert rc_chk_ok == 0
+    assert json.loads(capsys.readouterr().out)["healthy"] is True
+
+    # 5. Tamper overlay file -> check-vdp-env fails with remediation AND run_pytest is denied pre-launch
+    test_file.write_text("def test_tampered(): assert False\n", encoding="utf-8")
+    rc_chk_bad = admin_main(
+        [
+            "check-vdp-env",
+            "--db-path",
+            str(db_path),
+            "--vault-root",
+            str(vault_root),
+            "--profile-name",
+            "cli-app",
+            "--docker-bin",
+            str(fake_docker),
+        ]
+    )
+    assert rc_chk_bad == 1
+    bad_report = json.loads(capsys.readouterr().out)
+    assert bad_report["healthy"] is False
+    assert any(
+        issue["code"] == "overlay_integrity_failed" and "SHA-256 mismatch" in issue["cause"]
+        for issue in bad_report["issues"]
+    )
+
+    tamper_env = ctrl.execute_action(
+        principal=alice,
+        request=ActionRequest(
+            run_id="run-cli-env",
+            request_id="req-tamper-deny",
+            expected_revision=ctrl.runs.get_run_snapshot("run-cli-env").revision,
+            capability_name="vdp.test",
+            operation="run_pytest",
+            arguments={
+                "target_profile": "cli-app",
+                "source_commit": source_commit,
+                "image_digest": fake_digest,
+                "test_selectors": [new_sel],
+                "overlay_bundle": "cli-overlay",
+            },
+        ),
+    )
+    assert tamper_env.status == EnvelopeStatus.DENIED
+    assert tamper_env.error is not None
+

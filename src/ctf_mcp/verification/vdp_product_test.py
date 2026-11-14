@@ -3,9 +3,9 @@
 Enforces strict separation between:
 - Local HTTP 200 responses (`net.probe`, rejected as product smoke/repro),
 - Incomplete/uncleaned runs (`capture_complete=False`, `cleanup_confirmed=False`),
-- Non-conclusive executions (`not_executed`, `skipped`, `timeout`, `environment_failure`),
-- Broken positive baselines (`baseline_failed` -> never accepted as defense success),
-- Conclusive falsifications (`hypothesis_falsified`) and reproductions (`deviation_reproduced`).
+- Non-conclusive executions (`not_executed`, `skipped`, `timeout`, `environment_failure`, `inconclusive`, `env_check_passed`),
+- Broken positive baselines (`baseline_failed` -> never accepted as defense success or anomaly repro),
+- Conclusive falsifications (`hypothesis_falsified`) and observed anomalies (`anomaly_observed` / `deviation_reproduced`).
 """
 
 from __future__ import annotations
@@ -279,6 +279,14 @@ class VdpProductTestVerifier:
         pytest_payloads = [p for p in payloads if p.get("operation") == "run_pytest"]
         verdicts = [str(p.get("verdict") or "") for p in payloads]
 
+        for p in payloads:
+            conc = p.get("conclusion_status")
+            if isinstance(conc, dict):
+                for cond in conc.get("unverified_conditions") or ():
+                    cond_str = str(cond).strip()
+                    if cond_str and cond_str not in limitations:
+                        limitations.append(cond_str)
+
         if "timeout" in verdicts:
             checks.append("outcome_state:timeout")
             limitations.append(
@@ -314,12 +322,24 @@ class VdpProductTestVerifier:
             )
 
         # Non-conclusive states remain strictly separated from PASSED and from each other.
-        for bad_state in ("environment_failure", "skipped", "not_executed"):
+        for bad_state in (
+            "environment_failure",
+            "skipped",
+            "not_executed",
+            "inconclusive",
+            "env_check_passed",
+        ):
             if bad_state in verdicts:
                 checks.append(f"outcome_state:{bad_state}")
-                limitations.append(
-                    f"Run includes non-conclusive test outcome {bad_state!r}."
-                )
+                if bad_state == "inconclusive" and any(int(p.get("failed_count") or 0) > 0 for p in payloads):
+                    checks.append("assertion_failure_requires_inspection")
+                    limitations.append(
+                        "Assertion or test setup failure requires root-cause inspection; not counted as vulnerability proof."
+                    )
+                else:
+                    limitations.append(
+                        f"Run includes non-conclusive test outcome {bad_state!r}."
+                    )
                 return VerificationRecord(
                     verification_id=f"ver-{uuid.uuid4().hex}",
                     run_id=run_id,
@@ -335,7 +355,7 @@ class VdpProductTestVerifier:
         if "baseline_failed" in verdicts:
             checks.append("outcome_state:baseline_failed")
             limitations.append(
-                "Positive control did not pass; negative no-change cannot be claimed as defense success."
+                "Positive control did not pass; negative no-change or anomaly cannot be concluded."
             )
             return VerificationRecord(
                 verification_id=f"ver-{uuid.uuid4().hex}",
@@ -426,6 +446,10 @@ class VdpProductTestVerifier:
         total_pos_failed = sum(int(p.get("positive_failed") or 0) for p in pytest_payloads)
         total_neg_passed = sum(int(p.get("negative_passed") or 0) for p in pytest_payloads)
         total_neg_failed = sum(int(p.get("negative_failed") or 0) for p in pytest_payloads)
+        total_anom_passed = sum(int(p.get("anomaly_repro_passed") or 0) for p in pytest_payloads)
+        total_anom_failed = sum(int(p.get("anomaly_repro_failed") or 0) for p in pytest_payloads)
+        total_skipped = sum(int(p.get("skipped_count") or 0) for p in pytest_payloads)
+        total_errors = sum(int(p.get("error_count") or 0) for p in pytest_payloads)
 
         if total_pos_passed < 1 or total_pos_failed > 0:
             checks.append("outcome_state:baseline_failed")
@@ -444,11 +468,36 @@ class VdpProductTestVerifier:
                 verified_at=self._clock(),
             )
 
+        if total_skipped > 0 or total_errors > 0:
+            checks.append("outcome_state:inconclusive")
+            return VerificationRecord(
+                verification_id=f"ver-{uuid.uuid4().hex}",
+                run_id=run_id,
+                verifier_id=self.verifier_id,
+                verifier_revision=self.verifier_revision,
+                status=VerificationStatus.INCONCLUSIVE,
+                checks_performed=tuple(checks),
+                limitations=tuple(limitations),
+                evidence_ids=eid_tuple,
+                verified_at=self._clock(),
+            )
+
         checks.append("positive_baseline:passed")
 
-        if any(p.get("verdict") == "deviation_reproduced" for p in pytest_payloads) or total_neg_failed > 0:
+        if (
+            any(p.get("verdict") == "anomaly_observed" for p in pytest_payloads)
+            and total_anom_passed >= 1
+            and total_anom_failed == 0
+        ):
+            final_verdict = "anomaly_observed"
+            checks.append("vulnerability_qualification:separate_from_anomaly_observation")
+        elif any(p.get("verdict") == "deviation_reproduced" for p in pytest_payloads):
             final_verdict = "deviation_reproduced"
-        elif all(p.get("verdict") in {"hypothesis_falsified", "baseline_passed"} for p in pytest_payloads) and total_neg_passed >= 1:
+        elif (
+            all(p.get("verdict") in {"hypothesis_falsified", "baseline_passed"} for p in pytest_payloads)
+            and total_neg_passed >= 1
+            and total_neg_failed == 0
+        ):
             final_verdict = "hypothesis_falsified"
         elif all(p.get("verdict") == "baseline_passed" for p in pytest_payloads):
             final_verdict = "baseline_passed"
@@ -466,21 +515,29 @@ class VdpProductTestVerifier:
                 verified_at=self._clock(),
             )
 
-        if normalized_claim is not None and normalized_claim != final_verdict:
-            checks.append(f"claim_mismatch:expected={normalized_claim}:actual={final_verdict}")
-            return VerificationRecord(
-                verification_id=f"ver-{uuid.uuid4().hex}",
-                run_id=run_id,
-                verifier_id=self.verifier_id,
-                verifier_revision=self.verifier_revision,
-                status=VerificationStatus.FAILED,
-                checks_performed=tuple(checks),
-                limitations=tuple(limitations),
-                evidence_ids=eid_tuple,
-                verified_at=self._clock(),
+        anomaly_aliases = {"anomaly_observed", "deviation_reproduced"}
+        if normalized_claim is not None:
+            claim_matches = (
+                normalized_claim == final_verdict
+                or (normalized_claim in anomaly_aliases and final_verdict in anomaly_aliases)
             )
+            if not claim_matches:
+                checks.append(f"claim_mismatch:expected={normalized_claim}:actual={final_verdict}")
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
 
         checks.append(f"outcome_state:{final_verdict}")
+        if final_verdict == "anomaly_observed" and normalized_claim == "deviation_reproduced":
+            checks.append("outcome_state:deviation_reproduced")
         return VerificationRecord(
             verification_id=f"ver-{uuid.uuid4().hex}",
             run_id=run_id,

@@ -109,6 +109,9 @@ def test_local_git_http_fixture_basic_auth_and_stage_marker_redaction(
             sender_auth_state="unauthenticated",
             url_kind="ordinary_non_matching",
             submitted_url="http://vcsuser:secret-pass-123@127.0.0.1:9999/other/repo.git",
+            configured_url="http://vcsuser:secret-pass-123@127.0.0.1:9999/other/repo.git",
+            payload_url="http://127.0.0.1:9999/team/repo.git",
+            target_component="other/comp",
             config_creation_path="validated_ui_api_clean_repo",
             config_accepted=True,
             http_status=200,
@@ -149,3 +152,7 @@ def test_local_git_http_fixture_basic_auth_and_stage_marker_redaction(
         "sync_completed": True,
         "data_changed": True,
     }
+    first_sc = parsed["scenario_comparisons"][0]
+    assert first_sc["configured_url"] == "http://***:***@127.0.0.1:9999/other/repo.git"
+    assert first_sc["payload_url"] == "http://127.0.0.1:9999/team/repo.git"
+    assert first_sc["target_component"] == "other/comp"

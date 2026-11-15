@@ -414,6 +414,9 @@ class ScenarioStageRecord:
     before_state: dict[str, Any] = field(default_factory=dict)
     after_state: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    configured_url: str = ""
+    payload_url: str = ""
+    target_component: str = ""
 
 
 class StageComparisonRecorder:
@@ -454,6 +457,8 @@ class StageComparisonRecorder:
                 {
                     **asdict(s),
                     "submitted_url": redact_sensitive_text(s.submitted_url),
+                    "configured_url": redact_sensitive_text(s.configured_url),
+                    "payload_url": redact_sensitive_text(s.payload_url),
                     "notes": redact_sensitive_text(s.notes),
                 }
                 for s in self.scenarios

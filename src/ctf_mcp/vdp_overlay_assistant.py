@@ -31,6 +31,7 @@ from ctf_mcp.adapters.vdp_product_test import (
     VALID_SELECTOR_ROLES,
     VdpOverlaySpec,
     VdpTargetProfile,
+    compute_vdp_profile_digest,
     load_registered_vdp_profiles,
     run_vdp_environment_check,
     save_registered_vdp_profile,
@@ -423,6 +424,7 @@ def _compute_registration_diff(
             for k, v in sorted(candidate.allowed_overlays.items())
         }
         updated_overlays: dict[str, Any] = {}
+        removed_overlays: dict[str, Any] = {}
         changed_fields: dict[str, Any] = {
             "image_ref": {"before": None, "after": candidate.image_ref},
             "expected_image_digest": {"before": None, "after": candidate.expected_image_digest},
@@ -467,6 +469,14 @@ def _compute_registration_diff(
                     "before_files": dict(old.allowed_files),
                     "after_files": dict(spec.allowed_files),
                 }
+        removed_overlays = {
+            bname: {
+                "container_target": spec.container_target,
+                "allowed_files": dict(spec.allowed_files),
+            }
+            for bname, spec in sorted(reference.allowed_overlays.items())
+            if bname not in candidate.allowed_overlays
+        }
 
         changed_fields = {}
         for field_name in (
@@ -521,6 +531,7 @@ def _compute_registration_diff(
         "new_revision": candidate.profile_revision,
         "added_overlays": added_overlays,
         "updated_overlays": updated_overlays,
+        "removed_overlays": removed_overlays,
         "added_selectors": added_selectors,
         "removed_selectors": removed_selectors,
         "role_changes": role_changes,
@@ -535,10 +546,41 @@ def _collect_apply_conflicts(
     candidate: VdpTargetProfile,
     reference: VdpTargetProfile | None,
     existing_target: VdpTargetProfile | None,
+    requested_base_name: str | None,
     diff: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Identify any overwrite or mutation conflict that must block apply."""
+    """Identify any overwrite, cross-base drop, or mutation conflict that must block apply."""
     conflicts: list[dict[str, Any]] = []
+    if (
+        existing_target is not None
+        and requested_base_name is not None
+        and requested_base_name != existing_target.profile_name
+    ):
+        conflicts.append(
+            {
+                "code": "cross_base_profile_existing_target_denied",
+                "profile_name": existing_target.profile_name,
+                "base_profile": requested_base_name,
+                "message": (
+                    f"Target profile {existing_target.profile_name!r} already exists in profiles.json; "
+                    f"cannot re-base it onto different profile {requested_base_name!r}. "
+                    f"Omit --base-profile or pass --base-profile {existing_target.profile_name} "
+                    "to stack onto the existing target profile."
+                ),
+            }
+        )
+    if diff.get("removed_overlays"):
+        removed_names = sorted(diff["removed_overlays"].keys())
+        conflicts.append(
+            {
+                "code": "would_remove_existing_target_overlays",
+                "removed": removed_names,
+                "message": (
+                    f"Candidate would drop existing overlay bundle(s) {removed_names}; "
+                    "refusing modification."
+                ),
+            }
+        )
     if reference is not None and overlay_bundle in reference.allowed_overlays:
         conflicts.append(
             {
@@ -580,7 +622,7 @@ def _collect_apply_conflicts(
     if diff.get("removed_selectors"):
         conflicts.append(
             {
-                "code": "existing_selector_removed_conflict",
+                "code": "would_remove_existing_target_selectors",
                 "removed": list(diff["removed_selectors"]),
                 "message": "Candidate would remove existing allowlisted selectors; refusing modification.",
             }
@@ -634,10 +676,13 @@ def generate_overlay_registration_plan(
 
     existing_target = registered.get(clean_profile_name)
     base: VdpTargetProfile | None = None
+    requested_base_name: str | None = None
     if isinstance(base_profile, VdpTargetProfile):
+        requested_base_name = base_profile.profile_name
         base = base_profile
     elif isinstance(base_profile, str) and base_profile.strip():
         base_name = base_profile.strip()
+        requested_base_name = base_name
         if base_name in registered:
             base = registered[base_name]
         else:
@@ -853,7 +898,15 @@ def generate_overlay_registration_plan(
         candidate=candidate,
         reference=reference,
         existing_target=existing_target,
+        requested_base_name=requested_base_name,
         diff=diff,
+    )
+
+    target_revision_before = (
+        existing_target.profile_revision if existing_target is not None else None
+    )
+    target_digest_before = (
+        compute_vdp_profile_digest(existing_target) if existing_target is not None else None
     )
 
     return {
@@ -862,6 +915,8 @@ def generate_overlay_registration_plan(
         "profile_revision": candidate.profile_revision,
         "base_profile": base.profile_name if base is not None else None,
         "previous_revision": reference.profile_revision if reference is not None else None,
+        "target_revision_before": target_revision_before,
+        "target_digest_before": target_digest_before,
         "overlay_bundle": clean_bundle_name,
         "discovered_files": dict(scan_result["allowed_files"]),
         "test_files": list(scan_result["test_files"]),
@@ -870,6 +925,7 @@ def generate_overlay_registration_plan(
         "selector_roles": diff["selector_roles"],
         "added_overlays": diff["added_overlays"],
         "updated_overlays": diff["updated_overlays"],
+        "removed_overlays": diff["removed_overlays"],
         "added_selectors": diff["added_selectors"],
         "removed_selectors": diff["removed_selectors"],
         "role_changes": diff["role_changes"],
@@ -902,7 +958,7 @@ def preview_and_register_overlay(
     max_output_bytes: int | None = None,
     apply: bool = False,
     confirm_apply: bool = False,
-    require_healthy_env: bool = False,
+    require_healthy_env: bool = True,
     runner: SubprocessRunner | None = None,
     docker_bin: str | None = None,
     git_bin: str | None = None,
@@ -913,8 +969,9 @@ def preview_and_register_overlay(
 
     By default (``apply=False``), produces a full pre-registration diff and
     ``run_vdp_environment_check`` report without mutating ``profiles.json``.
-    Setting ``apply=True`` requires ``confirm_apply=True``, ``vault_root``, and
-    zero overwrite/role/revision conflicts; otherwise it fails closed.
+    Setting ``apply=True`` requires ``confirm_apply=True``, ``vault_root``,
+    zero overwrite/cross-base/role/revision conflicts, and a healthy environment
+    by default (``require_healthy_env=True``); otherwise it fails closed.
     """
     plan = generate_overlay_registration_plan(
         overlay_dir=overlay_dir,
@@ -947,6 +1004,20 @@ def preview_and_register_overlay(
         clock=clock,
     )
 
+    apply_conflicts = list(plan["apply_conflicts"])
+    if require_healthy_env and not env_health["healthy"]:
+        apply_conflicts.append(
+            {
+                "code": "env_check_failed",
+                "issues": list(env_health["issues"]),
+                "message": (
+                    "Environment health check failed; refusing to persist profile revision "
+                    "unless require_healthy_env=False (--allow-unhealthy-env)."
+                ),
+            }
+        )
+    can_apply = len(apply_conflicts) == 0
+
     result: dict[str, Any] = {
         "schema": "vdp-overlay-assistant/1",
         "status": "dry_run_preview",
@@ -958,6 +1029,7 @@ def preview_and_register_overlay(
         "overlay_bundle": plan["overlay_bundle"],
         "added_overlays": plan["added_overlays"],
         "updated_overlays": plan["updated_overlays"],
+        "removed_overlays": plan["removed_overlays"],
         "added_selectors": plan["added_selectors"],
         "removed_selectors": plan["removed_selectors"],
         "role_changes": plan["role_changes"],
@@ -965,8 +1037,8 @@ def preview_and_register_overlay(
         "new_selector_roles": plan["new_selector_roles"],
         "config_diffs": plan["config_diffs"],
         "env_health": env_health,
-        "apply_conflicts": plan["apply_conflicts"],
-        "can_apply": plan["can_apply"],
+        "apply_conflicts": apply_conflicts,
+        "can_apply": can_apply,
         "existing_runs_and_evidence_untouched": True,
         "profile_summary": plan["candidate_profile_summary"],
     }
@@ -988,7 +1060,7 @@ def preview_and_register_overlay(
         raise ContractViolationError(
             first_msg,
             code="registration_overwrite_refused",
-            details={"conflicts": plan["apply_conflicts"]},
+            details={"conflicts": apply_conflicts},
         )
     if require_healthy_env and not env_health["healthy"]:
         raise ContractViolationError(
@@ -997,24 +1069,14 @@ def preview_and_register_overlay(
             details={"issues": env_health["issues"]},
         )
 
-    # Re-verify vault state immediately prior to atomic save (fail-closed against concurrent overwrites).
-    current_profiles = load_registered_vdp_profiles(vault_root)
-    existing_now = current_profiles.get(candidate.profile_name)
-    if existing_now is not None:
-        if plan["overlay_bundle"] in existing_now.allowed_overlays:
-            raise ContractViolationError(
-                f"Overlay bundle {plan['overlay_bundle']!r} already exists in {candidate.profile_name!r}; "
-                "refusing overwrite.",
-                code="registration_overwrite_refused",
-            )
-        if candidate.profile_revision == existing_now.profile_revision:
-            raise ContractViolationError(
-                f"Profile revision {candidate.profile_revision!r} already exists in {candidate.profile_name!r}; "
-                "refusing overwrite.",
-                code="registration_overwrite_refused",
-            )
-
-    saved_path = save_registered_vdp_profile(vault_root, candidate)
+    # Atomic locked read-check-write + CAS against concurrent overwrites/lost updates.
+    saved_path = save_registered_vdp_profile(
+        vault_root,
+        candidate,
+        expected_profile_revision=plan["target_revision_before"],
+        expected_profile_digest=plan["target_digest_before"],
+        disallow_existing_bundles=(plan["overlay_bundle"],),
+    )
     result["status"] = "registered"
     result["dry_run"] = False
     result["applied"] = True
@@ -1118,12 +1180,20 @@ def register_overlay_assistant_subparser(
     subparser.add_argument("--max-output-bytes", type=int, default=None)
     subparser.add_argument("--docker-bin", default=None, help="Docker CLI binary for environment check.")
     subparser.add_argument("--git-bin", default=None, help="Git CLI binary for checkout check.")
-    subparser.add_argument(
+    env_group = subparser.add_mutually_exclusive_group()
+    env_group.add_argument(
         "--require-healthy-env",
+        dest="require_healthy_env",
         action="store_true",
-        default=False,
-        help="Refuse --apply unless environment verification passes.",
+        help="Refuse --apply unless environment verification passes (default).",
     )
+    env_group.add_argument(
+        "--allow-unhealthy-env",
+        dest="require_healthy_env",
+        action="store_false",
+        help="Explicitly allow --apply even when environment verification fails.",
+    )
+    subparser.set_defaults(require_healthy_env=True)
     subparser.add_argument(
         "--apply",
         action="store_true",
@@ -1174,7 +1244,7 @@ def handle_overlay_assistant(
         max_output_bytes=getattr(args, "max_output_bytes", None),
         apply=bool(getattr(args, "apply", False)),
         confirm_apply=bool(getattr(args, "confirm_apply", False)),
-        require_healthy_env=bool(getattr(args, "require_healthy_env", False)),
+        require_healthy_env=bool(getattr(args, "require_healthy_env", True)),
         docker_bin=getattr(args, "docker_bin", None),
         git_bin=getattr(args, "git_bin", None),
         include_host_paths=True,

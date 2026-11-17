@@ -174,6 +174,152 @@ _AUTH_ATTR_TOKENS: tuple[str, ...] = (
     "is_admin",
 )
 
+_OPEN_ACCESS_CLASS_TOKENS: frozenset[str] = frozenset(
+    {
+        "allowany",
+        "allow_any",
+        "allowall",
+        "public",
+        "publicpermission",
+        "noauth",
+        "unauthenticated",
+        "anonymous",
+    }
+)
+
+_READONLY_OPEN_CLASS_TOKENS: frozenset[str] = frozenset(
+    {
+        "isauthenticatedorreadonly",
+        "djangomodelpermissionsoranonreadonly",
+    }
+)
+
+_OPEN_ACCESS_DECORATOR_TOKENS: tuple[str, ...] = (
+    "allow_any",
+    "allowany",
+    "public_view",
+    "public_endpoint",
+    "public_api",
+    "no_auth",
+    "auth_exempt",
+    "login_exempt",
+    "unauthenticated",
+    "anonymous_allowed",
+    "skip_auth",
+    "bypass_auth",
+    "open_access",
+)
+
+_READONLY_HTTP_METHODS: frozenset[str] = frozenset(
+    {"get", "head", "options", "list", "retrieve"}
+)
+
+_TRUSTED_IDENTITY_PREFIXES: tuple[str, ...] = (
+    "request.user",
+    "req.user",
+    "self.request.user",
+    "g.user",
+    "g.current_user",
+    "g.tenant",
+    "request.auth",
+    "req.auth",
+    "self.request.auth",
+    "request.session",
+    "req.session",
+    "self.request.session",
+    "current_user.",
+    "auth_user.",
+    "authenticated_user.",
+    "session_user.",
+    "actor.",
+)
+
+_TRUSTED_IDENTITY_NAMES: frozenset[str] = frozenset(
+    {
+        "current_user",
+        "auth_user",
+        "authenticated_user",
+        "session_user",
+        "actor",
+    }
+)
+
+_TRUSTED_IDENTITY_CALLS: frozenset[str] = frozenset(
+    {
+        "get_current_user",
+        "get_current_tenant",
+        "get_authenticated_user",
+        "current_user",
+    }
+)
+
+_UNTRUSTED_INPUT_PREFIXES: tuple[str, ...] = (
+    "request.data",
+    "request.post",
+    "request.get",
+    "request.query_params",
+    "request.json",
+    "request.form",
+    "request.args",
+    "request.values",
+    "request.headers",
+    "request.cookies",
+    "request.body",
+    "request.files",
+    "request.params",
+    "request.meta",
+    "req.data",
+    "req.post",
+    "req.get",
+    "req.query_params",
+    "req.json",
+    "req.form",
+    "req.args",
+    "req.values",
+    "req.headers",
+    "req.params",
+    "self.request.data",
+    "self.request.post",
+    "self.request.get",
+    "self.request.query_params",
+    "self.request.json",
+    "self.request.headers",
+    "serializer.validated_data",
+    "serializer.initial_data",
+    "form.cleaned_data",
+    "payload.",
+    "body.",
+    "input_data.",
+    "raw_data.",
+    "query_params.",
+)
+
+_UNTRUSTED_INPUT_NAMES: frozenset[str] = frozenset(
+    {
+        "payload",
+        "body",
+        "data",
+        "input_data",
+        "raw_data",
+        "form_data",
+        "query_params",
+        "params",
+        "event",
+    }
+)
+
+_DYNAMIC_DISPATCH_CALLS: frozenset[str] = frozenset(
+    {
+        "getattr",
+        "setattr",
+        "delattr",
+        "eval",
+        "exec",
+        "__import__",
+        "import_module",
+    }
+)
+
 _SCOPE_PREDICATE_KEYS: frozenset[str] = frozenset(
     {
         "owner",
@@ -368,6 +514,42 @@ class DiffCategory(StrEnum):
     MISSING_INPUT_VALIDATION = "missing_input_validation"
     INPUT_NORMALIZATION_MISMATCH = "input_normalization_mismatch"
     UPDATE_SINK_ASYMMETRY = "update_sink_asymmetry"
+    INDETERMINABLE_BOUNDARY = "indeterminable_boundary"
+
+
+class PermissionStatus(StrEnum):
+    """Static permission enforcement classification for an entrypoint."""
+
+    CHECKED = "checked"
+    OPEN_ACCESS = "open_access"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+class ValidationStatus(StrEnum):
+    """Static input validation classification for an entrypoint."""
+
+    CHECKED = "checked"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+class ScopingStatus(StrEnum):
+    """Static target scoping classification for an entrypoint."""
+
+    TRUSTED_SCOPED = "trusted_scoped"
+    UNTRUSTED_SCOPED = "untrusted_scoped"
+    UNSCOPED = "unscoped"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+class UpdateSinkStatus(StrEnum):
+    """Static update sink classification for an entrypoint."""
+
+    OBSERVED = "observed"
+    NONE = "none"
+    UNKNOWN = "unknown"
 
 
 class CoverageGapType(StrEnum):
@@ -404,10 +586,16 @@ class EntrypointBoundaryRecord(StrictModel):
     location: str = Field(min_length=1)
     matched_feature_reasons: tuple[str, ...] = ()
     parameters: tuple[str, ...] = ()
+    permission_status: PermissionStatus = PermissionStatus.MISSING
+    validation_status: ValidationStatus = ValidationStatus.MISSING
+    scoping_status: ScopingStatus = ScopingStatus.MISSING
+    update_sink_status: UpdateSinkStatus = UpdateSinkStatus.NONE
     permission_checks: tuple[SourceEvidenceItem, ...] = ()
+    open_access_controls: tuple[SourceEvidenceItem, ...] = ()
     input_validations: tuple[SourceEvidenceItem, ...] = ()
     target_scopings: tuple[SourceEvidenceItem, ...] = ()
     update_sinks: tuple[SourceEvidenceItem, ...] = ()
+    unknown_items: tuple[SourceEvidenceItem, ...] = ()
     callees_followed: tuple[str, ...] = ()
     test_references: tuple[str, ...] = ()
 
@@ -950,6 +1138,14 @@ def _is_task_decorator(decorator: ast.expr) -> bool:
     )
 
 
+def _is_open_access_decorator(decorator: ast.expr) -> bool:
+    dec_name = _format_expr(decorator).lower()
+    tail = dec_name.rsplit(".", 1)[-1]
+    if tail == "public":
+        return True
+    return any(tok in dec_name for tok in _OPEN_ACCESS_DECORATOR_TOKENS)
+
+
 def _lookup_route_for_function(
     fn: _IndexedFunction,
     route_table: dict[str, str],
@@ -997,6 +1193,9 @@ def _classify_entrypoint(
     has_http_dec = any(_is_http_decorator(d) for d in decorators)
     has_auth_dec = any(
         any(tok in _format_expr(d).lower() for tok in _PERMISSION_DECORATOR_TOKENS)
+        or _is_open_access_decorator(d)
+        or _format_expr(d).lower().rsplit(".", 1)[-1]
+        in {"permission_classes", "authentication_classes"}
         for d in decorators
     )
     arg_names = [a.arg for a in fn.node.args.args]
@@ -1116,6 +1315,71 @@ def _collect_feature_terms(
     return slugs, token_groups
 
 
+def _iter_executable_nodes(stmts: Sequence[ast.stmt]) -> list[ast.AST]:
+    """Walk AST nodes in ``stmts`` without descending into nested def/class/lambda blocks."""
+    nodes: list[ast.AST] = []
+
+    def _visit_stmts(block: Sequence[ast.stmt]) -> None:
+        for stmt in block:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            nodes.append(stmt)
+            if isinstance(stmt, ast.If):
+                nodes.extend(_iter_expr_nodes(stmt.test))
+                if isinstance(stmt.test, ast.Constant):
+                    if stmt.test.value:
+                        _visit_stmts(stmt.body)
+                    else:
+                        _visit_stmts(stmt.orelse)
+                elif _format_expr(stmt.test) == "TYPE_CHECKING":
+                    _visit_stmts(stmt.orelse)
+                else:
+                    _visit_stmts(stmt.body)
+                    _visit_stmts(stmt.orelse)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        nodes.extend(_iter_expr_nodes(child))
+                _visit_stmts(stmt.body)
+                _visit_stmts(stmt.orelse)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    nodes.extend(_iter_expr_nodes(item.context_expr))
+                    if item.optional_vars is not None:
+                        nodes.extend(_iter_expr_nodes(item.optional_vars))
+                _visit_stmts(stmt.body)
+            elif isinstance(stmt, ast.Try):
+                _visit_stmts(stmt.body)
+                for handler in stmt.handlers:
+                    if handler.type is not None:
+                        nodes.extend(_iter_expr_nodes(handler.type))
+                    _visit_stmts(handler.body)
+                _visit_stmts(stmt.orelse)
+                _visit_stmts(stmt.finalbody)
+            else:
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        nodes.extend(_iter_expr_nodes(child))
+                    elif isinstance(child, ast.stmt):
+                        _visit_stmts([child])
+            if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                break
+
+    def _iter_expr_nodes(root: ast.AST) -> list[ast.AST]:
+        out: list[ast.AST] = []
+        stack: list[ast.AST] = [root]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            out.append(cur)
+            stack.extend(ast.iter_child_nodes(cur))
+        return out
+
+    _visit_stmts(stmts)
+    return nodes
+
+
 def _function_surface_text(fn: _IndexedFunction, route: str | None) -> tuple[str, str]:
     header_parts = [fn.qualified_name, fn.file_rel, route or ""]
     doc = ast.get_docstring(fn.node) or ""
@@ -1130,7 +1394,7 @@ def _function_surface_text(fn: _IndexedFunction, route: str | None) -> tuple[str
                     header_parts.append(s)
 
     body_parts: list[str] = []
-    for node in ast.walk(fn.node):
+    for node in _iter_executable_nodes(fn.node.body):
         if isinstance(node, ast.Name):
             body_parts.append(node.id)
         elif isinstance(node, ast.Attribute):
@@ -1249,26 +1513,348 @@ def _is_validation_error_node(if_node: ast.If) -> bool:
     return False
 
 
+@dataclass
+class _ExtractionResult:
+    items: list[SourceEvidenceItem]
+    open_access: list[SourceEvidenceItem]
+    unknown: list[SourceEvidenceItem]
+    outgoing_calls: list[tuple[str, ast.Call, dict[str, str], bool, bool]]
+
+
+def _is_pascal_case_name(name: str) -> bool:
+    tail = name.rsplit(".", 1)[-1]
+    return bool(tail) and tail[0].isupper() and any(ch.islower() for ch in tail)
+
+
+def _classify_permission_classes_expr(expr: ast.expr) -> tuple[str, str]:
+    """Classify a DRF ``permission_classes`` / ``authentication_classes`` expression.
+
+    Returns ``(kind, reason)`` where ``kind`` is one of:
+    ``"checked"``, ``"open_access"``, ``"readonly_open"``, or ``"unknown"``.
+    """
+    if isinstance(expr, ast.Constant) and expr.value is None:
+        return "open_access", "set to None"
+    if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        return "unknown", f"non-literal expression ({_format_expr(expr)})"
+    if not expr.elts:
+        return "open_access", "empty permission list []"
+
+    saw_checked = False
+    saw_open = False
+    saw_readonly_open = False
+    for elt in expr.elts:
+        if isinstance(elt, ast.Starred):
+            return "unknown", f"starred dynamic element (*{_format_expr(elt.value)})"
+        if isinstance(elt, ast.Call):
+            if not isinstance(elt.func, (ast.Name, ast.Attribute)):
+                return "unknown", "dynamic callable permission entry"
+            fname = _format_expr(elt.func)
+            ftail = fname.rsplit(".", 1)[-1].lower()
+            if ftail in _DYNAMIC_DISPATCH_CALLS:
+                return "unknown", f"dynamic {ftail}() permission entry"
+            if ftail in _OPEN_ACCESS_CLASS_TOKENS:
+                saw_open = True
+            elif ftail in _READONLY_OPEN_CLASS_TOKENS:
+                saw_readonly_open = True
+            elif _is_pascal_case_name(fname):
+                saw_checked = True
+            else:
+                return "unknown", f"dynamic factory call {fname}()"
+        elif isinstance(elt, (ast.Name, ast.Attribute)):
+            ename = _format_expr(elt)
+            etail = ename.rsplit(".", 1)[-1].lower()
+            if etail in _OPEN_ACCESS_CLASS_TOKENS:
+                saw_open = True
+            elif etail in _READONLY_OPEN_CLASS_TOKENS:
+                saw_readonly_open = True
+            elif _is_pascal_case_name(ename):
+                saw_checked = True
+            else:
+                return "unknown", f"unresolved identifier {ename}"
+        else:
+            return "unknown", f"dynamic expression ({type(elt).__name__})"
+
+    if saw_checked:
+        return "checked", "static permission class(es)"
+    if saw_readonly_open and not saw_open:
+        return "readonly_open", "anonymous read-only permission class"
+    if saw_open:
+        return "open_access", "AllowAny / open-access permission class"
+    return "unknown", "empty or unresolved permission classes"
+
+
+def _classify_decorator_item(
+    dec: ast.expr,
+    *,
+    file_rel: str,
+    method_name_lower: str = "",
+    prefix_label: str = "decorator",
+) -> tuple[str, SourceEvidenceItem | None]:
+    """Classify a class/function decorator into ``checked``, ``open_access``, ``unknown``, or ``none``."""
+    if isinstance(dec, ast.Subscript):
+        return "unknown", SourceEvidenceItem(
+            category=BoundaryItemCategory.PERMISSION_CHECK,
+            name=_format_expr(dec),
+            detail=f"unknown (dynamic subscript {prefix_label} @{ast.unparse(dec) if hasattr(ast, 'unparse') else _format_expr(dec)})",
+            file=file_rel,
+            line=dec.lineno,
+            location=f"{file_rel}:{dec.lineno}",
+            tags=("unknown", "unresolved_decorator"),
+        )
+    if isinstance(dec, ast.Call):
+        if not isinstance(dec.func, (ast.Name, ast.Attribute)):
+            return "unknown", SourceEvidenceItem(
+                category=BoundaryItemCategory.PERMISSION_CHECK,
+                name="dynamic_decorator",
+                detail=f"unknown (dynamic {prefix_label})",
+                file=file_rel,
+                line=dec.lineno,
+                location=f"{file_rel}:{dec.lineno}",
+                tags=("unknown", "unresolved_decorator"),
+            )
+        func_name = _format_expr(dec.func)
+        func_tail = func_name.rsplit(".", 1)[-1].lower()
+        if func_tail in _DYNAMIC_DISPATCH_CALLS:
+            return "unknown", SourceEvidenceItem(
+                category=BoundaryItemCategory.PERMISSION_CHECK,
+                name=func_name,
+                detail=f"unknown (dynamic {func_tail} {prefix_label})",
+                file=file_rel,
+                line=dec.lineno,
+                location=f"{file_rel}:{dec.lineno}",
+                tags=("unknown", "unresolved_decorator"),
+            )
+
+    dec_name = _format_expr(dec)
+    dec_lower = dec_name.lower()
+    tail = dec_lower.rsplit(".", 1)[-1]
+
+    if tail in {"permission_classes", "authentication_classes"}:
+        arg_expr = dec.args[0] if isinstance(dec, ast.Call) and dec.args else None
+        if arg_expr is None and isinstance(dec, ast.Call):
+            for kw in dec.keywords:
+                if kw.arg in {"permission_classes", "authentication_classes", "classes"}:
+                    arg_expr = kw.value
+                    break
+        if arg_expr is None:
+            return "unknown", SourceEvidenceItem(
+                category=BoundaryItemCategory.PERMISSION_CHECK,
+                name=dec_name,
+                detail=f"unknown (missing argument to @{dec_name})",
+                file=file_rel,
+                line=dec.lineno,
+                location=f"{file_rel}:{dec.lineno}",
+                tags=("unknown", "unresolved_decorator"),
+            )
+        kind, reason = _classify_permission_classes_expr(arg_expr)
+        raw_expr = ast.unparse(arg_expr) if hasattr(ast, "unparse") else _format_expr(arg_expr)
+        if kind == "readonly_open":
+            kind = "open_access" if method_name_lower in _READONLY_HTTP_METHODS else "checked"
+        if kind == "open_access":
+            return "open_access", SourceEvidenceItem(
+                category=BoundaryItemCategory.PERMISSION_CHECK,
+                name=dec_name,
+                detail=f"open-access {prefix_label} @{dec_name}({raw_expr}) [{reason}]",
+                file=file_rel,
+                line=dec.lineno,
+                location=f"{file_rel}:{dec.lineno}",
+                tags=("open_access", "unprotected", "drf_open_permission_classes"),
+            )
+        if kind == "unknown":
+            return "unknown", SourceEvidenceItem(
+                category=BoundaryItemCategory.PERMISSION_CHECK,
+                name=dec_name,
+                detail=f"unknown ({prefix_label} @{dec_name}({raw_expr}): {reason})",
+                file=file_rel,
+                line=dec.lineno,
+                location=f"{file_rel}:{dec.lineno}",
+                tags=("unknown", "unresolved_decorator"),
+            )
+        return "checked", SourceEvidenceItem(
+            category=BoundaryItemCategory.PERMISSION_CHECK,
+            name=dec_name,
+            detail=f"{prefix_label} @{dec_name}({raw_expr})",
+            file=file_rel,
+            line=dec.lineno,
+            location=f"{file_rel}:{dec.lineno}",
+            tags=("auth_decorator", "permission_decorator", "drf_permission_classes"),
+        )
+
+    if _is_open_access_decorator(dec):
+        return "open_access", SourceEvidenceItem(
+            category=BoundaryItemCategory.PERMISSION_CHECK,
+            name=dec_name,
+            detail=f"open-access {prefix_label} @{dec_name}",
+            file=file_rel,
+            line=dec.lineno,
+            location=f"{file_rel}:{dec.lineno}",
+            tags=("open_access", "unprotected"),
+        )
+
+    if any(tok in dec_lower for tok in _PERMISSION_DECORATOR_TOKENS):
+        if isinstance(dec, ast.Call):
+            for arg in [*dec.args, *(kw.value for kw in dec.keywords)]:
+                if isinstance(arg, ast.Call) and _format_expr(arg.func).rsplit(".", 1)[-1].lower() in _DYNAMIC_DISPATCH_CALLS:
+                    return "unknown", SourceEvidenceItem(
+                        category=BoundaryItemCategory.PERMISSION_CHECK,
+                        name=dec_name,
+                        detail=f"unknown (dynamic argument in @{dec_name})",
+                        file=file_rel,
+                        line=dec.lineno,
+                        location=f"{file_rel}:{dec.lineno}",
+                        tags=("unknown", "unresolved_decorator"),
+                    )
+        tags = ["auth_decorator"]
+        if "permission" in dec_lower or "role" in dec_lower or "scope" in dec_lower:
+            tags.append("permission_decorator")
+        if any(tok in dec_lower for tok in _SIGNATURE_CHECK_TOKENS):
+            tags.append("signature_verification")
+        return "checked", SourceEvidenceItem(
+            category=BoundaryItemCategory.PERMISSION_CHECK,
+            name=dec_name,
+            detail=f"{prefix_label} @{dec_name}",
+            file=file_rel,
+            line=dec.lineno,
+            location=f"{file_rel}:{dec.lineno}",
+            tags=tuple(tags),
+        )
+
+    # Unrecognized decorator with explicit policy/guard/authz/acl naming
+    if any(tok in tail for tok in ("policy", "authz", "acl", "guard", "protect", "restrict")):
+        return "unknown", SourceEvidenceItem(
+            category=BoundaryItemCategory.PERMISSION_CHECK,
+            name=dec_name,
+            detail=f"unknown (unresolved auth/policy {prefix_label} @{dec_name})",
+            file=file_rel,
+            line=dec.lineno,
+            location=f"{file_rel}:{dec.lineno}",
+            tags=("unknown", "unresolved_decorator"),
+        )
+
+    return "none", None
+
+
 def _extract_class_level_items(
     cls_info: _IndexedClass,
+    *,
+    method_name_lower: str,
     items: list[SourceEvidenceItem],
+    open_access: list[SourceEvidenceItem],
+    unknown: list[SourceEvidenceItem],
 ) -> None:
-    """Inspect class decorators and attributes like ``permission_classes`` / ``serializer_class``."""
+    """Inspect class decorators, mixins, attributes, and DRF permission/serializer overrides."""
     for dec in cls_info.decorators:
-        dec_name = _format_expr(dec)
-        dec_lower = dec_name.lower()
-        if any(tok in dec_lower for tok in _PERMISSION_DECORATOR_TOKENS):
-            items.append(
-                SourceEvidenceItem(
-                    category=BoundaryItemCategory.PERMISSION_CHECK,
-                    name=dec_name,
-                    detail=f"class decorator @{dec_name}",
-                    file=cls_info.file_rel,
-                    line=dec.lineno,
-                    location=f"{cls_info.file_rel}:{dec.lineno}",
-                    tags=("auth_decorator",),
+        kind, item = _classify_decorator_item(
+            dec,
+            file_rel=cls_info.file_rel,
+            method_name_lower=method_name_lower,
+            prefix_label="class decorator",
+        )
+        if item is None:
+            continue
+        if kind == "checked":
+            items.append(item)
+        elif kind == "open_access":
+            open_access.append(item)
+        elif kind == "unknown":
+            unknown.append(item)
+
+    has_dynamic_get_permissions = False
+    for stmt in cls_info.class_body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name in {"get_permissions", "check_permissions", "check_object_permissions", "has_permission"}:
+                if (
+                    stmt.name == "get_permissions"
+                    and len(stmt.body) == 1
+                    and isinstance(stmt.body[0], ast.Return)
+                    and stmt.body[0].value is not None
+                ):
+                    pkind, preason = _classify_permission_classes_expr(stmt.body[0].value)
+                    if pkind == "readonly_open":
+                        pkind = "open_access" if method_name_lower in _READONLY_HTTP_METHODS else "checked"
+                    if pkind == "checked":
+                        items.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.PERMISSION_CHECK,
+                                name=f"{cls_info.name}.{stmt.name}",
+                                detail=f"method {stmt.name}() returns static permission classes",
+                                file=cls_info.file_rel,
+                                line=stmt.lineno,
+                                location=f"{cls_info.file_rel}:{stmt.lineno}",
+                                tags=("drf_permission_classes",),
+                            )
+                        )
+                    elif pkind == "open_access":
+                        has_dynamic_get_permissions = True
+                        open_access.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.PERMISSION_CHECK,
+                                name=f"{cls_info.name}.{stmt.name}",
+                                detail=f"open-access {stmt.name}() ({preason})",
+                                file=cls_info.file_rel,
+                                line=stmt.lineno,
+                                location=f"{cls_info.file_rel}:{stmt.lineno}",
+                                tags=("open_access", "unprotected", "drf_open_permission_classes"),
+                            )
+                        )
+                    else:
+                        has_dynamic_get_permissions = True
+                        unknown.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.PERMISSION_CHECK,
+                                name=f"{cls_info.name}.{stmt.name}",
+                                detail=f"unknown (dynamic {stmt.name}(): {preason})",
+                                file=cls_info.file_rel,
+                                line=stmt.lineno,
+                                location=f"{cls_info.file_rel}:{stmt.lineno}",
+                                tags=("unknown", "dynamic_permission_method"),
+                            )
+                        )
+                else:
+                    has_dynamic_get_permissions = True
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{stmt.name}",
+                            detail=f"unknown (conditional or dynamic {stmt.name}() override)",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("unknown", "dynamic_permission_method"),
+                        )
+                    )
+            elif stmt.name == "get_serializer_class":
+                is_simple_return = (
+                    len(stmt.body) == 1
+                    and isinstance(stmt.body[0], ast.Return)
+                    and isinstance(stmt.body[0].value, (ast.Name, ast.Attribute))
+                    and _is_pascal_case_name(_format_expr(stmt.body[0].value))
                 )
-            )
+                if is_simple_return:
+                    sname = _format_expr(stmt.body[0].value)  # type: ignore[union-attr]
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.INPUT_VALIDATION,
+                            name=sname,
+                            detail=f"method get_serializer_class() -> {sname}",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("schema_validation",),
+                        )
+                    )
+                else:
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.INPUT_VALIDATION,
+                            name=f"{cls_info.name}.get_serializer_class",
+                            detail="unknown (conditional or dynamic get_serializer_class() override)",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("unknown", "dynamic_serializer"),
+                        )
+                    )
 
     for stmt in cls_info.class_body:
         if not isinstance(stmt, ast.Assign):
@@ -1277,39 +1863,324 @@ def _extract_class_level_items(
             _format_expr(t) for t in stmt.targets if isinstance(t, (ast.Name, ast.Attribute))
         ]
         for tname in target_names:
-            if tname in {"permission_classes", "authentication_classes"}:
-                items.append(
-                    SourceEvidenceItem(
-                        category=BoundaryItemCategory.PERMISSION_CHECK,
-                        name=f"{cls_info.name}.{tname}",
-                        detail=f"class attribute {tname}={ast.unparse(stmt.value) if hasattr(ast, 'unparse') else '...'}",
-                        file=cls_info.file_rel,
-                        line=stmt.lineno,
-                        location=f"{cls_info.file_rel}:{stmt.lineno}",
-                        tags=("drf_permission_classes",),
+            if tname == "permission_classes":
+                if has_dynamic_get_permissions:
+                    continue
+                raw_val = ast.unparse(stmt.value) if hasattr(ast, "unparse") else "..."
+                pkind, preason = _classify_permission_classes_expr(stmt.value)
+                if pkind == "readonly_open":
+                    pkind = "open_access" if method_name_lower in _READONLY_HTTP_METHODS else "checked"
+                if pkind == "checked":
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"class attribute {tname}={raw_val}",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("drf_permission_classes",),
+                        )
                     )
-                )
+                elif pkind == "open_access":
+                    open_access.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"open-access class attribute {tname}={raw_val} ({preason})",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("open_access", "unprotected", "drf_open_permission_classes"),
+                        )
+                    )
+                else:
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"unknown (class attribute {tname}={raw_val}: {preason})",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("unknown", "unresolved_permission_classes"),
+                        )
+                    )
+            elif tname == "authentication_classes":
+                raw_val = ast.unparse(stmt.value) if hasattr(ast, "unparse") else "..."
+                akind, areason = _classify_permission_classes_expr(stmt.value)
+                if akind == "open_access":
+                    open_access.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"open-access class attribute {tname}={raw_val} ({areason})",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("open_access", "unprotected", "authentication_disabled"),
+                        )
+                    )
+                elif akind == "unknown":
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"unknown (class attribute {tname}={raw_val}: {areason})",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("unknown", "unresolved_authentication_classes"),
+                        )
+                    )
+                else:
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"class attribute {tname}={raw_val}",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("auth_scheme",),
+                        )
+                    )
             elif tname in {"serializer_class", "form_class", "schema_class"}:
                 val_name = _format_expr(stmt.value)
-                items.append(
-                    SourceEvidenceItem(
-                        category=BoundaryItemCategory.INPUT_VALIDATION,
-                        name=val_name or tname,
-                        detail=f"class attribute {tname}={val_name}",
-                        file=cls_info.file_rel,
-                        line=stmt.lineno,
-                        location=f"{cls_info.file_rel}:{stmt.lineno}",
-                        tags=("schema_validation",),
+                if isinstance(stmt.value, (ast.Name, ast.Attribute)) and _is_pascal_case_name(val_name):
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.INPUT_VALIDATION,
+                            name=val_name or tname,
+                            detail=f"class attribute {tname}={val_name}",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("schema_validation",),
+                        )
                     )
-                )
+                else:
+                    raw_val = ast.unparse(stmt.value) if hasattr(ast, "unparse") else val_name
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.INPUT_VALIDATION,
+                            name=f"{cls_info.name}.{tname}",
+                            detail=f"unknown (dynamic class attribute {tname}={raw_val})",
+                            file=cls_info.file_rel,
+                            line=stmt.lineno,
+                            location=f"{cls_info.file_rel}:{stmt.lineno}",
+                            tags=("unknown", "unresolved_validator"),
+                        )
+                    )
 
 
-def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenceItem]:
-    """Extract permission, validation, scoping, and sink items directly from ``fn``."""
+def _classify_expr_origin(expr: ast.AST, env: Mapping[str, str]) -> str:
+    """Classify an AST expression's provenance for scoping/validation trust.
+
+    Returns one of ``"trusted_identity"``, ``"untrusted_input"``, ``"unknown"``, or ``"neutral"``.
+    """
+    if isinstance(expr, ast.Await):
+        return _classify_expr_origin(expr.value, env)
+    if isinstance(expr, ast.Constant):
+        return "neutral"
+    if isinstance(expr, ast.Name):
+        if expr.id in env:
+            return env[expr.id]
+        lowered = expr.id.lower()
+        if lowered in _TRUSTED_IDENTITY_NAMES:
+            return "trusted_identity"
+        if lowered in _UNTRUSTED_INPUT_NAMES:
+            return "untrusted_input"
+        return "neutral"
+    if isinstance(expr, ast.Attribute):
+        formatted = _format_expr(expr).lower()
+        if any(formatted == p.rstrip(".") or formatted.startswith(p) for p in _TRUSTED_IDENTITY_PREFIXES):
+            return "trusted_identity"
+        if (
+            any(formatted == p.rstrip(".") or formatted.startswith(p) for p in _UNTRUSTED_INPUT_PREFIXES)
+            or formatted.endswith((".validated_data", ".initial_data", ".cleaned_data"))
+            or any(tok in formatted for tok in (".validated_data.", ".initial_data.", ".cleaned_data."))
+        ):
+            return "untrusted_input"
+        return _classify_expr_origin(expr.value, env)
+    if isinstance(expr, ast.Subscript):
+        base_origin = _classify_expr_origin(expr.value, env)
+        if base_origin != "neutral":
+            return base_origin
+        fmt = _format_expr(expr.value).lower()
+        if any(fmt.startswith(p.rstrip(".")) for p in _UNTRUSTED_INPUT_PREFIXES):
+            return "untrusted_input"
+        if any(fmt.startswith(p.rstrip(".")) for p in _TRUSTED_IDENTITY_PREFIXES):
+            return "trusted_identity"
+        return "unknown"
+    if isinstance(expr, ast.Call):
+        if not isinstance(expr.func, (ast.Name, ast.Attribute)):
+            return "unknown"
+        call_name = _format_expr(expr.func).lower()
+        tail = call_name.rsplit(".", 1)[-1]
+        if tail in _DYNAMIC_DISPATCH_CALLS:
+            return "unknown"
+        if any(call_name == p.rstrip(".") or call_name.startswith(p) for p in _UNTRUSTED_INPUT_PREFIXES):
+            return "untrusted_input"
+        if call_name in _TRUSTED_IDENTITY_CALLS or tail in _TRUSTED_IDENTITY_CALLS:
+            return "trusted_identity"
+        if isinstance(expr.func, ast.Attribute):
+            recv_origin = _classify_expr_origin(expr.func.value, env)
+            if recv_origin in {"trusted_identity", "untrusted_input", "unknown"}:
+                return recv_origin
+        if tail in {"int", "str", "float", "bool", "uuid", "strip", "lstrip", "rstrip", "lower", "upper"} and expr.args:
+            return _classify_expr_origin(expr.args[0], env)
+        if tail in _ORM_LOOKUP_CALLS:
+            arg_origins = {
+                _classify_expr_origin(a, env) for a in expr.args
+            } | {_classify_expr_origin(kw.value, env) for kw in expr.keywords}
+            if "trusted_identity" in arg_origins and "untrusted_input" not in arg_origins:
+                return "trusted_identity"
+            if "untrusted_input" in arg_origins:
+                return "untrusted_input"
+        return "unknown"
+    if isinstance(expr, ast.IfExp):
+        origins = {
+            _classify_expr_origin(expr.body, env),
+            _classify_expr_origin(expr.orelse, env),
+        }
+        if "untrusted_input" in origins:
+            return "untrusted_input"
+        if "unknown" in origins:
+            return "unknown"
+        if origins == {"trusted_identity"}:
+            return "trusted_identity"
+        return "unknown" if "trusted_identity" in origins else "neutral"
+    if isinstance(expr, ast.BoolOp):
+        origins = {_classify_expr_origin(v, env) for v in expr.values}
+        if "untrusted_input" in origins:
+            return "untrusted_input"
+        if "unknown" in origins:
+            return "unknown"
+        if "trusted_identity" in origins:
+            return "trusted_identity"
+        return "neutral"
+    if isinstance(expr, ast.BinOp):
+        origins = {
+            _classify_expr_origin(expr.left, env),
+            _classify_expr_origin(expr.right, env),
+        }
+        if "untrusted_input" in origins:
+            return "untrusted_input"
+        if "unknown" in origins:
+            return "unknown"
+        if "trusted_identity" in origins:
+            return "trusted_identity"
+        return "neutral"
+    if isinstance(expr, ast.UnaryOp):
+        return _classify_expr_origin(expr.operand, env)
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        origins = {_classify_expr_origin(e, env) for e in expr.elts}
+        if "untrusted_input" in origins:
+            return "untrusted_input"
+        if "unknown" in origins:
+            return "unknown"
+        if "trusted_identity" in origins:
+            return "trusted_identity"
+        return "neutral"
+    return "unknown"
+
+
+def _bind_target_origin(target: ast.AST, origin: str, env: dict[str, str]) -> None:
+    if isinstance(target, ast.Name):
+        prev = env.get(target.id)
+        if prev is not None and prev != origin and prev != "neutral" and origin != "neutral":
+            # Conflicting branches or reassignments cannot be guaranteed trusted
+            if "untrusted_input" in {prev, origin}:
+                env[target.id] = "untrusted_input"
+            else:
+                env[target.id] = "unknown"
+        else:
+            env[target.id] = origin
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _bind_target_origin(elt, origin, env)
+
+
+def _is_http_method_gate(if_node: ast.If) -> bool:
+    test_text = (ast.unparse(if_node.test) if hasattr(ast, "unparse") else _format_expr(if_node.test)).lower()
+    return "request.method" in test_text or "req.method" in test_text
+
+
+def _is_null_existence_guard(if_node: ast.If) -> bool:
+    if isinstance(if_node.test, ast.Compare) and len(if_node.test.ops) == 1 and len(if_node.test.comparators) == 1:
+        op = if_node.test.ops[0]
+        comp = if_node.test.comparators[0]
+        if isinstance(op, (ast.Is, ast.IsNot)) and isinstance(comp, ast.Constant) and comp.value is None:
+            return True
+    return False
+
+
+def _is_auth_branch_test(test: ast.expr) -> bool:
+    test_text = (ast.unparse(test) if hasattr(ast, "unparse") else _format_expr(test)).lower()
+    return any(tok in test_text for tok in _AUTH_ATTR_TOKENS)
+
+
+def _has_unconditional_forbid(stmts: Sequence[ast.stmt]) -> bool:
+    for stmt in stmts:
+        if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+            exc_name = _format_expr(stmt.exc).lower()
+            if any(
+                tok in exc_name
+                for tok in ("permissiondenied", "forbidden", "unauthorized", "httpexception", "abort")
+            ):
+                return True
+        if isinstance(stmt, ast.Return):
+            raw = (ast.unparse(stmt) if hasattr(ast, "unparse") else "").lower()
+            if any(tok in raw for tok in ("401", "403", "forbidden", "unauthorized")):
+                return True
+    return False
+
+
+def _is_swallowing_try(try_node: ast.Try) -> bool:
+    for handler in try_node.handlers:
+        has_exit = any(isinstance(s, (ast.Raise, ast.Return)) for s in handler.body)
+        if not has_exit:
+            return True
+    return False
+
+
+def _infer_dynamic_category(context_text: str, *, has_static_perm: bool) -> BoundaryItemCategory:
+    lowered = context_text.lower()
+    if any(tok in lowered for tok in ("perm", "auth", "role", "policy", "access", "acl", "guard", "signature", "token")):
+        return BoundaryItemCategory.PERMISSION_CHECK
+    if any(tok in lowered for tok in ("valid", "sanitiz", "normaliz", "clean", "schema", "form", "serializer", "parse")):
+        return BoundaryItemCategory.INPUT_VALIDATION
+    if any(tok in lowered for tok in ("objects", "queryset", "filter", "lookup", "scope", "tenant", "owner", "query", "repo")):
+        return BoundaryItemCategory.TARGET_SCOPING
+    if any(tok in lowered for tok in ("save", "update", "write", "delete", "create", "sync", "dispatch", "mutate", "exec", "sink", "action")):
+        return BoundaryItemCategory.UPDATE_SINK
+    return BoundaryItemCategory.UPDATE_SINK if has_static_perm else BoundaryItemCategory.PERMISSION_CHECK
+
+
+def _extract_function_boundary_items(
+    fn: _IndexedFunction,
+    *,
+    arg_origins: Mapping[str, str] | None = None,
+    is_root: bool = True,
+    inherited_conditional: bool = False,
+    inherited_swallowing_try: bool = False,
+) -> _ExtractionResult:
+    """Extract permission, validation, scoping, sink, open-access, and unknown items from ``fn``."""
     items: list[SourceEvidenceItem] = []
+    open_access: list[SourceEvidenceItem] = []
+    unknown: list[SourceEvidenceItem] = []
+    outgoing_calls: list[tuple[str, ast.Call, dict[str, str], bool, bool]] = []
 
-    if fn.class_info is not None:
-        _extract_class_level_items(fn.class_info, items)
+    method_name_lower = fn.name.lower()
+    if fn.class_info is not None and is_root:
+        _extract_class_level_items(
+            fn.class_info,
+            method_name_lower=method_name_lower,
+            items=items,
+            open_access=open_access,
+            unknown=unknown,
+        )
         for base in fn.class_info.bases:
             b_lower = base.rsplit(".", 1)[-1].lower()
             if b_lower in {"loginrequiredmixin", "permissionrequiredmixin", "userpassestestmixin"}:
@@ -1326,30 +2197,36 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                 )
 
     # 1. Function decorators
-    for dec in fn.node.decorator_list:
-        dec_name = _format_expr(dec)
-        dec_lower = dec_name.lower()
-        if any(tok in dec_lower for tok in _PERMISSION_DECORATOR_TOKENS):
-            tags = ["auth_decorator"]
-            if "permission" in dec_lower or "role" in dec_lower or "scope" in dec_lower:
-                tags.append("permission_decorator")
-            if any(tok in dec_lower for tok in _SIGNATURE_CHECK_TOKENS):
-                tags.append("signature_verification")
-            items.append(
-                SourceEvidenceItem(
-                    category=BoundaryItemCategory.PERMISSION_CHECK,
-                    name=dec_name,
-                    detail=f"decorator @{dec_name}",
-                    file=fn.file_rel,
-                    line=dec.lineno,
-                    location=f"{fn.file_rel}:{dec.lineno}",
-                    tags=tuple(tags),
-                )
+    if is_root:
+        for dec in fn.node.decorator_list:
+            kind, dec_item = _classify_decorator_item(
+                dec,
+                file_rel=fn.file_rel,
+                method_name_lower=method_name_lower,
+                prefix_label="decorator",
             )
+            if dec_item is None:
+                continue
+            if kind == "checked":
+                items.append(dec_item)
+            elif kind == "open_access":
+                open_access.append(dec_item)
+            elif kind == "unknown":
+                unknown.append(dec_item)
 
-    # 2. Typed schema / FastAPI Body/Query annotations on parameters
+    # 2. Typed schema / FastAPI Body/Query annotations on parameters & initial variable origins
     all_args = list(fn.node.args.posonlyargs) + list(fn.node.args.args) + list(fn.node.args.kwonlyargs)
+    env: dict[str, str] = {}
     for arg in all_args:
+        if arg.arg in {"self", "cls", "request", "req"}:
+            env[arg.arg] = "neutral"
+        elif arg_origins is not None and arg.arg in arg_origins:
+            env[arg.arg] = arg_origins[arg.arg]
+        elif is_root:
+            env[arg.arg] = "untrusted_input"
+        else:
+            env[arg.arg] = "neutral"
+
         if arg.annotation is None:
             continue
         ann_text = _format_expr(arg.annotation)
@@ -1382,73 +2259,124 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                     )
                 )
 
-    # 3. Walk statements & expressions inside function body
-    for node in ast.walk(fn.node):
-        if isinstance(node, ast.If):
-            test_text = ast.unparse(node.test) if hasattr(ast, "unparse") else _format_expr(node.test)
-            test_lower = test_text.lower()
-            has_forbid = _is_forbidden_response_node(node)
-            if any(tok in test_lower for tok in _AUTH_ATTR_TOKENS) or (
-                has_forbid and any(tok in test_lower for tok in ("perm", "auth", "role", "signature", "hmac", "token", "admin", "staff"))
-            ):
-                tags = ["inline_auth_check"]
-                if any(tok in test_lower for tok in _SIGNATURE_CHECK_TOKENS):
-                    tags.append("signature_verification")
-                if any(tok in test_lower for tok in ("perm", "role")):
-                    tags.append("permission_check_guard")
-                items.append(
-                    SourceEvidenceItem(
-                        category=BoundaryItemCategory.PERMISSION_CHECK,
-                        name="inline_auth_guard",
-                        detail=f"if {test_text}",
-                        file=fn.file_rel,
-                        line=node.lineno,
-                        location=f"{fn.file_rel}:{node.lineno}",
-                        tags=tuple(tags),
-                    )
-                )
-            elif any(tok in test_lower for tok in ("owner", "tenant", "org", "member", "workspace")) and (
-                has_forbid or "404" in test_lower or any(isinstance(s, ast.Raise) for s in node.body)
-            ):
-                items.append(
-                    SourceEvidenceItem(
-                        category=BoundaryItemCategory.TARGET_SCOPING,
-                        name="post_lookup_scope_guard",
-                        detail=f"if {test_text}",
-                        file=fn.file_rel,
-                        line=node.lineno,
-                        location=f"{fn.file_rel}:{node.lineno}",
-                        tags=("post_lookup_scope_check",),
-                    )
-                )
-            elif _is_validation_error_node(node):
-                items.append(
-                    SourceEvidenceItem(
-                        category=BoundaryItemCategory.INPUT_VALIDATION,
-                        name="inline_validation_guard",
-                        detail=f"if {test_text}",
-                        file=fn.file_rel,
-                        line=node.lineno,
-                        location=f"{fn.file_rel}:{node.lineno}",
-                        tags=("explicit_guard",),
-                    )
-                )
+    has_static_root_perm = bool(items and any(i.category == BoundaryItemCategory.PERMISSION_CHECK for i in items))
 
-        if not isinstance(node, ast.Call):
-            continue
+    def _inspect_call(call: ast.Call, *, in_cond: bool, in_swallow_try: bool) -> None:
+        nonlocal has_static_root_perm
+        # Detect dynamic dispatch: subscript call (handlers[k](...)) or getattr(...)(...)
+        if isinstance(call.func, ast.Subscript):
+            raw = ast.unparse(call) if hasattr(ast, "unparse") else _format_expr(call)
+            cat = _infer_dynamic_category(raw, has_static_perm=has_static_root_perm)
+            unknown.append(
+                SourceEvidenceItem(
+                    category=cat,
+                    name=_format_expr(call.func),
+                    detail=f"unknown (dynamic subscript dispatch {raw})",
+                    file=fn.file_rel,
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
+                    tags=("unknown", "dynamic_dispatch"),
+                )
+            )
+            return
 
-        call_name = _format_expr(node.func)
+        if isinstance(call.func, ast.Call):
+            inner_name = _format_expr(call.func.func).rsplit(".", 1)[-1].lower()
+            raw = ast.unparse(call) if hasattr(ast, "unparse") else _format_expr(call)
+            cat = _infer_dynamic_category(raw, has_static_perm=has_static_root_perm)
+            unknown.append(
+                SourceEvidenceItem(
+                    category=cat,
+                    name=f"{inner_name}()(...)" if inner_name else "dynamic_call",
+                    detail=f"unknown (dynamic call dispatch {raw})",
+                    file=fn.file_rel,
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
+                    tags=("unknown", "dynamic_dispatch"),
+                )
+            )
+            return
+
+        call_name = _format_expr(call.func)
         call_lower = call_name.lower()
         tail = call_lower.rsplit(".", 1)[-1]
-        args_summary = _call_kwargs_summary(node)
+        args_summary = _call_kwargs_summary(call)
         args_joined = ", ".join(args_summary)
         args_lower = args_joined.lower()
 
+        # Calling a local variable whose origin is unknown (e.g. fn = getattr(...); fn(request))
+        if isinstance(call.func, ast.Name) and env.get(call.func.id) == "unknown":
+            raw = ast.unparse(call) if hasattr(ast, "unparse") else call_name
+            cat = _infer_dynamic_category(raw, has_static_perm=has_static_root_perm)
+            unknown.append(
+                SourceEvidenceItem(
+                    category=cat,
+                    name=call_name,
+                    detail=f"unknown (invocation of dynamically resolved callable {raw})",
+                    file=fn.file_rel,
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
+                    tags=("unknown", "dynamic_dispatch"),
+                )
+            )
+            return
+
+        # Direct dynamic reflection / eval / exec / importlib calls
+        if tail in _DYNAMIC_DISPATCH_CALLS:
+            raw = ast.unparse(call) if hasattr(ast, "unparse") else f"{call_name}({args_joined})"
+            cat = _infer_dynamic_category(raw, has_static_perm=has_static_root_perm)
+            unknown.append(
+                SourceEvidenceItem(
+                    category=cat,
+                    name=call_name,
+                    detail=f"unknown (dynamic reflection/dispatch {raw})",
+                    file=fn.file_rel,
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
+                    tags=("unknown", "dynamic_dispatch"),
+                )
+            )
+            return
+
+        # Record outgoing call for call-graph traversal with argument origins
+        call_arg_origins: dict[str, str] = {}
+        for idx, arg in enumerate(call.args):
+            call_arg_origins[f"pos:{idx}"] = _classify_expr_origin(arg, env)
+        for kw in call.keywords:
+            if kw.arg is not None:
+                call_arg_origins[f"kw:{kw.arg}"] = _classify_expr_origin(kw.value, env)
+            else:
+                call_arg_origins["**kwargs"] = "unknown"
+        outgoing_calls.append((call_name, call, call_arg_origins, in_cond, in_swallow_try))
+
         # A. Permission calls
-        if any(
-            tail == tok or tok in call_lower
-            for tok in _PERMISSION_CALL_TOKENS
-        ):
+        if any(tail == tok or tok in call_lower for tok in _PERMISSION_CALL_TOKENS):
+            if in_swallow_try:
+                unknown.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.PERMISSION_CHECK,
+                        name=call_name,
+                        detail=f"unknown (permission call {call_name} inside exception-swallowing try block)",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=("unknown", "conditional_or_swallowed_permission"),
+                    )
+                )
+                return
+            if in_cond:
+                unknown.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.PERMISSION_CHECK,
+                        name=call_name,
+                        detail=f"unknown (conditional permission call {call_name}({args_joined}))",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=("unknown", "conditional_permission"),
+                    )
+                )
+                return
             tags = ["inline_permission_call"]
             if any(tok in call_lower or tok in args_lower for tok in _SIGNATURE_CHECK_TOKENS):
                 tags.append("signature_verification")
@@ -1460,12 +2388,13 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                     name=call_name,
                     detail=f"call {call_name}({args_joined})",
                     file=fn.file_rel,
-                    line=node.lineno,
-                    location=f"{fn.file_rel}:{node.lineno}",
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
                     tags=tuple(tags),
                 )
             )
-            continue
+            has_static_root_perm = True
+            return
 
         # B. Input validation / normalization calls
         val_tags: list[str] = []
@@ -1492,23 +2421,49 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
             val_tags.append("custom_validator")
 
         if val_tags:
-            items.append(
+            if in_cond:
+                unknown.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.INPUT_VALIDATION,
+                        name=call_name,
+                        detail=f"unknown (conditional validation call {call_name}({args_joined}))",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=("unknown", "conditional_validation"),
+                    )
+                )
+            else:
+                items.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.INPUT_VALIDATION,
+                        name=call_name,
+                        detail=f"call {call_name}({args_joined})",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=tuple(val_tags),
+                    )
+                )
+
+        # Raw SQL / dynamic ORM escapes -> unknown scoping (and unknown sink if cursor.execute)
+        if tail in {"raw", "extra"} and (".objects." in call_lower or "queryset" in call_lower or is_chained_call_expr(call)):
+            unknown.append(
                 SourceEvidenceItem(
-                    category=BoundaryItemCategory.INPUT_VALIDATION,
+                    category=BoundaryItemCategory.TARGET_SCOPING,
                     name=call_name,
-                    detail=f"call {call_name}({args_joined})",
+                    detail=f"unknown (raw SQL ORM call {call_name}({args_joined}))",
                     file=fn.file_rel,
-                    line=node.lineno,
-                    location=f"{fn.file_rel}:{node.lineno}",
-                    tags=tuple(val_tags),
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
+                    tags=("unknown", "raw_sql_scoping"),
                 )
             )
+            return
 
         # C. Target selection / scoping lookups
-        is_chained_call = isinstance(node.func, ast.Attribute) and isinstance(
-            node.func.value, ast.Call
-        )
-        has_lookup_args = bool(node.args or node.keywords)
+        is_chained_call = isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Call)
+        has_lookup_args = bool(call.args or call.keywords)
         is_orm_lookup = (
             tail in _ORM_LOOKUP_CALLS
             and (has_lookup_args or not is_chained_call)
@@ -1519,23 +2474,122 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                 or "session." in call_lower
                 or ".query." in call_lower
                 or tail in {"get_object_or_404", "get_list_or_404", "filter_by", "get_object", "get_queryset"}
-                or (tail in {"filter", "where"} and len(node.keywords) > 0)
+                or (tail in {"filter", "where"} and (len(call.keywords) > 0 or len(call.args) > 0))
             )
         )
         if is_orm_lookup:
-            kw_names = {kw.arg.lower() for kw in node.keywords if kw.arg}
-            has_scope_kw = bool(kw_names & _SCOPE_PREDICATE_KEYS) or any(
-                any(k in kw for k in _SCOPE_PREDICATE_KEYS) for kw in kw_names
-            )
-            has_actor_ref = any(
-                tok in args_lower for tok in ("request.user", "current_user", "actor", "tenant")
-            )
-            scope_tags: list[str] = []
-            if has_scope_kw or has_actor_ref:
-                scope_tags.append("tenant_or_owner_scoped")
-            else:
-                scope_tags.append("unscoped_lookup")
-            if any(any(sfx in kw for sfx in _FUZZY_LOOKUP_SUFFIXES) for kw in kw_names):
+            kw_names = {kw.arg.lower() for kw in call.keywords if kw.arg}
+            has_starred_kw = any(kw.arg is None for kw in call.keywords)
+            scope_origins: list[str] = []
+
+            for kw in call.keywords:
+                if kw.arg is None:
+                    scope_origins.append("unknown")
+                    continue
+                k_lower = kw.arg.lower()
+                if k_lower in _SCOPE_PREDICATE_KEYS or any(k in k_lower for k in _SCOPE_PREDICATE_KEYS):
+                    scope_origins.append(_classify_expr_origin(kw.value, env))
+
+            # Inspect positional args for Q(tenant_id=...) or SQLAlchemy Model.tenant_id == rhs
+            for arg in call.args:
+                if isinstance(arg, ast.Call) and _format_expr(arg.func).rsplit(".", 1)[-1] == "Q":
+                    for qkw in arg.keywords:
+                        if qkw.arg is None:
+                            scope_origins.append("unknown")
+                        elif qkw.arg.lower() in _SCOPE_PREDICATE_KEYS or any(
+                            k in qkw.arg.lower() for k in _SCOPE_PREDICATE_KEYS
+                        ):
+                            scope_origins.append(_classify_expr_origin(qkw.value, env))
+                elif isinstance(arg, ast.Compare) and len(arg.comparators) == 1:
+                    lhs_txt = _format_expr(arg.left).lower()
+                    rhs_txt = _format_expr(arg.comparators[0]).lower()
+                    if any(k in lhs_txt for k in _SCOPE_PREDICATE_KEYS):
+                        scope_origins.append(_classify_expr_origin(arg.comparators[0], env))
+                    elif any(k in rhs_txt for k in _SCOPE_PREDICATE_KEYS):
+                        scope_origins.append(_classify_expr_origin(arg.left, env))
+                elif isinstance(arg, ast.Starred):
+                    scope_origins.append("unknown")
+
+            if has_starred_kw and not any(o in {"trusted_identity", "untrusted_input"} for o in scope_origins):
+                unknown.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.TARGET_SCOPING,
+                        name=call_name,
+                        detail=f"unknown (dynamic **kwargs lookup {call_name}({args_joined}))",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=("unknown", "dynamic_lookup_kwargs"),
+                    )
+                )
+                return
+
+            has_fuzzy = any(any(sfx in kw for sfx in _FUZZY_LOOKUP_SUFFIXES) for kw in kw_names)
+
+            if "unknown" in scope_origins:
+                unknown.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.TARGET_SCOPING,
+                        name=call_name,
+                        detail=f"unknown (indeterminable scope origin in {call_name}({args_joined}))",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=("unknown", "indeterminable_scoping"),
+                    )
+                )
+                return
+
+            if "untrusted_input" in scope_origins:
+                scope_tags = ["untrusted_scope_input", "user_supplied_scope"]
+                if has_fuzzy:
+                    scope_tags.append("fuzzy_or_suffix_lookup")
+                items.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.TARGET_SCOPING,
+                        name=call_name,
+                        detail=f"lookup {call_name}({args_joined}) [{', '.join(scope_tags)}]",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=tuple(scope_tags),
+                    )
+                )
+                return
+
+            if "trusted_identity" in scope_origins:
+                if in_cond:
+                    unknown.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.TARGET_SCOPING,
+                            name=call_name,
+                            detail=f"unknown (conditional scoping filter {call_name}({args_joined}))",
+                            file=fn.file_rel,
+                            line=call.lineno,
+                            location=f"{fn.file_rel}:{call.lineno}",
+                            tags=("unknown", "conditional_scoping"),
+                        )
+                    )
+                    return
+                scope_tags = ["tenant_or_owner_scoped"]
+                if has_fuzzy:
+                    scope_tags.append("fuzzy_or_suffix_lookup")
+                items.append(
+                    SourceEvidenceItem(
+                        category=BoundaryItemCategory.TARGET_SCOPING,
+                        name=call_name,
+                        detail=f"lookup {call_name}({args_joined}) [{', '.join(scope_tags)}]",
+                        file=fn.file_rel,
+                        line=call.lineno,
+                        location=f"{fn.file_rel}:{call.lineno}",
+                        tags=tuple(scope_tags),
+                    )
+                )
+                return
+
+            # No trusted or untrusted identity scope predicate matched -> unscoped lookup
+            scope_tags = ["unscoped_lookup"]
+            if has_fuzzy:
                 scope_tags.append("fuzzy_or_suffix_lookup")
             items.append(
                 SourceEvidenceItem(
@@ -1543,12 +2597,12 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                     name=call_name,
                     detail=f"lookup {call_name}({args_joined}) [{', '.join(scope_tags)}]",
                     file=fn.file_rel,
-                    line=node.lineno,
-                    location=f"{fn.file_rel}:{node.lineno}",
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
                     tags=tuple(scope_tags),
                 )
             )
-            continue
+            return
 
         # D. Update sinks
         sink_tags: list[str] = []
@@ -1572,13 +2626,251 @@ def _extract_function_boundary_items(fn: _IndexedFunction) -> list[SourceEvidenc
                     name=call_name,
                     detail=f"sink {call_name}({args_joined})",
                     file=fn.file_rel,
-                    line=node.lineno,
-                    location=f"{fn.file_rel}:{node.lineno}",
+                    line=call.lineno,
+                    location=f"{fn.file_rel}:{call.lineno}",
                     tags=tuple(sink_tags),
                 )
             )
 
-    return items
+    def is_chained_call_expr(call: ast.Call) -> bool:
+        return isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Call)
+
+    def _walk_expr_calls(expr: ast.AST | None, *, in_cond: bool, in_swallow_try: bool) -> None:
+        if expr is None:
+            return
+        # Traverse in source order without entering nested Lambda/FunctionDef/ClassDef
+        stack: list[ast.AST] = [expr]
+        while stack:
+            cur = stack.pop(0)
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(cur, ast.Call):
+                _inspect_call(cur, in_cond=in_cond, in_swallow_try=in_swallow_try)
+            # Prepend direct expression children to keep approximate left-to-right order
+            children = [c for c in ast.iter_child_nodes(cur) if isinstance(c, ast.AST)]
+            stack = children + stack
+
+    def _walk_stmt_block(
+        stmts: Sequence[ast.stmt],
+        *,
+        in_cond: bool,
+        in_swallow_try: bool,
+    ) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                # Uncalled nested def/class blocks MUST NOT contribute directly;
+                # local calls to them are resolved explicitly via outgoing_calls.
+                continue
+
+            if isinstance(stmt, ast.Assign):
+                _walk_expr_calls(stmt.value, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                origin = _classify_expr_origin(stmt.value, env)
+                for tgt in stmt.targets:
+                    _bind_target_origin(tgt, origin, env)
+            elif isinstance(stmt, ast.AnnAssign):
+                if stmt.value is not None:
+                    _walk_expr_calls(stmt.value, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                    origin = _classify_expr_origin(stmt.value, env)
+                    _bind_target_origin(stmt.target, origin, env)
+            elif isinstance(stmt, ast.AugAssign):
+                _walk_expr_calls(stmt.value, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                origin = _classify_expr_origin(stmt.value, env)
+                _bind_target_origin(stmt.target, origin, env)
+            elif isinstance(stmt, ast.If):
+                _walk_expr_calls(stmt.test, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                if isinstance(stmt.test, ast.Constant):
+                    if stmt.test.value:
+                        _walk_stmt_block(stmt.body, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                    else:
+                        _walk_stmt_block(stmt.orelse, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                    continue
+                if _format_expr(stmt.test) == "TYPE_CHECKING":
+                    _walk_stmt_block(stmt.orelse, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                    continue
+
+                test_text = ast.unparse(stmt.test) if hasattr(ast, "unparse") else _format_expr(stmt.test)
+                test_lower = test_text.lower()
+                has_forbid = _is_forbidden_response_node(stmt)
+                if any(tok in test_lower for tok in _AUTH_ATTR_TOKENS) or (
+                    has_forbid and any(tok in test_lower for tok in ("perm", "auth", "role", "signature", "hmac", "token", "admin", "staff"))
+                ):
+                    tags = ["inline_auth_check"]
+                    if any(tok in test_lower for tok in _SIGNATURE_CHECK_TOKENS):
+                        tags.append("signature_verification")
+                    if any(tok in test_lower for tok in ("perm", "role")):
+                        tags.append("permission_check_guard")
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.PERMISSION_CHECK,
+                            name="inline_auth_guard",
+                            detail=f"if {test_text}",
+                            file=fn.file_rel,
+                            line=stmt.lineno,
+                            location=f"{fn.file_rel}:{stmt.lineno}",
+                            tags=tuple(tags),
+                        )
+                    )
+                    has_static_root_perm = True
+                elif any(tok in test_lower for tok in ("owner", "tenant", "org", "member", "workspace")) and (
+                    has_forbid or "404" in test_lower or any(isinstance(s, ast.Raise) for s in stmt.body)
+                ):
+                    # Verify whether the post-lookup guard checks against trusted identity vs untrusted input
+                    guard_origin = _classify_expr_origin(stmt.test, env)
+                    if guard_origin == "untrusted_input":
+                        items.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.TARGET_SCOPING,
+                                name="post_lookup_scope_guard",
+                                detail=f"if {test_text} [untrusted_scope_input]",
+                                file=fn.file_rel,
+                                line=stmt.lineno,
+                                location=f"{fn.file_rel}:{stmt.lineno}",
+                                tags=("untrusted_scope_input", "user_supplied_scope"),
+                            )
+                        )
+                    elif guard_origin == "unknown":
+                        unknown.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.TARGET_SCOPING,
+                                name="post_lookup_scope_guard",
+                                detail=f"unknown (indeterminable scope guard: if {test_text})",
+                                file=fn.file_rel,
+                                line=stmt.lineno,
+                                location=f"{fn.file_rel}:{stmt.lineno}",
+                                tags=("unknown", "indeterminable_scoping"),
+                            )
+                        )
+                    else:
+                        items.append(
+                            SourceEvidenceItem(
+                                category=BoundaryItemCategory.TARGET_SCOPING,
+                                name="post_lookup_scope_guard",
+                                detail=f"if {test_text}",
+                                file=fn.file_rel,
+                                line=stmt.lineno,
+                                location=f"{fn.file_rel}:{stmt.lineno}",
+                                tags=("post_lookup_scope_check",),
+                            )
+                        )
+                elif _is_validation_error_node(stmt):
+                    items.append(
+                        SourceEvidenceItem(
+                            category=BoundaryItemCategory.INPUT_VALIDATION,
+                            name="inline_validation_guard",
+                            detail=f"if {test_text}",
+                            file=fn.file_rel,
+                            line=stmt.lineno,
+                            location=f"{fn.file_rel}:{stmt.lineno}",
+                            tags=("explicit_guard",),
+                        )
+                    )
+
+                branch_is_conditional = not (
+                    _is_http_method_gate(stmt)
+                    or _is_null_existence_guard(stmt)
+                    or _is_auth_branch_test(stmt.test)
+                    or _has_unconditional_forbid(stmt.orelse)
+                )
+                _walk_stmt_block(
+                    stmt.body,
+                    in_cond=in_cond or branch_is_conditional,
+                    in_swallow_try=in_swallow_try,
+                )
+                _walk_stmt_block(
+                    stmt.orelse,
+                    in_cond=in_cond or branch_is_conditional,
+                    in_swallow_try=in_swallow_try,
+                )
+            elif isinstance(stmt, ast.Try):
+                swallowing = _is_swallowing_try(stmt)
+                _walk_stmt_block(
+                    stmt.body,
+                    in_cond=in_cond,
+                    in_swallow_try=in_swallow_try or swallowing,
+                )
+                for handler in stmt.handlers:
+                    _walk_stmt_block(handler.body, in_cond=True, in_swallow_try=in_swallow_try)
+                _walk_stmt_block(stmt.orelse, in_cond=True, in_swallow_try=in_swallow_try)
+                _walk_stmt_block(stmt.finalbody, in_cond=in_cond, in_swallow_try=in_swallow_try)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        _walk_expr_calls(child, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                _walk_stmt_block(stmt.body, in_cond=True, in_swallow_try=in_swallow_try)
+                _walk_stmt_block(stmt.orelse, in_cond=True, in_swallow_try=in_swallow_try)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for witem in stmt.items:
+                    _walk_expr_calls(witem.context_expr, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                _walk_stmt_block(stmt.body, in_cond=in_cond, in_swallow_try=in_swallow_try)
+            else:
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        _walk_expr_calls(child, in_cond=in_cond, in_swallow_try=in_swallow_try)
+                    elif isinstance(child, ast.stmt):
+                        _walk_stmt_block([child], in_cond=in_cond, in_swallow_try=in_swallow_try)
+
+            if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                break
+
+    _walk_stmt_block(
+        fn.node.body,
+        in_cond=inherited_conditional,
+        in_swallow_try=inherited_swallowing_try,
+    )
+    return _ExtractionResult(
+        items=items,
+        open_access=open_access,
+        unknown=unknown,
+        outgoing_calls=outgoing_calls,
+    )
+
+
+def _index_local_nested_functions(
+    fn: _IndexedFunction,
+) -> dict[str, _IndexedFunction]:
+    """Index nested ``def`` / ``async def`` directly inside ``fn.node.body``."""
+    locals_map: dict[str, _IndexedFunction] = {}
+    for stmt in fn.node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            locals_map[stmt.name] = _IndexedFunction(
+                file_rel=fn.file_rel,
+                module_name=fn.module_name,
+                name=stmt.name,
+                qualified_name=f"{fn.qualified_name}.<locals>.{stmt.name}",
+                line=stmt.lineno,
+                end_line=getattr(stmt, "end_lineno", stmt.lineno),
+                is_async=isinstance(stmt, ast.AsyncFunctionDef),
+                node=stmt,
+                class_info=None,
+                imports_map=fn.imports_map,
+            )
+    return locals_map
+
+
+def _bind_callee_arg_origins(
+    callee: _IndexedFunction,
+    call_arg_origins: Mapping[str, str],
+) -> dict[str, str]:
+    params = [
+        a.arg
+        for a in (
+            list(callee.node.args.posonlyargs)
+            + list(callee.node.args.args)
+            + list(callee.node.args.kwonlyargs)
+        )
+    ]
+    if callee.class_info is not None and params and params[0] in {"self", "cls"}:
+        params = params[1:]
+    bound: dict[str, str] = {}
+    has_star_kw = "**kwargs" in call_arg_origins
+    for idx, pname in enumerate(params):
+        if f"kw:{pname}" in call_arg_origins:
+            bound[pname] = call_arg_origins[f"kw:{pname}"]
+        elif f"pos:{idx}" in call_arg_origins:
+            bound[pname] = call_arg_origins[f"pos:{idx}"]
+        elif has_star_kw:
+            bound[pname] = "unknown"
+    return bound
 
 
 def _collect_entrypoint_boundaries(
@@ -1592,45 +2884,157 @@ def _collect_entrypoint_boundaries(
     tuple[SourceEvidenceItem, ...],
     tuple[SourceEvidenceItem, ...],
     tuple[SourceEvidenceItem, ...],
+    tuple[SourceEvidenceItem, ...],
+    tuple[SourceEvidenceItem, ...],
     tuple[str, ...],
 ]:
-    """Collect boundary items across ``fn`` and bounded internal callees."""
-    visited: set[str] = set()
+    """Collect boundary items across ``fn`` and reachable internal callees."""
+    visited: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     callees_followed: list[str] = []
     all_items: list[SourceEvidenceItem] = []
+    all_open_access: list[SourceEvidenceItem] = []
+    all_unknown: list[SourceEvidenceItem] = []
 
-    def _visit(current: _IndexedFunction, depth: int) -> None:
-        if current.qualified_name in visited:
+    def _visit(
+        current: _IndexedFunction,
+        depth: int,
+        *,
+        arg_origins: dict[str, str] | None = None,
+        in_cond: bool = False,
+        in_swallow_try: bool = False,
+    ) -> None:
+        state_key = (
+            current.qualified_name,
+            tuple(sorted((arg_origins or {}).items())),
+        )
+        if state_key in visited:
             return
-        visited.add(current.qualified_name)
+        visited.add(state_key)
         if depth > 0:
             callees_followed.append(f"{current.qualified_name} ({current.file_rel}:{current.line})")
-        all_items.extend(_extract_function_boundary_items(current))
+        res = _extract_function_boundary_items(
+            current,
+            arg_origins=arg_origins,
+            is_root=(depth == 0),
+            inherited_conditional=in_cond,
+            inherited_swallowing_try=in_swallow_try,
+        )
+        all_items.extend(res.items)
+        all_open_access.extend(res.open_access)
+        all_unknown.extend(res.unknown)
         if depth >= max_call_depth:
             return
-        for stmt in current.node.body:
-            for node in ast.walk(stmt):
-                if not isinstance(node, ast.Call):
-                    continue
-                call_name = _format_expr(node.func)
+        local_funcs = _index_local_nested_functions(current)
+        for call_name, _call_node, call_arg_origins, call_in_cond, call_in_try in res.outgoing_calls:
+            callee = local_funcs.get(call_name) if "." not in call_name else None
+            if callee is None:
                 callee = _resolve_callee(call_name, current, by_qname, by_short_name)
-                if callee is not None and callee.qualified_name not in visited:
-                    _visit(callee, depth + 1)
+            if callee is not None:
+                bound = _bind_callee_arg_origins(callee, call_arg_origins)
+                _visit(
+                    callee,
+                    depth + 1,
+                    arg_origins=bound,
+                    in_cond=call_in_cond,
+                    in_swallow_try=call_in_try,
+                )
 
     _visit(fn, 0)
 
-    deduped: dict[tuple[str, str, str], SourceEvidenceItem] = {}
-    for item in all_items:
-        key = (item.category.value, item.name, item.location)
-        if key not in deduped:
-            deduped[key] = item
+    def _dedup(seq: Sequence[SourceEvidenceItem]) -> tuple[SourceEvidenceItem, ...]:
+        deduped: dict[tuple[str, str, str], SourceEvidenceItem] = {}
+        for item in seq:
+            key = (item.category.value, item.name, item.location)
+            if key not in deduped:
+                deduped[key] = item
+        return tuple(sorted(deduped.values(), key=lambda i: (i.file, i.line, i.name)))
 
-    sorted_items = sorted(deduped.values(), key=lambda i: (i.file, i.line, i.name))
-    perms = tuple(i for i in sorted_items if i.category == BoundaryItemCategory.PERMISSION_CHECK)
+    sorted_items = _dedup(all_items)
+    deduped_open = _dedup(all_open_access)
+    has_drf_open = any("drf_open_permission_classes" in o.tags for o in deduped_open)
+    perms = tuple(
+        i
+        for i in sorted_items
+        if i.category == BoundaryItemCategory.PERMISSION_CHECK
+        and not (has_drf_open and "auth_scheme" in i.tags)
+    )
     vals = tuple(i for i in sorted_items if i.category == BoundaryItemCategory.INPUT_VALIDATION)
     scopes = tuple(i for i in sorted_items if i.category == BoundaryItemCategory.TARGET_SCOPING)
     sinks = tuple(i for i in sorted_items if i.category == BoundaryItemCategory.UPDATE_SINK)
-    return perms, vals, scopes, sinks, tuple(callees_followed)
+    return (
+        perms,
+        deduped_open,
+        vals,
+        scopes,
+        sinks,
+        _dedup(all_unknown),
+        tuple(dict.fromkeys(callees_followed)),
+    )
+
+
+def _derive_boundary_statuses(
+    *,
+    perms: Sequence[SourceEvidenceItem],
+    open_access: Sequence[SourceEvidenceItem],
+    vals: Sequence[SourceEvidenceItem],
+    scopes: Sequence[SourceEvidenceItem],
+    sinks: Sequence[SourceEvidenceItem],
+    unknown_items: Sequence[SourceEvidenceItem],
+) -> tuple[PermissionStatus, ValidationStatus, ScopingStatus, UpdateSinkStatus]:
+    unknown_cats = {u.category for u in unknown_items}
+
+    # Permission status: any unknown perm item -> UNKNOWN; explicit open_access DRF permission_classes
+    # overrides bare auth_scheme unless an actual permission/auth enforcement check is present.
+    effective_perms = [p for p in perms if "auth_scheme" not in p.tags]
+    has_drf_open = any("drf_open_permission_classes" in o.tags for o in open_access)
+    if BoundaryItemCategory.PERMISSION_CHECK in unknown_cats:
+        perm_status = PermissionStatus.UNKNOWN
+    elif effective_perms or (perms and not has_drf_open):
+        perm_status = PermissionStatus.CHECKED
+    elif open_access:
+        perm_status = PermissionStatus.OPEN_ACCESS
+    else:
+        perm_status = PermissionStatus.MISSING
+
+    # Validation status
+    if BoundaryItemCategory.INPUT_VALIDATION in unknown_cats and not vals:
+        val_status = ValidationStatus.UNKNOWN
+    elif BoundaryItemCategory.INPUT_VALIDATION in unknown_cats:
+        val_status = ValidationStatus.UNKNOWN
+    elif vals:
+        val_status = ValidationStatus.CHECKED
+    else:
+        val_status = ValidationStatus.MISSING
+
+    # Scoping status: untrusted user-supplied scoping MUST NOT be classified as trusted_scoped
+    has_post_lookup_trusted = any("post_lookup_scope_check" in s.tags for s in scopes)
+    has_untrusted_scope = any("untrusted_scope_input" in s.tags for s in scopes)
+    has_trusted_scope = any(
+        "tenant_or_owner_scoped" in s.tags or "post_lookup_scope_check" in s.tags
+        for s in scopes
+    )
+    has_unscoped = any("unscoped_lookup" in s.tags for s in scopes)
+
+    if BoundaryItemCategory.TARGET_SCOPING in unknown_cats:
+        scope_status = ScopingStatus.UNKNOWN
+    elif has_untrusted_scope and not has_post_lookup_trusted:
+        scope_status = ScopingStatus.UNTRUSTED_SCOPED
+    elif has_trusted_scope:
+        scope_status = ScopingStatus.TRUSTED_SCOPED
+    elif has_unscoped:
+        scope_status = ScopingStatus.UNSCOPED
+    else:
+        scope_status = ScopingStatus.MISSING
+
+    # Update sink status
+    if BoundaryItemCategory.UPDATE_SINK in unknown_cats:
+        sink_status = UpdateSinkStatus.UNKNOWN
+    elif sinks:
+        sink_status = UpdateSinkStatus.OBSERVED
+    else:
+        sink_status = UpdateSinkStatus.NONE
+
+    return perm_status, val_status, scope_status, sink_status
 
 
 # ---------------------------------------------------------------------------
@@ -1645,18 +3049,23 @@ def _score_baseline(ep: EntrypointBoundaryRecord) -> tuple[int, int, str]:
         EntrypointKind.WEBHOOK: 2,
         EntrypointKind.ASYNC: 1,
     }
-    has_scoped = int(
-        any(
-            "tenant_or_owner_scoped" in s.tags or "post_lookup_scope_check" in s.tags
-            for s in ep.target_scopings
-        )
-    )
-    control_score = (
+    perm_score = (
         len(ep.permission_checks) * 3
-        + has_scoped * 3
-        + len(ep.input_validations) * 2
-        + len(ep.update_sinks)
+        if ep.permission_status == PermissionStatus.CHECKED
+        else 0
     )
+    has_scoped = int(ep.scoping_status == ScopingStatus.TRUSTED_SCOPED)
+    val_score = (
+        len(ep.input_validations) * 2
+        if ep.validation_status == ValidationStatus.CHECKED
+        else 0
+    )
+    sink_score = (
+        len(ep.update_sinks)
+        if ep.update_sink_status == UpdateSinkStatus.OBSERVED
+        else 0
+    )
+    control_score = perm_score + has_scoped * 3 + val_score + sink_score
     return (control_score, kind_priority.get(ep.kind, 0), ep.entrypoint_id)
 
 
@@ -1690,10 +3099,7 @@ def _select_baseline(
 
 
 def _has_scoped_check(ep: EntrypointBoundaryRecord) -> bool:
-    return any(
-        "tenant_or_owner_scoped" in s.tags or "post_lookup_scope_check" in s.tags
-        for s in ep.target_scopings
-    )
+    return ep.scoping_status == ScopingStatus.TRUSTED_SCOPED
 
 
 def _has_unscoped_lookup(ep: EntrypointBoundaryRecord) -> bool:
@@ -1702,6 +3108,12 @@ def _has_unscoped_lookup(ep: EntrypointBoundaryRecord) -> bool:
 
 def _has_fuzzy_lookup(ep: EntrypointBoundaryRecord) -> bool:
     return any("fuzzy_or_suffix_lookup" in s.tags for s in ep.target_scopings)
+
+
+def _unknown_items_for(
+    ep: EntrypointBoundaryRecord, category: BoundaryItemCategory
+) -> tuple[SourceEvidenceItem, ...]:
+    return tuple(u for u in ep.unknown_items if u.category == category)
 
 
 def _validation_tags(ep: EntrypointBoundaryRecord) -> set[str]:
@@ -1761,11 +3173,62 @@ def _compute_cross_path_diffs(
         ep_fuzzy = _has_fuzzy_lookup(ep)
 
         # 1. Permission boundary diffs
-        if baseline.permission_checks and not ep.permission_checks:
+        base_perm_unknown = _unknown_items_for(baseline, BoundaryItemCategory.PERMISSION_CHECK)
+        ep_perm_unknown = _unknown_items_for(ep, BoundaryItemCategory.PERMISSION_CHECK)
+        if (
+            baseline.permission_status == PermissionStatus.UNKNOWN
+            or ep.permission_status == PermissionStatus.UNKNOWN
+            or base_perm_unknown
+            or ep_perm_unknown
+        ):
             locs = _collect_locations(
-                baseline.permission_checks, ep.update_sinks, fallback=ep.location
+                base_perm_unknown,
+                ep_perm_unknown,
+                baseline.permission_checks,
+                ep.permission_checks,
+                ep.open_access_controls,
+                fallback=ep.location,
             )
             locs = tuple(dict.fromkeys((ep.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.INDETERMINABLE_BOUNDARY,
+                    baseline_entrypoint_id=baseline.entrypoint_id,
+                    compared_entrypoint_id=ep.entrypoint_id,
+                    baseline_kind=baseline.kind,
+                    compared_kind=ep.kind,
+                    summary=(
+                        f"Permission boundary cannot be verified for parity between baseline "
+                        f"'{baseline.name}' ({baseline.permission_status.value}) and "
+                        f"'{ep.name}' ({ep.permission_status.value}); static analysis marked 'unknown'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "aspect": BoundaryItemCategory.PERMISSION_CHECK.value,
+                        "baseline_permission_status": baseline.permission_status.value,
+                        "compared_permission_status": ep.permission_status.value,
+                        "unknown_reasons": [u.detail for u in (*base_perm_unknown, *ep_perm_unknown)],
+                    },
+                )
+            )
+        elif (
+            baseline.permission_status == PermissionStatus.CHECKED
+            and ep.permission_status in {PermissionStatus.MISSING, PermissionStatus.OPEN_ACCESS}
+        ):
+            locs = _collect_locations(
+                ep.open_access_controls,
+                baseline.permission_checks,
+                ep.update_sinks,
+                fallback=ep.location,
+            )
+            locs = tuple(dict.fromkeys((ep.location, *locs)))
+            is_open = ep.permission_status == PermissionStatus.OPEN_ACCESS
+            open_desc = (
+                f"is explicitly open-access/unprotected ({', '.join(o.detail for o in ep.open_access_controls)})"
+                if is_open
+                else "has no observed permission check"
+            )
             findings.append(
                 BoundaryDiffFinding(
                     finding_id=_next_id(),
@@ -1775,22 +3238,37 @@ def _compute_cross_path_diffs(
                     baseline_kind=baseline.kind,
                     compared_kind=ep.kind,
                     summary=(
-                        f"{ep.kind.value.upper()} entrypoint '{ep.name}' has no observed permission check "
+                        f"{ep.kind.value.upper()} entrypoint '{ep.name}' {open_desc} "
                         f"(unlike baseline {baseline.kind.value.upper()} entrypoint '{baseline.name}')."
                     ),
                     evidence_locations=locs,
                     details={
+                        "baseline_permission_status": baseline.permission_status.value,
+                        "compared_permission_status": ep.permission_status.value,
                         "baseline_permission_checks": [p.name for p in baseline.permission_checks],
                         "compared_permission_checks": [],
+                        "compared_open_access_controls": [o.detail for o in ep.open_access_controls],
                         "compared_update_sinks": [s.name for s in ep.update_sinks],
                     },
                 )
             )
-        elif ep.permission_checks and not baseline.permission_checks:
+        elif (
+            ep.permission_status == PermissionStatus.CHECKED
+            and baseline.permission_status in {PermissionStatus.MISSING, PermissionStatus.OPEN_ACCESS}
+        ):
             locs = _collect_locations(
-                ep.permission_checks, baseline.update_sinks, fallback=baseline.location
+                baseline.open_access_controls,
+                ep.permission_checks,
+                baseline.update_sinks,
+                fallback=baseline.location,
             )
             locs = tuple(dict.fromkeys((baseline.location, *locs)))
+            is_open = baseline.permission_status == PermissionStatus.OPEN_ACCESS
+            open_desc = (
+                f"is explicitly open-access/unprotected ({', '.join(o.detail for o in baseline.open_access_controls)})"
+                if is_open
+                else "has no observed permission check"
+            )
             findings.append(
                 BoundaryDiffFinding(
                     finding_id=_next_id(),
@@ -1800,17 +3278,23 @@ def _compute_cross_path_diffs(
                     baseline_kind=ep.kind,
                     compared_kind=baseline.kind,
                     summary=(
-                        f"Baseline {baseline.kind.value.upper()} entrypoint '{baseline.name}' has no observed "
-                        f"permission check compared to {ep.kind.value.upper()} entrypoint '{ep.name}'."
+                        f"Baseline {baseline.kind.value.upper()} entrypoint '{baseline.name}' {open_desc} "
+                        f"compared to {ep.kind.value.upper()} entrypoint '{ep.name}'."
                     ),
                     evidence_locations=locs,
                     details={
+                        "baseline_permission_status": ep.permission_status.value,
+                        "compared_permission_status": baseline.permission_status.value,
                         "baseline_permission_checks": [p.name for p in ep.permission_checks],
                         "compared_permission_checks": [],
+                        "compared_open_access_controls": [o.detail for o in baseline.open_access_controls],
                     },
                 )
             )
-        elif baseline.permission_checks and ep.permission_checks:
+        elif (
+            baseline.permission_status == PermissionStatus.CHECKED
+            and ep.permission_status == PermissionStatus.CHECKED
+        ):
             base_rbac = bool(
                 base_perm_tags
                 & {"permission_decorator", "drf_permission_classes", "object_or_role_permission", "permission_check_guard"}
@@ -1847,7 +3331,109 @@ def _compute_cross_path_diffs(
                 )
 
         # 2. Target selection & scoping diffs
-        if base_scoped and not ep_scoped and (ep_unscoped or ep.update_sinks):
+        base_scope_unknown = _unknown_items_for(baseline, BoundaryItemCategory.TARGET_SCOPING)
+        ep_scope_unknown = _unknown_items_for(ep, BoundaryItemCategory.TARGET_SCOPING)
+        if (
+            baseline.scoping_status == ScopingStatus.UNKNOWN
+            or ep.scoping_status == ScopingStatus.UNKNOWN
+            or base_scope_unknown
+            or ep_scope_unknown
+        ):
+            locs = _collect_locations(
+                base_scope_unknown,
+                ep_scope_unknown,
+                baseline.target_scopings,
+                ep.target_scopings,
+                fallback=ep.location,
+            )
+            locs = tuple(dict.fromkeys((ep.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.INDETERMINABLE_BOUNDARY,
+                    baseline_entrypoint_id=baseline.entrypoint_id,
+                    compared_entrypoint_id=ep.entrypoint_id,
+                    baseline_kind=baseline.kind,
+                    compared_kind=ep.kind,
+                    summary=(
+                        f"Target scoping cannot be verified for parity between baseline "
+                        f"'{baseline.name}' ({baseline.scoping_status.value}) and "
+                        f"'{ep.name}' ({ep.scoping_status.value}); static analysis marked 'unknown'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "aspect": BoundaryItemCategory.TARGET_SCOPING.value,
+                        "baseline_scoping_status": baseline.scoping_status.value,
+                        "compared_scoping_status": ep.scoping_status.value,
+                        "unknown_reasons": [u.detail for u in (*base_scope_unknown, *ep_scope_unknown)],
+                    },
+                )
+            )
+        elif (
+            baseline.scoping_status == ScopingStatus.TRUSTED_SCOPED
+            and ep.scoping_status == ScopingStatus.UNTRUSTED_SCOPED
+        ):
+            locs = _collect_locations(
+                baseline.target_scopings,
+                ep.target_scopings,
+                ep.update_sinks,
+                fallback=ep.location,
+            )
+            locs = tuple(dict.fromkeys((ep.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.SCOPING_MISMATCH,
+                    baseline_entrypoint_id=baseline.entrypoint_id,
+                    compared_entrypoint_id=ep.entrypoint_id,
+                    baseline_kind=baseline.kind,
+                    compared_kind=ep.kind,
+                    summary=(
+                        f"{ep.kind.value.upper()} entrypoint '{ep.name}' uses untrusted user-supplied "
+                        f"scoping input instead of server/identity-derived scoping on baseline '{baseline.name}'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "baseline_scoping_status": baseline.scoping_status.value,
+                        "compared_scoping_status": ep.scoping_status.value,
+                        "baseline_scopings": [s.detail for s in baseline.target_scopings],
+                        "compared_scopings": [s.detail for s in ep.target_scopings],
+                    },
+                )
+            )
+        elif (
+            ep.scoping_status == ScopingStatus.TRUSTED_SCOPED
+            and baseline.scoping_status == ScopingStatus.UNTRUSTED_SCOPED
+        ):
+            locs = _collect_locations(
+                ep.target_scopings,
+                baseline.target_scopings,
+                baseline.update_sinks,
+                fallback=baseline.location,
+            )
+            locs = tuple(dict.fromkeys((baseline.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.SCOPING_MISMATCH,
+                    baseline_entrypoint_id=ep.entrypoint_id,
+                    compared_entrypoint_id=baseline.entrypoint_id,
+                    baseline_kind=ep.kind,
+                    compared_kind=baseline.kind,
+                    summary=(
+                        f"Baseline {baseline.kind.value.upper()} entrypoint '{baseline.name}' uses untrusted "
+                        f"user-supplied scoping input unlike server/identity-derived scoping on '{ep.name}'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "baseline_scoping_status": ep.scoping_status.value,
+                        "compared_scoping_status": baseline.scoping_status.value,
+                        "baseline_scopings": [s.detail for s in ep.target_scopings],
+                        "compared_scopings": [s.detail for s in baseline.target_scopings],
+                    },
+                )
+            )
+        elif base_scoped and not ep_scoped and (ep_unscoped or ep.update_sinks):
             locs = _collect_locations(
                 baseline.target_scopings,
                 ep.target_scopings,
@@ -1925,7 +3511,45 @@ def _compute_cross_path_diffs(
             )
 
         # 3. Input validation & normalization diffs
-        if baseline.input_validations and not ep.input_validations:
+        base_val_unknown = _unknown_items_for(baseline, BoundaryItemCategory.INPUT_VALIDATION)
+        ep_val_unknown = _unknown_items_for(ep, BoundaryItemCategory.INPUT_VALIDATION)
+        if (
+            baseline.validation_status == ValidationStatus.UNKNOWN
+            or ep.validation_status == ValidationStatus.UNKNOWN
+            or base_val_unknown
+            or ep_val_unknown
+        ):
+            locs = _collect_locations(
+                base_val_unknown,
+                ep_val_unknown,
+                baseline.input_validations,
+                ep.input_validations,
+                fallback=ep.location,
+            )
+            locs = tuple(dict.fromkeys((ep.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.INDETERMINABLE_BOUNDARY,
+                    baseline_entrypoint_id=baseline.entrypoint_id,
+                    compared_entrypoint_id=ep.entrypoint_id,
+                    baseline_kind=baseline.kind,
+                    compared_kind=ep.kind,
+                    summary=(
+                        f"Input validation cannot be verified for parity between baseline "
+                        f"'{baseline.name}' ({baseline.validation_status.value}) and "
+                        f"'{ep.name}' ({ep.validation_status.value}); static analysis marked 'unknown'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "aspect": BoundaryItemCategory.INPUT_VALIDATION.value,
+                        "baseline_validation_status": baseline.validation_status.value,
+                        "compared_validation_status": ep.validation_status.value,
+                        "unknown_reasons": [u.detail for u in (*base_val_unknown, *ep_val_unknown)],
+                    },
+                )
+            )
+        elif baseline.input_validations and not ep.input_validations:
             locs = _collect_locations(
                 baseline.input_validations, ep.update_sinks, fallback=ep.location
             )
@@ -2001,11 +3625,49 @@ def _compute_cross_path_diffs(
             )
 
         # 4. Update sink asymmetry
+        base_sink_unknown = _unknown_items_for(baseline, BoundaryItemCategory.UPDATE_SINK)
+        ep_sink_unknown = _unknown_items_for(ep, BoundaryItemCategory.UPDATE_SINK)
         base_sink_tags = {t for s in baseline.update_sinks for t in s.tags}
         ep_sink_tags = {t for s in ep.update_sinks for t in s.tags}
         base_sink_names = {s.name.rsplit(".", 1)[-1] for s in baseline.update_sinks}
         ep_sink_names = {s.name.rsplit(".", 1)[-1] for s in ep.update_sinks}
-        if (baseline.update_sinks or ep.update_sinks) and (
+        if (
+            baseline.update_sink_status == UpdateSinkStatus.UNKNOWN
+            or ep.update_sink_status == UpdateSinkStatus.UNKNOWN
+            or base_sink_unknown
+            or ep_sink_unknown
+        ):
+            locs = _collect_locations(
+                base_sink_unknown,
+                ep_sink_unknown,
+                baseline.update_sinks,
+                ep.update_sinks,
+                fallback=ep.location,
+            )
+            locs = tuple(dict.fromkeys((ep.location, *locs)))
+            findings.append(
+                BoundaryDiffFinding(
+                    finding_id=_next_id(),
+                    category=DiffCategory.INDETERMINABLE_BOUNDARY,
+                    baseline_entrypoint_id=baseline.entrypoint_id,
+                    compared_entrypoint_id=ep.entrypoint_id,
+                    baseline_kind=baseline.kind,
+                    compared_kind=ep.kind,
+                    summary=(
+                        f"Update sink behavior cannot be verified for parity between baseline "
+                        f"'{baseline.name}' ({baseline.update_sink_status.value}) and "
+                        f"'{ep.name}' ({ep.update_sink_status.value}); static analysis marked 'unknown'."
+                    ),
+                    evidence_locations=locs,
+                    details={
+                        "aspect": BoundaryItemCategory.UPDATE_SINK.value,
+                        "baseline_update_sink_status": baseline.update_sink_status.value,
+                        "compared_update_sink_status": ep.update_sink_status.value,
+                        "unknown_reasons": [u.detail for u in (*base_sink_unknown, *ep_sink_unknown)],
+                    },
+                )
+            )
+        elif (baseline.update_sinks or ep.update_sinks) and (
             base_sink_tags != ep_sink_tags or base_sink_names != ep_sink_names
         ):
             locs = _collect_locations(
@@ -2321,7 +3983,7 @@ def build_boundary_diff_map(
 
         direct_calls = [
             _format_expr(node.func)
-            for node in ast.walk(fn.node)
+            for node in _iter_executable_nodes(fn.node.body)
             if isinstance(node, ast.Call)
         ]
         reasons = _match_feature_reasons(fn, route, direct_calls, slugs, token_groups)
@@ -2331,11 +3993,19 @@ def build_boundary_diff_map(
             else:
                 continue
 
-        perms, vals, scopes, sinks, callees = _collect_entrypoint_boundaries(
+        perms, open_access, vals, scopes, sinks, unknowns, callees = _collect_entrypoint_boundaries(
             fn,
             by_qname=by_qname,
             by_short_name=by_short_name,
             max_call_depth=max_call_depth,
+        )
+        perm_status, val_status, scope_status, sink_status = _derive_boundary_statuses(
+            perms=perms,
+            open_access=open_access,
+            vals=vals,
+            scopes=scopes,
+            sinks=sinks,
+            unknown_items=unknowns,
         )
         ep_id = f"{kind.value}:{fn.qualified_name}"
         params = tuple(
@@ -2355,10 +4025,16 @@ def build_boundary_diff_map(
                 location=f"{fn.file_rel}:{fn.line}",
                 matched_feature_reasons=reasons,
                 parameters=params,
+                permission_status=perm_status,
+                validation_status=val_status,
+                scoping_status=scope_status,
+                update_sink_status=sink_status,
                 permission_checks=perms,
+                open_access_controls=open_access,
                 input_validations=vals,
                 target_scopings=scopes,
                 update_sinks=sinks,
+                unknown_items=unknowns,
                 callees_followed=callees,
             )
         )
@@ -2448,9 +4124,10 @@ def format_boundary_diff_map(
             for ep in diff_map.entrypoints:
                 lines.append(
                     f"| `{ep.kind.value}` | `{ep.name}` | `{ep.route or '-'}` | "
-                    f"`{ep.location}` | {len(ep.permission_checks)} | "
-                    f"{len(ep.input_validations)} | {len(ep.target_scopings)} | "
-                    f"{len(ep.update_sinks)} | {len(ep.test_references)} |"
+                    f"`{ep.location}` | `{ep.permission_status.value}` ({len(ep.permission_checks)}) | "
+                    f"`{ep.validation_status.value}` ({len(ep.input_validations)}) | "
+                    f"`{ep.scoping_status.value}` ({len(ep.target_scopings)}) | "
+                    f"`{ep.update_sink_status.value}` ({len(ep.update_sinks)}) | {len(ep.test_references)} |"
                 )
         lines.append("")
         lines.append("## Cross-Path Differences (Investigation Candidates)")
@@ -2488,8 +4165,10 @@ def format_boundary_diff_map(
     for ep in diff_map.entrypoints:
         lines.append(
             f"  [{ep.kind.value}] {ep.name} ({ep.location}) route={ep.route or '-'} "
-            f"perm={len(ep.permission_checks)} val={len(ep.input_validations)} "
-            f"scope={len(ep.target_scopings)} sink={len(ep.update_sinks)} tests={len(ep.test_references)}"
+            f"perm={ep.permission_status.value}({len(ep.permission_checks)}) "
+            f"val={ep.validation_status.value}({len(ep.input_validations)}) "
+            f"scope={ep.scoping_status.value}({len(ep.target_scopings)}) "
+            f"sink={ep.update_sink_status.value}({len(ep.update_sinks)}) tests={len(ep.test_references)}"
         )
     lines.append("Cross-Path Differences (investigation_candidate):")
     for item in diff_map.cross_path_diffs:
@@ -2612,9 +4291,13 @@ __all__ = [
     "EntrypointBoundaryRecord",
     "EntrypointKind",
     "INVESTIGATION_CANDIDATE_STATUS",
+    "PermissionStatus",
+    "ScopingStatus",
     "SourceEvidenceItem",
     "TestCoverageGap",
+    "UpdateSinkStatus",
     "VALID_ENTRYPOINT_KINDS",
+    "ValidationStatus",
     "build_boundary_diff_map",
     "format_boundary_diff_map",
     "handle_boundary_map_cli",

@@ -66,6 +66,16 @@ from ctf_mcp.controller import (
 from ctf_mcp.gateway import sanitize_audit_text
 from ctf_mcp.server import build_server_from_env
 from ctf_mcp.storage import Storage
+from ctf_mcp.vdp_boundary_map import (
+    BOUNDARY_MAP_SUBCOMMAND,
+    handle_boundary_map_cli,
+    register_boundary_map_subparser,
+)
+from ctf_mcp.vdp_overlay_assistant import (
+    OVERLAY_ASSISTANT_COMMAND,
+    handle_overlay_assistant,
+    register_overlay_assistant_subparser,
+)
 from ctf_mcp.verification import ExpectedChallengeSpec
 
 
@@ -1269,6 +1279,14 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_vdp_check.add_argument("--overlay-bundle", default=None)
     p_vdp_check.add_argument("--docker-bin", default="docker")
 
+    p_boundary = register_boundary_map_subparser(subparsers)
+    _add_common_admin_flags(p_boundary, suppress_defaults=True)
+
+    register_overlay_assistant_subparser(
+        subparsers,
+        add_common_flags=lambda p: _add_common_admin_flags(p, suppress_defaults=True),
+    )
+
     return parser
 
 
@@ -1292,6 +1310,8 @@ def admin_main(
         "update-scope": _handle_update_scope,
         "register-vdp-profile": _handle_register_vdp_profile,
         "check-vdp-env": _handle_check_vdp_env,
+        BOUNDARY_MAP_SUBCOMMAND: handle_boundary_map_cli,
+        OVERLAY_ASSISTANT_COMMAND: handle_overlay_assistant,
     }
     try:
         return handlers[args.command](args, env)

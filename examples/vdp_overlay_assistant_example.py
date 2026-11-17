@@ -87,8 +87,11 @@ def main() -> None:
                     "status": preview["status"],
                     "dry_run": preview["dry_run"],
                     "added_overlays": preview["added_overlays"],
+                    "removed_overlays": preview["removed_overlays"],
                     "added_selectors": preview["added_selectors"],
+                    "removed_selectors": preview["removed_selectors"],
                     "env_healthy": preview["env_health"]["healthy"],
+                    "can_apply": preview["can_apply"],
                 },
                 indent=2,
             )

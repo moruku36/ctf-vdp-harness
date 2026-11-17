@@ -14,19 +14,32 @@ Execution host premise:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    msvcrt = None  # type: ignore[assignment]
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 from pydantic import Field
 
@@ -47,6 +60,7 @@ from ctf_mcp.contracts import (
     EvidenceRef,
     EvidenceVaultPort,
     ExecutionClass,
+    PathSecurityError,
     ProvenanceInfo,
     ResultEnvelope,
     RunMode,
@@ -55,7 +69,7 @@ from ctf_mcp.contracts import (
     StrictModel,
     UsageMetrics,
 )
-from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
+from ctf_mcp.fs_guard import _is_reparse_or_symlink, safe_read_bounded, safe_write_atomic
 from ctf_mcp.vdp_fixtures.local_git_http import redact_sensitive_text, redact_structure
 
 VDP_PRODUCT_TEST_CAPABILITY_NAME = "vdp.test"
@@ -74,6 +88,10 @@ VDP_PRODUCT_TEST_OPERATIONS: tuple[str, ...] = (
     "run_pytest",
 )
 VDP_PROFILES_RELPATH = "_vdp/profiles.json"
+VDP_PROFILES_LOCK_RELPATH = "_vdp/profiles.json.lock"
+_PROFILES_THREAD_LOCKS_GUARD = threading.Lock()
+_PROFILES_THREAD_LOCKS: dict[Path, threading.Lock] = {}
+_UNSET = object()
 
 WEBLATE_2026_11_2_PROFILE_NAME = "weblate-2026.11.2"
 WEBLATE_2026_11_2_PROFILE_REVISION = "weblate-2026.11.2-r2"
@@ -499,9 +517,117 @@ def validate_vdp_profile_registration(profile: VdpTargetProfile) -> VdpTargetPro
     )
 
 
-def load_registered_vdp_profiles(vault_root: str | Path) -> dict[str, VdpTargetProfile]:
-    """Load operator-registered VDP target profiles from ``<vault_root>/_vdp/profiles.json``."""
-    vault_path = Path(vault_root)
+def compute_vdp_profile_digest(profile: VdpTargetProfile) -> str:
+    """Compute canonical SHA-256 digest of a ``VdpTargetProfile`` for CAS checks."""
+    canonical = json.dumps(
+        profile.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _get_profiles_thread_lock(lock_path: Path) -> threading.Lock:
+    with _PROFILES_THREAD_LOCKS_GUARD:
+        lock = _PROFILES_THREAD_LOCKS.get(lock_path)
+        if lock is None:
+            lock = threading.Lock()
+            _PROFILES_THREAD_LOCKS[lock_path] = lock
+        return lock
+
+
+def _acquire_file_lock(fd: int, *, timeout_seconds: float = 30.0) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if sys.platform == "win32" and msvcrt is not None:
+        if os.fstat(fd).st_size == 0:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, b"\0")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out acquiring lock for VDP profiles store."
+                    ) from exc
+                time.sleep(0.01)
+
+
+def _release_file_lock(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if sys.platform == "win32" and msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _vdp_profiles_lock(vault_path: Path) -> Iterator[None]:
+    """Acquire an intra-process and cross-process exclusive lock on ``_vdp/profiles.json.lock``."""
+    try:
+        root_st = os.lstat(vault_path)
+    except OSError as exc:
+        raise PathSecurityError(f"Vault root is inaccessible: {exc}") from exc
+    if _is_reparse_or_symlink(root_st) or not stat.S_ISDIR(root_st.st_mode):
+        raise PathSecurityError("Vault root must be a non-symlink directory.")
+    real_vault = Path(os.path.realpath(vault_path, strict=True))
+
+    vdp_dir = real_vault / "_vdp"
+    try:
+        vdp_st = os.lstat(vdp_dir)
+    except FileNotFoundError:
+        try:
+            os.mkdir(vdp_dir, 0o750)
+        except FileExistsError:
+            pass
+        vdp_st = os.lstat(vdp_dir)
+    except OSError as exc:
+        raise PathSecurityError(f"Unable to inspect _vdp directory: {exc}") from exc
+    if _is_reparse_or_symlink(vdp_st) or not stat.S_ISDIR(vdp_st.st_mode):
+        raise PathSecurityError("Vault _vdp directory must be a non-symlink directory.")
+
+    lock_path = Path(os.path.realpath(vdp_dir, strict=True)) / "profiles.json.lock"
+    thread_lock = _get_profiles_thread_lock(lock_path)
+    with thread_lock:
+        try:
+            existing_lock_st = os.lstat(lock_path)
+        except FileNotFoundError:
+            existing_lock_st = None
+        except OSError as exc:
+            raise PathSecurityError(f"Unable to inspect profiles lockfile: {exc}") from exc
+        if existing_lock_st is not None and (
+            _is_reparse_or_symlink(existing_lock_st) or not stat.S_ISREG(existing_lock_st.st_mode)
+        ):
+            raise PathSecurityError("VDP profiles lockfile cannot be a symlink or special file.")
+
+        open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(lock_path, open_flags, 0o600)
+        try:
+            fd_st = os.fstat(fd)
+            path_st = os.lstat(lock_path)
+            if _is_reparse_or_symlink(path_st) or not stat.S_ISREG(fd_st.st_mode):
+                raise PathSecurityError("VDP profiles lockfile is not a regular file.")
+            if (fd_st.st_dev, fd_st.st_ino) != (path_st.st_dev, path_st.st_ino):
+                raise PathSecurityError("VDP profiles lockfile changed during open.")
+            _acquire_file_lock(fd)
+            try:
+                yield
+            finally:
+                _release_file_lock(fd)
+        finally:
+            os.close(fd)
+
+
+def _load_registered_vdp_profiles_unlocked(vault_path: Path) -> dict[str, VdpTargetProfile]:
     target = vault_path / VDP_PROFILES_RELPATH
     if not target.exists():
         return {}
@@ -524,30 +650,99 @@ def load_registered_vdp_profiles(vault_root: str | Path) -> dict[str, VdpTargetP
     return loaded
 
 
+def load_registered_vdp_profiles(vault_root: str | Path) -> dict[str, VdpTargetProfile]:
+    """Load operator-registered VDP target profiles from ``<vault_root>/_vdp/profiles.json``."""
+    vault_path = Path(vault_root)
+    target = vault_path / VDP_PROFILES_RELPATH
+    if not target.exists():
+        return {}
+    try:
+        with _vdp_profiles_lock(vault_path):
+            return _load_registered_vdp_profiles_unlocked(vault_path)
+    except OSError as exc:
+        if exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+            return _load_registered_vdp_profiles_unlocked(vault_path)
+        raise
+
+
 def save_registered_vdp_profile(
     vault_root: str | Path,
     profile: VdpTargetProfile,
+    *,
+    expected_profile_revision: str | None | object = _UNSET,
+    expected_profile_digest: str | None | object = _UNSET,
+    disallow_existing_bundles: Sequence[str] = (),
 ) -> Path:
-    """Validate and atomically persist an operator-registered ``VdpTargetProfile`` under ``vault_root``."""
+    """Validate and atomically persist an operator-registered ``VdpTargetProfile`` under ``vault_root``.
+
+    Serializes read-check-write across threads and processes via an exclusive lockfile
+    (``_vdp/profiles.json.lock``) and optionally enforces Compare-And-Swap preconditions
+    (``expected_profile_revision``, ``expected_profile_digest``, ``disallow_existing_bundles``).
+    """
     validated = validate_vdp_profile_registration(profile)
     vault_path = Path(vault_root)
     vault_path.mkdir(parents=True, exist_ok=True)
-    existing = load_registered_vdp_profiles(vault_path)
-    existing[validated.profile_name] = validated
-    data = {
-        "schema_version": "vdp-profiles/1",
-        "profiles": {
-            name: prof.model_dump(mode="json")
-            for name, prof in sorted(existing.items())
-        },
-    }
-    return safe_write_atomic(
-        vault_path,
-        VDP_PROFILES_RELPATH,
-        (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-        overwrite=True,
-        create_parents=True,
-    )
+    with _vdp_profiles_lock(vault_path):
+        existing = _load_registered_vdp_profiles_unlocked(vault_path)
+        current = existing.get(validated.profile_name)
+
+        if expected_profile_revision is not _UNSET:
+            actual_rev = current.profile_revision if current is not None else None
+            if actual_rev != expected_profile_revision:
+                raise ContractViolationError(
+                    f"Concurrent modification detected for VDP profile {validated.profile_name!r}: "
+                    f"expected revision {expected_profile_revision!r}, found {actual_rev!r}. "
+                    "Re-run preview/apply against the latest profile revision.",
+                    code="profile_cas_conflict",
+                    details={
+                        "profile_name": validated.profile_name,
+                        "expected_revision": expected_profile_revision,
+                        "actual_revision": actual_rev,
+                    },
+                )
+
+        if expected_profile_digest is not _UNSET:
+            actual_digest = compute_vdp_profile_digest(current) if current is not None else None
+            if actual_digest != expected_profile_digest:
+                raise ContractViolationError(
+                    f"Concurrent modification detected for VDP profile {validated.profile_name!r}: "
+                    "stored profile state changed before save. Re-run preview/apply.",
+                    code="profile_cas_conflict",
+                    details={
+                        "profile_name": validated.profile_name,
+                        "expected_digest": expected_profile_digest,
+                        "actual_digest": actual_digest,
+                    },
+                )
+
+        if disallow_existing_bundles and current is not None:
+            for bundle_name in disallow_existing_bundles:
+                if bundle_name in current.allowed_overlays:
+                    raise ContractViolationError(
+                        f"Overlay bundle {bundle_name!r} already exists in {validated.profile_name!r}; "
+                        "refusing overwrite.",
+                        code="registration_overwrite_refused",
+                        details={
+                            "profile_name": validated.profile_name,
+                            "overlay_bundle": bundle_name,
+                        },
+                    )
+
+        existing[validated.profile_name] = validated
+        data = {
+            "schema_version": "vdp-profiles/1",
+            "profiles": {
+                name: prof.model_dump(mode="json")
+                for name, prof in sorted(existing.items())
+            },
+        }
+        return safe_write_atomic(
+            vault_path,
+            VDP_PROFILES_RELPATH,
+            (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            overwrite=True,
+            create_parents=True,
+        )
 
 
 def build_default_weblate_profile(
@@ -2846,6 +3041,7 @@ __all__ = [
     "VdpProductTestAdapter",
     "VdpTargetProfile",
     "build_default_weblate_profile",
+    "compute_vdp_profile_digest",
     "create_vdp_product_test_descriptor",
     "load_registered_vdp_profiles",
     "run_vdp_environment_check",

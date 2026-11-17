@@ -13,10 +13,15 @@ from ctf_mcp.contracts import ContractViolationError, PathSecurityError
 from ctf_mcp.vdp_boundary_map import (
     BOUNDARY_MAP_SUBCOMMAND,
     BoundaryDiffMap,
+    BoundaryItemCategory,
     CoverageGapType,
     DiffCategory,
     EntrypointKind,
     INVESTIGATION_CANDIDATE_STATUS,
+    PermissionStatus,
+    ScopingStatus,
+    UpdateSinkStatus,
+    ValidationStatus,
     build_boundary_diff_map,
     format_boundary_diff_map,
     handle_boundary_map_cli,
@@ -409,4 +414,490 @@ def test_boundary_diff_map_permission_model_mismatch_aliases_and_syntax_skip(tmp
     assert DiffCategory.SCOPING_MISMATCH in cats
     assert DiffCategory.UPDATE_SINK_ASYMMETRY in cats
     assert all(d.status == INVESTIGATION_CANDIDATE_STATUS for d in diff_map.cross_path_diffs)
+
+
+def test_open_access_allow_any_and_empty_permission_classes_not_treated_as_checked(
+    tmp_path: Path,
+) -> None:
+    """Case 1: AllowAny / [] / open decorators must classify as open_access and diff against protected paths."""
+    src_dir = tmp_path / "open_app"
+    src_dir.mkdir()
+
+    (src_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "class ProtectedReportApiView(APIView):",
+                "    permission_classes = [IsAuthenticated, CanExportReports]",
+                "    def post(self, request, report_id: int):",
+                "        row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "        return {'ok': True}",
+                "",
+                "class OpenAllowAnyReportApiView(APIView):",
+                "    authentication_classes = [SessionAuthentication]",
+                "    permission_classes = [AllowAny]",
+                "    def post(self, request, report_id: int):",
+                "        row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "        return {'ok': True}",
+                "",
+                "class OpenEmptyPermsReportApiView(APIView):",
+                "    permission_classes = []",
+                "    def post(self, request, report_id: int):",
+                "        row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "        return {'ok': True}",
+                "",
+                "@api_view(['POST'])",
+                "@permission_classes([AllowAny])",
+                "def api_report_open_decorator(request, report_id: int):",
+                "    row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@allow_any",
+                "def api_report_allow_any_marker(request, report_id: int):",
+                "    row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    diff_map = build_boundary_diff_map(
+        "report",
+        src_dir,
+        baseline_entrypoint="api:api.ProtectedReportApiView.post",
+    )
+    by_qname = {ep.qualified_name: ep for ep in diff_map.entrypoints}
+
+    protected = by_qname["api.ProtectedReportApiView.post"]
+    assert protected.permission_status == PermissionStatus.CHECKED
+    assert protected.permission_checks
+    assert protected.open_access_controls == ()
+
+    open_names = [
+        "api.OpenAllowAnyReportApiView.post",
+        "api.OpenEmptyPermsReportApiView.post",
+        "api.api_report_open_decorator",
+        "api.api_report_allow_any_marker",
+    ]
+    for qname in open_names:
+        ep = by_qname[qname]
+        assert ep.permission_status == PermissionStatus.OPEN_ACCESS, qname
+        assert ep.permission_checks == (), qname
+        assert ep.open_access_controls, qname
+        assert any("open_access" in item.tags for item in ep.open_access_controls), qname
+
+    perm_diffs = [
+        d
+        for d in diff_map.cross_path_diffs
+        if d.category == DiffCategory.MISSING_PERMISSION_CHECK
+    ]
+    diff_targets = {d.compared_entrypoint_id for d in perm_diffs}
+    assert diff_targets == {f"api:{name}" for name in open_names}
+    for d in perm_diffs:
+        assert d.status == INVESTIGATION_CANDIDATE_STATUS
+        assert d.details["compared_permission_status"] == "open_access"
+
+    # Positive-control parity: two identically protected views produce zero diffs
+    parity_dir = tmp_path / "parity_app"
+    parity_dir.mkdir()
+    (parity_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "class FirstReportApiView(APIView):",
+                "    permission_classes = [IsAuthenticated, CanExportReports]",
+                "    def post(self, request, report_id: int):",
+                "        row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "        return {'ok': True}",
+                "",
+                "class SecondReportApiView(APIView):",
+                "    permission_classes = [IsAuthenticated, CanExportReports]",
+                "    def post(self, request, report_id: int):",
+                "        row = ReportJob.objects.get(pk=report_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "        return {'ok': True}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    parity_map = build_boundary_diff_map("report", parity_dir)
+    assert parity_map.cross_path_diffs == ()
+
+
+def test_untrusted_user_supplied_scoping_distinguished_from_trusted_identity_scoping(
+    tmp_path: Path,
+) -> None:
+    """Case 2: User-supplied tenant_id inputs must not match request.user.tenant_id scoping."""
+    src_dir = tmp_path / "scoping_app"
+    src_dir.mkdir()
+
+    (src_dir / "services.py").write_text(
+        "\n".join(
+            [
+                "def save_scoped_ledger(tenant_id: int, ledger_id: int) -> None:",
+                "    row = LedgerEntry.objects.filter(id=ledger_id, tenant_id=tenant_id).first()",
+                "    row.save()",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (src_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "from services import save_scoped_ledger",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_trusted_direct(request, ledger_id: int):",
+                "    row = LedgerEntry.objects.get(pk=ledger_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_trusted_helper(request, ledger_id: int):",
+                "    tid = request.user.tenant_id",
+                "    save_scoped_ledger(tid, ledger_id)",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_untrusted_data(request, ledger_id: int):",
+                "    row = LedgerEntry.objects.get(pk=ledger_id, tenant_id=request.data['tenant_id'])",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_untrusted_query_params(request, ledger_id: int):",
+                "    row = LedgerEntry.objects.get(pk=ledger_id, tenant_id=request.query_params.get('tenant_id'))",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_untrusted_get_var(request, ledger_id: int):",
+                "    tid = request.GET['tenant_id']",
+                "    row = LedgerEntry.objects.get(pk=ledger_id, tenant_id=tid)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_untrusted_post(request, ledger_id: int):",
+                "    row = LedgerEntry.objects.get(pk=ledger_id, tenant_id=request.POST['tenant_id'])",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@require_permission('ledger.write')",
+                "def api_ledger_untrusted_helper(request, ledger_id: int):",
+                "    save_scoped_ledger(request.data['tenant_id'], ledger_id)",
+                "    return {'ok': True}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    diff_map = build_boundary_diff_map(
+        "ledger",
+        src_dir,
+        baseline_entrypoint="api:api.api_ledger_trusted_direct",
+    )
+    by_name = {ep.name: ep for ep in diff_map.entrypoints}
+
+    # Positive controls
+    for trusted_name in ("api_ledger_trusted_direct", "api_ledger_trusted_helper"):
+        ep = by_name[trusted_name]
+        assert ep.scoping_status == ScopingStatus.TRUSTED_SCOPED, trusted_name
+        assert any("tenant_or_owner_scoped" in s.tags for s in ep.target_scopings), trusted_name
+        assert not any("untrusted_scope_input" in s.tags for s in ep.target_scopings), trusted_name
+
+    # Untrusted paths must NOT have tenant_or_owner_scoped and MUST diff against baseline
+    untrusted_names = [
+        "api_ledger_untrusted_data",
+        "api_ledger_untrusted_query_params",
+        "api_ledger_untrusted_get_var",
+        "api_ledger_untrusted_post",
+        "api_ledger_untrusted_helper",
+    ]
+    for uname in untrusted_names:
+        ep = by_name[uname]
+        assert ep.scoping_status == ScopingStatus.UNTRUSTED_SCOPED, uname
+        assert not any("tenant_or_owner_scoped" in s.tags for s in ep.target_scopings), uname
+        assert any("untrusted_scope_input" in s.tags for s in ep.target_scopings), uname
+
+    scoping_diffs = [
+        d for d in diff_map.cross_path_diffs if d.category == DiffCategory.SCOPING_MISMATCH
+    ]
+    assert {d.compared_entrypoint_id for d in scoping_diffs} == {
+        f"api:api.{uname}" for uname in untrusted_names
+    }
+    assert not any(
+        d.compared_entrypoint_id == "api:api.api_ledger_trusted_helper"
+        and d.category in {DiffCategory.SCOPING_MISMATCH, DiffCategory.MISSING_TARGET_SCOPING}
+        for d in diff_map.cross_path_diffs
+    )
+
+
+def test_uncalled_inner_helper_permission_check_not_counted(tmp_path: Path) -> None:
+    """Case 3: Uncalled nested def/class or unreachable dead code must not count as endpoint permission."""
+    src_dir = tmp_path / "inner_app"
+    src_dir.mkdir()
+
+    (src_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "def _orphan_module_guard(request):",
+                "    require_permission(request, 'token.manage')",
+                "",
+                "def api_token_called_inner(request, token_id: int):",
+                "    def _enforce():",
+                "        require_permission(request, 'token.manage')",
+                "    _enforce()",
+                "    tok = ApiToken.objects.get(pk=token_id, tenant_id=request.user.tenant_id)",
+                "    tok.save()",
+                "    return {'ok': True}",
+                "",
+                "def api_token_uncalled_inner_def(request, token_id: int):",
+                "    def _unused_guard():",
+                "        require_permission(request, 'token.manage')",
+                "    tok = ApiToken.objects.get(pk=token_id, tenant_id=request.user.tenant_id)",
+                "    tok.save()",
+                "    return {'ok': True}",
+                "",
+                "def api_token_uncalled_inner_async(request, token_id: int):",
+                "    async def _unused_async_guard():",
+                "        require_permission(request, 'token.manage')",
+                "    tok = ApiToken.objects.get(pk=token_id, tenant_id=request.user.tenant_id)",
+                "    tok.save()",
+                "    return {'ok': True}",
+                "",
+                "def api_token_uncalled_inner_class(request, token_id: int):",
+                "    class _UnusedGuardClass:",
+                "        @permission_required('token.manage')",
+                "        def check(self):",
+                "            require_permission(request, 'token.manage')",
+                "    tok = ApiToken.objects.get(pk=token_id, tenant_id=request.user.tenant_id)",
+                "    tok.save()",
+                "    return {'ok': True}",
+                "",
+                "def api_token_dead_code_after_return(request, token_id: int):",
+                "    tok = ApiToken.objects.get(pk=token_id, tenant_id=request.user.tenant_id)",
+                "    tok.save()",
+                "    return {'ok': True}",
+                "    require_permission(request, 'token.manage')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    diff_map = build_boundary_diff_map(
+        "token",
+        src_dir,
+        baseline_entrypoint="api:api.api_token_called_inner",
+    )
+    by_name = {ep.name: ep for ep in diff_map.entrypoints}
+
+    # Positive control: called inner helper IS counted
+    called = by_name["api_token_called_inner"]
+    assert called.permission_status == PermissionStatus.CHECKED
+    assert any(p.name == "require_permission" for p in called.permission_checks)
+
+    uncalled_names = [
+        "api_token_uncalled_inner_def",
+        "api_token_uncalled_inner_async",
+        "api_token_uncalled_inner_class",
+        "api_token_dead_code_after_return",
+    ]
+    for uname in uncalled_names:
+        ep = by_name[uname]
+        assert ep.permission_status == PermissionStatus.MISSING, uname
+        assert ep.permission_checks == (), uname
+
+    missing_perm_diffs = [
+        d
+        for d in diff_map.cross_path_diffs
+        if d.category == DiffCategory.MISSING_PERMISSION_CHECK
+    ]
+    assert {d.compared_entrypoint_id for d in missing_perm_diffs} == {
+        f"api:api.{uname}" for uname in uncalled_names
+    }
+
+
+def test_indeterminable_unknown_controls_never_claim_parity_or_safe_tags(
+    tmp_path: Path,
+) -> None:
+    """Case 4: Dynamic/conditional/unresolved controls must be marked unknown and never claim parity."""
+    src_dir = tmp_path / "unknown_app"
+    src_dir.mkdir()
+
+    (src_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "@permission_required('quota.manage')",
+                "def api_quota_static_baseline(request, quota_id: int):",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    row.name = cleaned",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "class DynamicPermQuotaApiView(APIView):",
+                "    permission_classes = get_configured_permissions()",
+                "    def post(self, request, quota_id: int):",
+                "        cleaned = normalize_quota_name(request.data['name'])",
+                "        row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "        row.name = cleaned",
+                "        row.save()",
+                "        return {'ok': True}",
+                "",
+                "def api_quota_getattr_perm(request, quota_id: int):",
+                "    checker = getattr(policy_registry, request.GET.get('mode', 'default'))",
+                "    checker(request)",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@DECORATORS[CURRENT_TIER]",
+                "def api_quota_unresolved_decorator(request, quota_id: int):",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "def api_quota_conditional_perm(request, quota_id: int):",
+                "    if feature_flags.enforce_quota_acl:",
+                "        require_permission(request, 'quota.manage')",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@permission_required('quota.manage')",
+                "def api_quota_dynamic_kwargs_scope(request, quota_id: int):",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    filters = build_dynamic_scope(request)",
+                "    row = QuotaRule.objects.filter(id=quota_id, **filters).first()",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@permission_required('quota.manage')",
+                "def api_quota_dynamic_validator(request, quota_id: int):",
+                "    cleaned = getattr(validators, 'quota_norm')(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    row.save()",
+                "    return {'ok': True}",
+                "",
+                "@permission_required('quota.manage')",
+                "def api_quota_dynamic_sink(request, quota_id: int):",
+                "    cleaned = normalize_quota_name(request.data['name'])",
+                "    row = QuotaRule.objects.get(pk=quota_id, tenant_id=request.user.tenant_id)",
+                "    getattr(row, request.data['action'])()",
+                "    return {'ok': True}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    diff_map = build_boundary_diff_map(
+        "quota",
+        src_dir,
+        baseline_entrypoint="api:api.api_quota_static_baseline",
+    )
+    by_qname = {ep.qualified_name: ep for ep in diff_map.entrypoints}
+
+    # Dynamic permission cases -> PermissionStatus.UNKNOWN, no safe permission tags
+    for perm_unknown_name in (
+        "api.DynamicPermQuotaApiView.post",
+        "api.api_quota_getattr_perm",
+        "api.api_quota_unresolved_decorator",
+        "api.api_quota_conditional_perm",
+    ):
+        ep = by_qname[perm_unknown_name]
+        assert ep.permission_status == PermissionStatus.UNKNOWN, perm_unknown_name
+        assert ep.permission_checks == (), perm_unknown_name
+        assert any(
+            u.category == BoundaryItemCategory.PERMISSION_CHECK and "unknown" in u.tags
+            for u in ep.unknown_items
+        ), perm_unknown_name
+
+    # Dynamic scoping -> ScopingStatus.UNKNOWN, no tenant_or_owner_scoped tag
+    scope_unknown = by_qname["api.api_quota_dynamic_kwargs_scope"]
+    assert scope_unknown.scoping_status == ScopingStatus.UNKNOWN
+    assert not any("tenant_or_owner_scoped" in s.tags for s in scope_unknown.target_scopings)
+    assert any(
+        u.category == BoundaryItemCategory.TARGET_SCOPING and "unknown" in u.tags
+        for u in scope_unknown.unknown_items
+    )
+
+    # Dynamic validator -> ValidationStatus.UNKNOWN, no safe validation tags
+    val_unknown = by_qname["api.api_quota_dynamic_validator"]
+    assert val_unknown.validation_status == ValidationStatus.UNKNOWN
+    assert val_unknown.input_validations == ()
+    assert any(
+        u.category == BoundaryItemCategory.INPUT_VALIDATION and "unknown" in u.tags
+        for u in val_unknown.unknown_items
+    )
+
+    # Dynamic sink -> UpdateSinkStatus.UNKNOWN, no safe sink tags
+    sink_unknown = by_qname["api.api_quota_dynamic_sink"]
+    assert sink_unknown.update_sink_status == UpdateSinkStatus.UNKNOWN
+    assert sink_unknown.update_sinks == ()
+    assert any(
+        u.category == BoundaryItemCategory.UPDATE_SINK and "unknown" in u.tags
+        for u in sink_unknown.unknown_items
+    )
+
+    indeterminable_diffs = [
+        d
+        for d in diff_map.cross_path_diffs
+        if d.category == DiffCategory.INDETERMINABLE_BOUNDARY
+    ]
+    assert {d.compared_entrypoint_id for d in indeterminable_diffs} == {
+        f"api:{name}"
+        for name in (
+            "api.DynamicPermQuotaApiView.post",
+            "api.api_quota_getattr_perm",
+            "api.api_quota_unresolved_decorator",
+            "api.api_quota_conditional_perm",
+            "api.api_quota_dynamic_kwargs_scope",
+            "api.api_quota_dynamic_validator",
+            "api.api_quota_dynamic_sink",
+        )
+    }
+
+    # Even comparing two unknown paths directly must NOT claim parity
+    two_unknown_dir = tmp_path / "two_unknown"
+    two_unknown_dir.mkdir()
+    (two_unknown_dir / "api.py").write_text(
+        "\n".join(
+            [
+                "class UnknownOneApiView(APIView):",
+                "    permission_classes = get_perms_a()",
+                "    def post(self, request, item_id: int):",
+                "        row = Item.objects.get(pk=item_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+                "",
+                "class UnknownTwoApiView(APIView):",
+                "    permission_classes = get_perms_b()",
+                "    def post(self, request, item_id: int):",
+                "        row = Item.objects.get(pk=item_id, tenant_id=request.user.tenant_id)",
+                "        row.save()",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    two_unknown_map = build_boundary_diff_map("item", two_unknown_dir)
+    assert any(
+        d.category == DiffCategory.INDETERMINABLE_BOUNDARY
+        for d in two_unknown_map.cross_path_diffs
+    )
+
 

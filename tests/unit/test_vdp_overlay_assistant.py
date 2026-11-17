@@ -7,6 +7,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import pytest
 from ctf_mcp.adapters.vdp_product_test import (
     VdpOverlaySpec,
     VdpTargetProfile,
+    compute_vdp_profile_digest,
     load_registered_vdp_profiles,
     save_registered_vdp_profile,
     validate_vdp_profile_registration,
@@ -518,3 +520,432 @@ def test_cli_subparser_and_handler_dry_run_and_apply(tmp_path: Path, capsys: Any
     assert apply_out["status"] == "registered"
     assert apply_out["applied"] is True
     assert (vault_root / "_vdp" / "profiles.json").exists()
+
+
+def _make_synthetic_profile(
+    *,
+    profile_name: str,
+    bundle_name: str,
+    overlay_dir: Path,
+    test_filename: str,
+    func_name: str,
+    checkout_dir: Path,
+    commit_sha: str,
+    revision: str = "r1",
+) -> VdpTargetProfile:
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    test_file = overlay_dir / test_filename
+    test_file.write_text(f"def {func_name}():\n    assert True\n", encoding="utf-8")
+    file_sha = _sha256_bytes(test_file.read_bytes())
+    selector = f"/src/vdp-test-overlay/{test_filename}::{func_name}"
+    return validate_vdp_profile_registration(
+        VdpTargetProfile(
+            profile_name=profile_name,
+            profile_revision=revision,
+            image_ref=SYNTHETIC_IMAGE_REF,
+            expected_image_digest=SYNTHETIC_IMAGE_DIGEST,
+            expected_source_commit=commit_sha,
+            checkout_dir=checkout_dir,
+            allowed_test_selectors=(selector,),
+            positive_selectors=(selector,),
+            allowed_overlays={
+                bundle_name: VdpOverlaySpec(
+                    bundle_name=bundle_name,
+                    host_dir=overlay_dir,
+                    container_target="/src/vdp-test-overlay",
+                    allowed_files={test_filename: file_sha},
+                )
+            },
+        )
+    )
+
+
+def test_cross_base_profile_on_existing_target_refused_and_removed_diff_shown(tmp_path: Path) -> None:
+    checkout_dir = tmp_path / "checkout"
+    commit_sha = _init_synthetic_git_repo(checkout_dir)
+    fake_docker = _write_fake_docker(tmp_path)
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+
+    target_profile = _make_synthetic_profile(
+        profile_name="target",
+        bundle_name="bundle-target",
+        overlay_dir=tmp_path / "ov-target",
+        test_filename="test_target.py",
+        func_name="test_positive_target",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+    )
+    # Even when base shares the same selector (previously caused can_apply=True and silent drop!),
+    # cross-base on an existing target must surface removed_overlays and fail closed.
+    base_shared_sel = _make_synthetic_profile(
+        profile_name="base-shared",
+        bundle_name="bundle-base-shared",
+        overlay_dir=tmp_path / "ov-base-shared",
+        test_filename="test_target.py",
+        func_name="test_positive_target",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+    )
+    base_distinct = _make_synthetic_profile(
+        profile_name="base-distinct",
+        bundle_name="bundle-base-distinct",
+        overlay_dir=tmp_path / "ov-base-distinct",
+        test_filename="test_base.py",
+        func_name="test_positive_base",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+    )
+    save_registered_vdp_profile(vault_root, target_profile)
+    save_registered_vdp_profile(vault_root, base_shared_sel)
+    save_registered_vdp_profile(vault_root, base_distinct)
+    profiles_path = vault_root / "_vdp" / "profiles.json"
+    before_bytes = profiles_path.read_bytes()
+
+    new_ov = tmp_path / "ov-new"
+    new_ov.mkdir()
+    (new_ov / "test_new.py").write_text("def test_positive_new():\n    assert True\n", encoding="utf-8")
+
+    # 1. Shared-selector base against existing target: removed_overlays catches bundle-target loss
+    preview_shared = preview_and_register_overlay(
+        overlay_dir=new_ov,
+        profile_name="target",
+        overlay_bundle="bundle-new",
+        base_profile="base-shared",
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+    )
+    assert preview_shared["can_apply"] is False
+    assert "bundle-target" in preview_shared["removed_overlays"]
+    assert preview_shared["removed_selectors"] == []
+    codes_shared = {c["code"] for c in preview_shared["apply_conflicts"]}
+    assert "cross_base_profile_existing_target_denied" in codes_shared
+    assert "would_remove_existing_target_overlays" in codes_shared
+
+    with pytest.raises(ContractViolationError) as exc_shared:
+        preview_and_register_overlay(
+            overlay_dir=new_ov,
+            profile_name="target",
+            overlay_bundle="bundle-new",
+            base_profile="base-shared",
+            vault_root=vault_root,
+            docker_bin=str(fake_docker),
+            apply=True,
+            confirm_apply=True,
+        )
+    assert exc_shared.value.code == "registration_overwrite_refused"
+    assert profiles_path.read_bytes() == before_bytes
+
+    # 2. Distinct-selector base against existing target: both removed_overlays & removed_selectors populated against target
+    preview_distinct = preview_and_register_overlay(
+        overlay_dir=new_ov,
+        profile_name="target",
+        overlay_bundle="bundle-new",
+        base_profile="base-distinct",
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+    )
+    assert preview_distinct["can_apply"] is False
+    assert "bundle-target" in preview_distinct["removed_overlays"]
+    assert [s["selector"] for s in preview_distinct["removed_selectors"]] == [
+        "/src/vdp-test-overlay/test_target.py::test_positive_target"
+    ]
+    codes_distinct = {c["code"] for c in preview_distinct["apply_conflicts"]}
+    assert {
+        "cross_base_profile_existing_target_denied",
+        "would_remove_existing_target_overlays",
+        "would_remove_existing_target_selectors",
+    }.issubset(codes_distinct)
+
+    # 3. Safe path A: updating existing target without --base-profile stacks cleanly
+    stacked = preview_and_register_overlay(
+        overlay_dir=new_ov,
+        profile_name="target",
+        overlay_bundle="bundle-new",
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+        apply=True,
+        confirm_apply=True,
+    )
+    assert stacked["applied"] is True
+    assert stacked["removed_overlays"] == {}
+    assert stacked["removed_selectors"] == []
+    loaded_target = load_registered_vdp_profiles(vault_root)["target"]
+    assert set(loaded_target.allowed_overlays.keys()) == {"bundle-target", "bundle-new"}
+
+    # 4. Safe path B: passing --base-profile target (self) stacks cleanly too
+    ov_third = tmp_path / "ov-third"
+    ov_third.mkdir()
+    (ov_third / "test_third.py").write_text("def test_positive_third():\n    assert True\n", encoding="utf-8")
+    stacked_self = preview_and_register_overlay(
+        overlay_dir=ov_third,
+        profile_name="target",
+        overlay_bundle="bundle-third",
+        base_profile="target",
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+        apply=True,
+        confirm_apply=True,
+    )
+    assert stacked_self["applied"] is True
+    assert stacked_self["removed_overlays"] == {}
+    loaded_target_after = load_registered_vdp_profiles(vault_root)["target"]
+    assert set(loaded_target_after.allowed_overlays.keys()) == {
+        "bundle-target",
+        "bundle-new",
+        "bundle-third",
+    }
+
+    # 5. Safe path C: --base-profile base-distinct when creating a brand-new profile works cleanly
+    cloned = preview_and_register_overlay(
+        overlay_dir=new_ov,
+        profile_name="brand-new-target",
+        overlay_bundle="bundle-new",
+        base_profile="base-distinct",
+        vault_root=vault_root,
+        docker_bin=str(fake_docker),
+        apply=True,
+        confirm_apply=True,
+    )
+    assert cloned["applied"] is True
+    assert cloned["removed_overlays"] == {}
+    assert cloned["removed_selectors"] == []
+    loaded_all = load_registered_vdp_profiles(vault_root)
+    assert set(loaded_all["brand-new-target"].allowed_overlays.keys()) == {
+        "bundle-base-distinct",
+        "bundle-new",
+    }
+    assert set(loaded_all["base-distinct"].allowed_overlays.keys()) == {"bundle-base-distinct"}
+
+
+def test_unhealthy_env_refused_by_default_on_apply_and_cli_opt_out(tmp_path: Path, capsys: Any) -> None:
+    checkout_dir = tmp_path / "checkout"
+    commit_sha = _init_synthetic_git_repo(checkout_dir)
+    bad_docker = _write_fake_docker(tmp_path, inspect_fail=True)
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    overlay_dir = tmp_path / "ov"
+    overlay_dir.mkdir()
+    (overlay_dir / "test_ok.py").write_text("def test_positive_ok():\n    assert True\n", encoding="utf-8")
+
+    # 1. Dry-run preview surfaces env_check_failed and can_apply=False by default
+    preview = preview_and_register_overlay(
+        overlay_dir=overlay_dir,
+        profile_name="unhealthy-app",
+        overlay_bundle="bundle-1",
+        vault_root=vault_root,
+        image_ref=SYNTHETIC_IMAGE_REF,
+        expected_image_digest=SYNTHETIC_IMAGE_DIGEST,
+        expected_source_commit=commit_sha,
+        checkout_dir=checkout_dir,
+        docker_bin=str(bad_docker),
+    )
+    assert preview["env_health"]["healthy"] is False
+    assert preview["can_apply"] is False
+    assert any(c["code"] == "env_check_failed" for c in preview["apply_conflicts"])
+
+    # 2. apply=True with default require_healthy_env=True refuses unhealthy env
+    with pytest.raises(ContractViolationError) as exc:
+        preview_and_register_overlay(
+            overlay_dir=overlay_dir,
+            profile_name="unhealthy-app",
+            overlay_bundle="bundle-1",
+            vault_root=vault_root,
+            image_ref=SYNTHETIC_IMAGE_REF,
+            expected_image_digest=SYNTHETIC_IMAGE_DIGEST,
+            expected_source_commit=commit_sha,
+            checkout_dir=checkout_dir,
+            docker_bin=str(bad_docker),
+            apply=True,
+            confirm_apply=True,
+        )
+    assert exc.value.code == "env_check_failed"
+    assert not (vault_root / "_vdp" / "profiles.json").exists()
+
+    # 3. CLI default also refuses unhealthy env on --apply --confirm-apply without --require-healthy-env
+    parser = argparse.ArgumentParser(prog="ctf-mcp-admin")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    register_overlay_assistant_subparser(subparsers)
+    cli_args = [
+        "register-vdp-overlay",
+        "--vault-root",
+        str(vault_root),
+        "--overlay-dir",
+        str(overlay_dir),
+        "--profile-name",
+        "unhealthy-app",
+        "--overlay-bundle",
+        "bundle-1",
+        "--image-ref",
+        SYNTHETIC_IMAGE_REF,
+        "--image-digest",
+        SYNTHETIC_IMAGE_DIGEST,
+        "--source-commit",
+        commit_sha,
+        "--checkout-dir",
+        str(checkout_dir),
+        "--docker-bin",
+        str(bad_docker),
+        "--apply",
+        "--confirm-apply",
+    ]
+    with pytest.raises(ContractViolationError) as cli_exc:
+        handle_overlay_assistant(parser.parse_args(cli_args), env={})
+    assert cli_exc.value.code == "env_check_failed"
+    assert not (vault_root / "_vdp" / "profiles.json").exists()
+
+    # 4. Explicit --allow-unhealthy-env opt-out permits apply when operator overrides
+    rc = handle_overlay_assistant(parser.parse_args([*cli_args, "--allow-unhealthy-env"]), env={})
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["applied"] is True
+    assert out["env_health"]["healthy"] is False
+    assert "unhealthy-app" in load_registered_vdp_profiles(vault_root)
+
+
+def test_concurrent_overlay_registration_cas_prevents_lost_updates(tmp_path: Path) -> None:
+    checkout_dir = tmp_path / "checkout"
+    commit_sha = _init_synthetic_git_repo(checkout_dir)
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+
+    # Fake docker with brief delay so both threads overlap during env check before save
+    slow_docker = tmp_path / "slow-fake-docker"
+    slow_docker.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        "time.sleep(0.05)\n"
+        f"sys.stdout.write({SYNTHETIC_IMAGE_DIGEST!r} + '\\n')\n",
+        encoding="utf-8",
+    )
+    slow_docker.chmod(0o755)
+
+    base_prof = _make_synthetic_profile(
+        profile_name="concurrent-app",
+        bundle_name="bundle-base",
+        overlay_dir=tmp_path / "ov-base",
+        test_filename="test_base.py",
+        func_name="test_positive_base",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+        revision="r1",
+    )
+    save_registered_vdp_profile(vault_root, base_prof)
+
+    ov_a = tmp_path / "ov-a"
+    ov_a.mkdir()
+    (ov_a / "test_a.py").write_text("def test_positive_a():\n    assert True\n", encoding="utf-8")
+    ov_b = tmp_path / "ov-b"
+    ov_b.mkdir()
+    (ov_b / "test_b.py").write_text("def test_positive_b():\n    assert True\n", encoding="utf-8")
+
+    # 1. Two concurrent writers adding distinct bundles to the same profile:
+    #    exactly one succeeds (r2) and the stale writer fails closed with profile_cas_conflict.
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[str, str, Any]] = []
+    outcomes_lock = threading.Lock()
+
+    def _worker(ov_dir: Path, bundle: str) -> None:
+        barrier.wait(timeout=5.0)
+        try:
+            res = preview_and_register_overlay(
+                overlay_dir=ov_dir,
+                profile_name="concurrent-app",
+                overlay_bundle=bundle,
+                vault_root=vault_root,
+                docker_bin=str(slow_docker),
+                apply=True,
+                confirm_apply=True,
+            )
+            with outcomes_lock:
+                outcomes.append(("ok", bundle, res["profile_revision"]))
+        except ContractViolationError as exc:
+            with outcomes_lock:
+                outcomes.append(("conflict", bundle, exc.code))
+
+    t1 = threading.Thread(target=_worker, args=(ov_a, "bundle-a"))
+    t2 = threading.Thread(target=_worker, args=(ov_b, "bundle-b"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+
+    assert len(outcomes) == 2
+    winners = [item for item in outcomes if item[0] == "ok"]
+    losers = [item for item in outcomes if item[0] == "conflict"]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert winners[0][2] == "r2"
+    assert losers[0][2] == "profile_cas_conflict"
+
+    winning_bundle = winners[0][1]
+    losing_bundle = losers[0][1]
+    losing_dir = ov_a if losing_bundle == "bundle-a" else ov_b
+
+    loaded_after_race = load_registered_vdp_profiles(vault_root)["concurrent-app"]
+    assert loaded_after_race.profile_revision == "r2"
+    assert set(loaded_after_race.allowed_overlays.keys()) == {"bundle-base", winning_bundle}
+
+    # Re-running the rejected bundle sequentially against r2 stacks cleanly to r3 with zero lost bundles
+    retried = preview_and_register_overlay(
+        overlay_dir=losing_dir,
+        profile_name="concurrent-app",
+        overlay_bundle=losing_bundle,
+        vault_root=vault_root,
+        docker_bin=str(slow_docker),
+        apply=True,
+        confirm_apply=True,
+    )
+    assert retried["profile_revision"] == "r3"
+    loaded_final = load_registered_vdp_profiles(vault_root)["concurrent-app"]
+    assert set(loaded_final.allowed_overlays.keys()) == {"bundle-base", "bundle-a", "bundle-b"}
+
+    # 2. Direct save_registered_vdp_profile CAS conflict check + multi-profile lock check
+    stale_digest = compute_vdp_profile_digest(base_prof)
+    with pytest.raises(ContractViolationError) as cas_exc:
+        save_registered_vdp_profile(
+            vault_root,
+            loaded_final.model_copy(update={"profile_revision": "r4"}),
+            expected_profile_revision="r1",
+            expected_profile_digest=stale_digest,
+        )
+    assert cas_exc.value.code == "profile_cas_conflict"
+
+    # Concurrent saves to distinct profiles in the same vault must preserve every profile
+    p_one = _make_synthetic_profile(
+        profile_name="distinct-one",
+        bundle_name="b-one",
+        overlay_dir=tmp_path / "ov-one",
+        test_filename="test_one.py",
+        func_name="test_positive_one",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+    )
+    p_two = _make_synthetic_profile(
+        profile_name="distinct-two",
+        bundle_name="b-two",
+        overlay_dir=tmp_path / "ov-two",
+        test_filename="test_two.py",
+        func_name="test_positive_two",
+        checkout_dir=checkout_dir,
+        commit_sha=commit_sha,
+    )
+    barrier2 = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _save_distinct(prof: VdpTargetProfile) -> None:
+        barrier2.wait(timeout=5.0)
+        try:
+            save_registered_vdp_profile(vault_root, prof, expected_profile_revision=None)
+        except BaseException as exc:  # pragma: no cover - regression check
+            errors.append(exc)
+
+    s1 = threading.Thread(target=_save_distinct, args=(p_one,))
+    s2 = threading.Thread(target=_save_distinct, args=(p_two,))
+    s1.start()
+    s2.start()
+    s1.join(timeout=15.0)
+    s2.join(timeout=15.0)
+    assert errors == []
+    all_profiles = load_registered_vdp_profiles(vault_root)
+    assert {"concurrent-app", "distinct-one", "distinct-two"}.issubset(all_profiles.keys())

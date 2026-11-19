@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -28,6 +29,8 @@ from ctf_mcp.fs_guard import safe_read_bounded
 from ctf_mcp.storage import Storage
 
 DEFAULT_MAX_VDP_VERIFY_READ_BYTES = 10 * 1024 * 1024
+
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _MANDATORY_LIMITATIONS: tuple[str, ...] = (
     "synthetic_data_only",
@@ -157,6 +160,16 @@ class VdpProductTestVerifier:
                     )
                     return False, incomplete_found, payloads
 
+                if isinstance(parsed, dict) and (
+                    parsed.get("schema") == "vdp-manual-observation/1"
+                    or parsed.get("execution_provenance") == "manual_isolated_observation"
+                ):
+                    checks.append("manual_observation_cannot_escalate_to_vdp_product_test")
+                    limitations.append(
+                        "Manual isolated observation evidence cannot be promoted to harness vdp.product_test verification."
+                    )
+                    return False, incomplete_found, payloads
+
                 if not isinstance(parsed, dict) or parsed.get("schema") != "vdp-product-test-evidence/1":
                     if isinstance(parsed, dict) and (
                         "pinned_ip" in parsed or "status_code" in parsed or "hops" in parsed
@@ -227,10 +240,18 @@ class VdpProductTestVerifier:
                 verified_at=self._clock(),
             )
 
+        def _append_check(tag: str) -> None:
+            if tag not in checks:
+                checks.append(tag)
+
+        def _append_limitation(msg: str) -> None:
+            if msg not in limitations:
+                limitations.append(msg)
+
         for p in payloads:
             if not p.get("container_cleanup_confirmed") or not p.get("process_cleanup_confirmed"):
-                checks.append("cleanup_confirmation:unconfirmed")
-                limitations.append(
+                _append_check("cleanup_confirmation:unconfirmed")
+                _append_limitation(
                     "Container or child-process cleanup was not confirmed."
                 )
                 return VerificationRecord(
@@ -244,9 +265,130 @@ class VdpProductTestVerifier:
                     evidence_ids=eid_tuple,
                     verified_at=self._clock(),
                 )
-            if p.get("network_mode") != "none":
-                checks.append("network_isolation:violated")
-                limitations.append("Product tests must execute with network_mode='none'.")
+
+            net_mode = p.get("network_mode")
+            if net_mode == "none":
+                if p.get("services_executed"):
+                    _append_check("network_isolation:unexpected_services_in_none_mode")
+                    _append_limitation(
+                        "network_mode='none' evidence cannot declare running dependency services."
+                    )
+                    return VerificationRecord(
+                        verification_id=f"ver-{uuid.uuid4().hex}",
+                        run_id=run_id,
+                        verifier_id=self.verifier_id,
+                        verifier_revision=self.verifier_revision,
+                        status=VerificationStatus.FAILED,
+                        checks_performed=tuple(checks),
+                        limitations=tuple(limitations),
+                        evidence_ids=eid_tuple,
+                        verified_at=self._clock(),
+                    )
+            elif net_mode == "isolated_internal_services":
+                if not p.get("service_cleanup_confirmed") or not p.get("network_cleanup_confirmed"):
+                    _append_check("cleanup_confirmation:unconfirmed")
+                    _append_limitation(
+                        "Internal service containers or dedicated internal Docker network cleanup was not confirmed."
+                    )
+                    return VerificationRecord(
+                        verification_id=f"ver-{uuid.uuid4().hex}",
+                        run_id=run_id,
+                        verifier_id=self.verifier_id,
+                        verifier_revision=self.verifier_revision,
+                        status=VerificationStatus.FAILED,
+                        checks_performed=tuple(checks),
+                        limitations=tuple(limitations),
+                        evidence_ids=eid_tuple,
+                        verified_at=self._clock(),
+                    )
+                net_iso = p.get("network_isolation")
+                net_name = net_iso.get("network_name") if isinstance(net_iso, dict) else None
+                net_ok = (
+                    isinstance(net_iso, dict)
+                    and net_iso.get("mode") == "isolated_internal_services"
+                    and net_iso.get("internal_flag_verified") is True
+                    and net_iso.get("external_egress_blocked") is True
+                    and net_iso.get("published_ports_verified_none") is True
+                    and net_iso.get("published_ports_count") == 0
+                    and isinstance(net_name, str)
+                    and net_name.startswith("ctf-vdp-net-")
+                )
+                if not net_ok:
+                    _append_check("network_isolation:violated")
+                    _append_limitation(
+                        "isolated_internal_services evidence requires verified internal=true network, blocked egress, and zero published ports."
+                    )
+                    return VerificationRecord(
+                        verification_id=f"ver-{uuid.uuid4().hex}",
+                        run_id=run_id,
+                        verifier_id=self.verifier_id,
+                        verifier_revision=self.verifier_revision,
+                        status=VerificationStatus.FAILED,
+                        checks_performed=tuple(checks),
+                        limitations=tuple(limitations),
+                        evidence_ids=eid_tuple,
+                        verified_at=self._clock(),
+                    )
+                svcs = p.get("services_executed")
+                if not isinstance(svcs, list) or not svcs:
+                    _append_check("service_isolation_or_pin:failed")
+                    _append_limitation(
+                        "isolated_internal_services evidence must record pinned dependency services."
+                    )
+                    return VerificationRecord(
+                        verification_id=f"ver-{uuid.uuid4().hex}",
+                        run_id=run_id,
+                        verifier_id=self.verifier_id,
+                        verifier_revision=self.verifier_revision,
+                        status=VerificationStatus.FAILED,
+                        checks_performed=tuple(checks),
+                        limitations=tuple(limitations),
+                        evidence_ids=eid_tuple,
+                        verified_at=self._clock(),
+                    )
+                for svc in svcs:
+                    svc_ok = (
+                        isinstance(svc, dict)
+                        and isinstance(svc.get("service_name"), str)
+                        and bool(svc["service_name"].strip())
+                        and isinstance(svc.get("image_digest"), str)
+                        and bool(_SHA256_DIGEST_RE.fullmatch(svc["image_digest"]))
+                        and svc.get("published_ports_verified_none") is True
+                        and svc.get("ready_verified") is True
+                        and svc.get("container_cleanup_confirmed") is True
+                        and isinstance(svc.get("cpus"), int)
+                        and not isinstance(svc.get("cpus"), bool)
+                        and svc["cpus"] >= 1
+                        and isinstance(svc.get("memory_mb"), int)
+                        and not isinstance(svc.get("memory_mb"), bool)
+                        and svc["memory_mb"] >= 128
+                    )
+                    if not svc_ok:
+                        _append_check("service_isolation_or_pin:failed")
+                        _append_limitation(
+                            "One or more internal service records lacked pinned image digest, readiness, resource cap, port-none proof, or cleanup confirmation."
+                        )
+                        return VerificationRecord(
+                            verification_id=f"ver-{uuid.uuid4().hex}",
+                            run_id=run_id,
+                            verifier_id=self.verifier_id,
+                            verifier_revision=self.verifier_revision,
+                            status=VerificationStatus.FAILED,
+                            checks_performed=tuple(checks),
+                            limitations=tuple(limitations),
+                            evidence_ids=eid_tuple,
+                            verified_at=self._clock(),
+                        )
+                _append_check("network_isolation:internal_services_verified")
+                _append_check("published_ports:none_verified")
+                _append_check("service_image_pins:verified")
+                _append_check("service_and_network_cleanup:confirmed")
+                _append_limitation("isolated_internal_service_network_no_external_egress")
+            else:
+                _append_check("network_isolation:violated")
+                _append_limitation(
+                    "Product tests must execute with network_mode='none' or verified 'isolated_internal_services'."
+                )
                 return VerificationRecord(
                     verification_id=f"ver-{uuid.uuid4().hex}",
                     run_id=run_id,
@@ -258,9 +400,10 @@ class VdpProductTestVerifier:
                     evidence_ids=eid_tuple,
                     verified_at=self._clock(),
                 )
+
             if p.get("execution_provenance", "harness_docker_isolated") != "harness_docker_isolated":
-                checks.append("execution_provenance:unverified_external")
-                limitations.append(
+                _append_check("execution_provenance:unverified_external")
+                _append_limitation(
                     "Product tests must include harness_docker_isolated execution provenance."
                 )
                 return VerificationRecord(
@@ -419,9 +562,20 @@ class VdpProductTestVerifier:
                 verified_at=self._clock(),
             )
 
-        # Ensure every pytest payload shares the same pinned source commit & image digest as smoke.
+        # Ensure every pytest payload shares the same pinned source commit, image digest, network mode, and service digests as smoke.
         pinned_pairs = {
-            (str(p.get("source_commit")), str(p.get("image_digest")))
+            (
+                str(p.get("source_commit")),
+                str(p.get("image_digest")),
+                str(p.get("network_mode")),
+                tuple(
+                    sorted(
+                        (str(s.get("service_name")), str(s.get("image_digest")))
+                        for s in (p.get("services_executed") or ())
+                        if isinstance(s, dict)
+                    )
+                ),
+            )
             for p in payloads
         }
         if len(pinned_pairs) != 1:

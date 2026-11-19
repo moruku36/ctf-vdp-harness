@@ -53,6 +53,44 @@ ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
 
 HTTP requires a non-placeholder token; clients must authenticate. Local stdio relies on the local process trust boundary. Neither command establishes a public tunnel, OAuth flow, isolated guest network or working connection for every ChatGPT/Codex client. See [Connectivity](04-connectivity.md) for the deployment design and the [WSL2/Codex record](../records/p0-p6-wsl2-codex-environment-acceptance.md) for that environment's historical result.
 
+## Windows Codex -> Linux Docker host (Intel NUC) MCP setup & diagnostics
+
+When moving Docker execution from legacy WSL2 to a Linux host (such as the owner's Intel NUC), add an OpenSSH (`ssh.exe -T`) `[mcp_servers.ctf_vdp_harness]` entry in Windows `%USERPROFILE%\.codex\config.toml` (do not double backslashes inside single-quoted `'...'` TOML strings). Keep real hostnames, usernames, private key paths, and tokens out of Git.
+
+```toml
+[mcp_servers.ctf_vdp_harness]
+command = 'C:\WINDOWS\System32\OpenSSH\ssh.exe'
+args = [
+  "-T",
+  "-i", 'C:\Users\<USER>\.ssh\<KEY_FILE>',
+  "-o", "BatchMode=yes",
+  "-o", "StrictHostKeyChecking=yes",
+  "-o", "IdentitiesOnly=yes",
+  "-o", "ServerAliveInterval=30",
+  "-o", "ServerAliveCountMax=3",
+  "-o", "ConnectTimeout=10",
+  "<NUC_USER>@<NUC_HOST>",
+  "/home/<NUC_USER>/ctf-vdp-harness-runtime/launch-mcp-stdio.sh",
+  "--config", "/home/<NUC_USER>/ctf-vdp-harness-runtime/config.vdp-weblate.json",
+  "--allow-dynamic",
+]
+startup_timeout_sec = 30
+tool_timeout_sec = 360
+```
+
+- **Startup, config check & tool schema refresh**: Verify registration with `codex.exe mcp list` and `codex.exe mcp get ctf_vdp_harness` (`--strict-config` applies to root/`codex exec`). After updating server code or `config.toml`, start a fresh Codex session so cached MCP `tools/list` schemas refresh.
+- **Staged diagnostics & root-cause isolation**:
+  - On NUC: `ctf-mcp-admin diagnose-mcp --config <CONFIG_JSON> [--active-run <RUN_ID>] [--check-docker]`
+  - On Windows (read-only):
+    ```powershell
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\diagnose-nuc-mcp.ps1 `
+      -SshTarget "<NUC_USER>@<NUC_HOST>" `
+      -IdentityFile "C:\Users\<USER>\.ssh\<KEY_FILE>" `
+      -RunId "<RUN_ID>" -CheckDocker
+    ```
+  - Separate failures explicitly: `codex_config_missing`, `codex_config_legacy_wsl` (`wsl.exe` remnants), `stdout_pollution` (remote `.bashrc`/MOTD noise before JSON-RPC), `transport_closed_on_initialize` / `transport_closed_on_tools_list`, and `schema_mismatch_or_extra_forbidden` (live `additionalProperties: false` schema drift).
+- **Migration & rollback**: Always back up `config.toml` (e.g. `config.toml.before-nuc-mcp.bak`) before switching from legacy `wsl.exe` to OpenSSH; to roll back, restore the backup file and check out `main` on the NUC repo if needed.
+
 ## State inspection and recovery
 
 ```powershell
@@ -89,6 +127,9 @@ Dynamic operations require `--allow-dynamic` / `CTF_MCP_ALLOW_DYNAMIC` or the co
   - `anomaly_repro` passing cleanly returns `anomaly_observed` (observed the targeted behavior; never classified as `hypothesis_falsified`, kept separate from full vulnerability qualification/impact, and never auto-submitted).
   - Test or setup assertion failures yield `inconclusive` (`VerificationStatus.INCONCLUSIVE`) until root cause is inspected (never counted as vulnerability evidence). Skips, 0 collected items, timeouts, and environment errors never count as defense success or anomaly observation.
 - **Local staged fixture & structured conclusion evidence**: For offline (`--network=none`) end-to-end verification against loopback services, `ctf_mcp.vdp_fixtures` provides `LocalGitHttpFixture` (`127.0.0.1` ephemeral HTTP Git repo server) and `StageComparisonRecorder` to compare sender auth state, config creation paths, and three separate stages (`update_scheduled`, `sync_completed`, `data_changed`). Evidence receipts attach redacted `execution_context` and `conclusion_status` (`confirmed_conditions`, `unverified_conditions`) alongside pinned source commit, image digest, and overlay SHA-256, surfacing unverified conditions in `VerificationRecord.limitations` (for example synthetic data and `celery_eager_test_settings_async_unverified`).
+- **Bounded internal-service offline tests (`isolated_internal_services`)**: Neither `network_mode="none"` nor `VdpProductTestVerifier` is weakened. Only when an isolated dependency container such as PostgreSQL is required, register the profile explicitly with `--network-mode isolated_internal_services --service-json <JSON> --runner-mode direct_pytest [--pytest-executable <PATH>] [--smoke-selector <SEL>]`. At runtime, `VdpProductTestAdapter` creates a dedicated `docker network create --driver bridge --internal` network, verifies `Internal==true`, verifies `publish_ports=False` and zero `HostConfig.PortBindings`, pins service image digests, enforces combined CPU (`<=4`) and memory (`<=8192MB`) caps, probes `readiness_command`, and confirms full container, volume, and network teardown even on timeout/failure (`service_cleanup_confirmed`, `network_cleanup_confirmed`), all independently re-checked by `VdpProductTestVerifier`.
+- **Out-of-harness manual isolated observation provenance (`import-manual-observation`)**: Manual isolated runs executed outside `vdp.test` can be ingested via `ctf-mcp-admin import-manual-observation --run-id <RUN_ID> --manifest-json <JSON> [--test-file <PATH> ...] [--raw-log-file <LOG>]`. It records test-code SHA-256 digests, pinned revisions, passed/failed controls, unverified conditions, and cleanup confirmations, always tagged `execution_provenance="manual_isolated_observation"` with `promoted_to_vdp_product_test=False`. Passing it to `VdpProductTestVerifier` (`vdp.product_test`) fails closed with `manual_observation_cannot_escalate_to_vdp_product_test`.
+- **Human-reviewed VDP submission drafts & manual submission tracking (`export-vdp-draft` / `record-vdp-submission`)**: Complementing [run-report.md](../templates/run-report.md), operators can render human-reviewable disclosure drafts from [vdp-submission-draft.md](../templates/vdp-submission-draft.md) ([JA](../templates/vdp-submission-draft.ja.md)) via `ctf-mcp-admin export-vdp-draft --run-id <RUN_ID> --draft-json <JSON> [--language ja|en] [--output-relpath <REL>]`, keeping `vdp.product_test` evidence strictly distinct from `manual_isolated_observation`, running `assert_report_clean`, and enforcing `automatic_submission=False`. Only after manual external submission by the owner can `record-vdp-submission --run-id <RUN_ID> --finding-id <ID> --status submitted|accepted --report-url https://... --recorded-by <ACTOR>` persist report URL and state to `_vdp/submissions.json`.
 - **Tool surface & static extraction default**: `artifact.inspect` is omitted by default because `StaticArtifactInspectorAdapter` binds under `analysis.query` and no default adapter binds to `artifact.inspect`. When `max_matches` is omitted on `analysis.query(operation="extract_strings")`, the worker applies a safe default cap (`--max-matches 40` + `--soft-byte-budget`) returning `status="ok"`, `truncated=True`, `recommended_max_matches`, and `next_offset` without triggering `output_limit_exceeded` (explicit large `max_matches` still enforces `partial` / `output_limit_exceeded`).
 
 The runtime includes SQLite-owned run state, request idempotency, crash reconciliation/fencing, session leases, bounded artifact intake, paged/redacted evidence and export. These mechanisms and their acceptance limits are described in the [harness design](08-analysis-harness.md), [contracts](11-contracts-and-acceptance.md) and [dated records](README.md#acceptance-records), not a blanket security certification.

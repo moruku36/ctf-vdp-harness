@@ -33,12 +33,14 @@
 - [P0／P6 WSL2環境とCodex接続](../records/p0-p6-wsl2-codex-environment-acceptance.md)
 - [P7 VDP Weblate製品テストアダプタ](../records/p7-vdp-weblate-product-test-acceptance.md)
 - [P8 VDP日次運用・W-02ライブ受入記録](../records/p8-vdp-daily-workflow-acceptance-2026-11-14.md)
+- [P9 Windows→NUC MCP・内部サービス隔離試験・手動来歴・提出下書き受入記録 (2026-11-19)](../records/p9-nuc-mcp-isolated-services-provenance-acceptance-2026-11-19.md)
 
 P5はA（MCPなし）、B（単発の静的検査）、C（状態を保持するハーネス）、D（開発課題由来の凍結ガイドを加えたC）を、開発用10件・重複しない合成ホールドアウト20件で比較します。初回`pass@1`と`best_of_k`を区別し、VDPの脆弱版／修正版ペアをCTFの分母から分離し、悪化やAPI料金未計測も記録します。実モデルや実対象での性能向上を示すものではありません。
 
 ## 雛形と連携
 
 - [調査レポート雛形](../templates/run-report.ja.md)：実クライアント・モデル・推論設定、スコープ、予算、再現可能な証拠を記録。
+- [VDP提出用下書き雛形](../templates/vdp-submission-draft.ja.md)（[English](../templates/vdp-submission-draft.md)）：対照試験・影響の限界・未確認条件・AI利用開示・証拠来歴を分離記載する人レビュー用雛形（自動提出無効）。
 - [証拠schemaの説明](../schemas/README.ja.md)・[合成証拠の例](../examples/evidence-page.synthetic.json)。
 - [オフライン試行設定](../configs/offline-pilot.example.json)：全アダプタ無効の非実行設計例。起動用設定ではありません。
 - [第三者ライセンス](../THIRD_PARTY_LICENSES.md)：依存関係の通知であり、このプロジェクトのライセンスではありません。

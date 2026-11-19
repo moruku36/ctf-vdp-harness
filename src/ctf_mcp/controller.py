@@ -67,6 +67,7 @@ from ctf_mcp.contracts import (
     EvidenceRef,
     ExecutionClass,
     FindingRecord,
+    FindingState,
     GuestBlockedError,
     GuestHealthState,
     HypothesisRecord,
@@ -83,17 +84,28 @@ from ctf_mcp.contracts import (
     VerificationRecord,
     canonical_digest,
     lifecycle_to_envelope_status,
+    sha256_bytes,
 )
 from ctf_mcp.evidence import (
+    MANUAL_OBSERVATION_PROVENANCE,
+    MANUAL_OBSERVATION_SCHEMA,
     BoundedEvidenceImporter,
     EvidenceRedactor,
     EvidenceVault,
     ExportResult,
     ImportReceipt,
+    ManualObservationRecord,
     RedactedViewOutcome,
     ReportMetadata,
     RunReportExporter,
+    VdpDraftExportResult,
+    VdpDraftSpec,
+    VdpSubmissionRecord,
+    export_vdp_submission_draft,
+    load_vdp_submissions,
+    record_manual_vdp_submission,
     scan_sensitive_markers,
+    serialize_manual_observation,
 )
 from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
 from ctf_mcp.gateway import (
@@ -1630,6 +1642,14 @@ class HarnessController:
                 vdp_spec = self._adapters.get("vdp.test")
             if vdp_spec is not None and hasattr(vdp_spec.adapter, "list_public_profiles"):
                 summary["vdp_profiles"] = vdp_spec.adapter.list_public_profiles()
+            summary["manual_observations"] = self._list_manual_observations(
+                run_id=run_id,
+                principal_id=principal.principal_id,
+            )
+            summary["vdp_submissions"] = [
+                rec.model_dump(mode="json")
+                for rec in self.list_vdp_submissions(principal=principal, run_id=run_id)
+            ]
         return summary
 
     # ------------------------------------------------------------------
@@ -2609,6 +2629,344 @@ class HarnessController:
                 ),
             )
         return outcome
+
+    def _list_manual_observations(
+        self,
+        *,
+        run_id: str,
+        principal_id: str,
+    ) -> list[dict[str, Any]]:
+        """List imported out-of-harness manual isolated observation summaries for a VDP run."""
+        with self.storage.read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT eo.evidence_id, eo.created_at
+                FROM evidence_objects eo
+                JOIN actions a ON a.action_id = eo.action_id
+                WHERE eo.run_id = ? AND eo.owner_principal_id = ?
+                  AND a.capability_name = 'vdp.manual_observation'
+                ORDER BY eo.created_at ASC, eo.rowid ASC
+                """,
+                (run_id, principal_id),
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            eid = str(row["evidence_id"])
+            try:
+                _, raw = self.evidence_vault.read_view_bytes(
+                    run_id=run_id,
+                    principal_id=principal_id,
+                    evidence_id=eid,
+                )
+                parsed = json.loads(raw.decode("utf-8", errors="strict"))
+            except Exception:
+                continue
+            if not isinstance(parsed, Mapping) or parsed.get("schema") != MANUAL_OBSERVATION_SCHEMA:
+                continue
+            cleanup = parsed.get("cleanup_confirmation") or {}
+            items.append(
+                {
+                    "evidence_id": eid,
+                    "observation_id": parsed.get("observation_id"),
+                    "execution_provenance": parsed.get("execution_provenance"),
+                    "verification_tier": parsed.get("verification_tier"),
+                    "promoted_to_vdp_product_test": False,
+                    "observed_at": parsed.get("observed_at"),
+                    "target_name": parsed.get("target_name"),
+                    "target_version": parsed.get("target_version"),
+                    "pinned_source_commit": parsed.get("pinned_source_commit"),
+                    "test_code_hashes": parsed.get("test_code_hashes") or {},
+                    "unverified_conditions": parsed.get("unverified_conditions") or [],
+                    "cleanup_confirmed": bool(
+                        isinstance(cleanup, Mapping)
+                        and cleanup.get("containers_removed")
+                        and cleanup.get("databases_removed")
+                        and cleanup.get("networks_removed")
+                    ),
+                }
+            )
+        return items
+
+    def import_manual_observation(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        observation: ManualObservationRecord,
+    ) -> ImportReceipt:
+        """Import an out-of-harness manual isolated observation with provenance (never promoted to vdp.test)."""
+        snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        if snapshot.manifest.mode != RunMode.VDP:
+            raise ScopeDeniedError(
+                f"Manual VDP observation import requires run mode 'vdp', got {snapshot.manifest.mode.value!r}."
+            )
+        if snapshot.manifest.closed_at is not None:
+            raise ScopeDeniedError(f"Cannot import manual observation into closed run {run_id!r}.")
+
+        payload_bytes = serialize_manual_observation(observation)
+        payload_sha256 = sha256_bytes(payload_bytes)
+        object_id = f"manual-obs-{observation.observation_id[:48]}-{uuid4().hex[:8]}"
+        staging_relpath = f"manual_observations/{object_id}.json"
+
+        self.staging_root.mkdir(parents=True, exist_ok=True)
+        staged_path = safe_write_atomic(
+            self.staging_root,
+            staging_relpath,
+            payload_bytes,
+            overwrite=True,
+            create_parents=True,
+        )
+
+        ts = self._now()
+        ts_iso = ts.isoformat()
+        action_id = f"act-man-{uuid4().hex[:16]}"
+        request_id = f"manual-obs-{observation.observation_id[:48]}-{uuid4().hex[:8]}"
+        sanitized_args = {
+            "observation_id": observation.observation_id,
+            "target_name": observation.target_name,
+            "target_version": observation.target_version,
+            "pinned_source_commit": observation.pinned_source_commit,
+            "execution_provenance": MANUAL_OBSERVATION_PROVENANCE,
+            "promoted_to_vdp_product_test": False,
+        }
+        args_sha256 = canonical_digest(sanitized_args)
+        source_hashes = tuple(sorted(set(observation.test_code_hashes.values())))
+
+        try:
+            with self.storage.transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO actions (
+                        action_id, principal_id, run_id, request_id, expected_revision,
+                        capability_name, operation, adapter_revision, canonical_args_sha256,
+                        sanitized_args_json, scope_revision, repeat_of, state,
+                        reserved_ms, reserved_bytes, used_ms, used_bytes,
+                        fencing_token, supervisor_instance_id, process_start_id,
+                        envelope_json, error_code, error_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, 0, 0, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        action_id,
+                        principal.principal_id,
+                        run_id,
+                        request_id,
+                        snapshot.revision,
+                        "vdp.manual_observation",
+                        "import_manual_observation",
+                        "manual-observation-import/1",
+                        args_sha256,
+                        json.dumps(sanitized_args, sort_keys=True, ensure_ascii=False),
+                        snapshot.manifest.scope_revision,
+                        ActionLifecycleState.COMPLETED.value,
+                        len(payload_bytes),
+                        ts_iso,
+                        ts_iso,
+                    ),
+                )
+                receipt = self.bounded_importer.import_object(
+                    run_id=run_id,
+                    owner_principal_id=principal.principal_id,
+                    action_id=action_id,
+                    object_id=object_id,
+                    expected_sha256=payload_sha256,
+                    media_type="application/json; charset=utf-8",
+                    capture_complete=True,
+                    omission_reason=None,
+                    source_artifact_hashes=source_hashes,
+                    adapter_revision="manual-observation-import/1",
+                    sanitized_args_sha256=args_sha256,
+                    expected_size_bytes=len(payload_bytes),
+                    staging_relpath=staging_relpath,
+                    conn=conn,
+                )
+                envelope = ResultEnvelope(
+                    run_id=run_id,
+                    action_id=action_id,
+                    status=EnvelopeStatus.OK,
+                    summary=(
+                        f"Imported manual isolated observation {observation.observation_id!r} "
+                        "(not harness vdp.product_test verified)."
+                    ),
+                    evidence=(
+                        EvidenceRef(
+                            id=receipt.evidence_id,
+                            sha256=receipt.manifest.view_sha256,
+                            kind=MANUAL_OBSERVATION_PROVENANCE,
+                        ),
+                    ),
+                    usage=UsageMetrics(wall_ms=0, output_bytes=len(payload_bytes)),
+                    provenance=ProvenanceInfo(
+                        adapter_revision="manual-observation-import/1",
+                        scope_revision=snapshot.manifest.scope_revision,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE actions SET envelope_json = ?, updated_at = ? WHERE action_id = ?",
+                    (envelope.model_dump_json(), ts_iso, action_id),
+                )
+                self.audit.record_sanitized_in_tx(
+                    conn,
+                    AuditEvent(
+                        event_id=f"aud-{uuid4().hex}",
+                        timestamp=ts,
+                        run_id=run_id,
+                        principal_id=principal.principal_id,
+                        action_id=action_id,
+                        capability="vdp.manual_observation",
+                        operation="import_manual_observation",
+                        outcome=EnvelopeStatus.OK.value,
+                        usage=UsageMetrics(wall_ms=0, output_bytes=len(payload_bytes)),
+                        scope_revision=snapshot.manifest.scope_revision,
+                        destination_summary=(
+                            f"observation_id={observation.observation_id};"
+                            f"evidence_id={receipt.evidence_id};"
+                            f"provenance={MANUAL_OBSERVATION_PROVENANCE}"
+                        ),
+                    ),
+                )
+        finally:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return receipt
+
+    def export_vdp_submission_draft(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        draft: VdpDraftSpec,
+        language: Literal["ja", "en"] = "ja",
+        output_relpath: str | None = None,
+        overwrite: bool = False,
+        forbidden_literals: Sequence[str] = (),
+    ) -> VdpDraftExportResult:
+        """Render a human-reviewable VDP submission draft (never auto-submits)."""
+        snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        if snapshot.manifest.mode != RunMode.VDP:
+            raise ScopeDeniedError(
+                f"VDP submission draft export requires run mode 'vdp', got {snapshot.manifest.mode.value!r}."
+            )
+        result = export_vdp_submission_draft(
+            storage=self.storage,
+            vault=self.evidence_vault,
+            vault_root=self.vault_root,
+            export_root=self.export_root,
+            run_id=run_id,
+            principal_id=principal.principal_id,
+            draft=draft,
+            language=language,
+            output_relpath=output_relpath,
+            overwrite=overwrite,
+            forbidden_literals=forbidden_literals,
+            clock=self._now,
+        )
+        with self.storage.transaction() as conn:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=self._now(),
+                    run_id=run_id,
+                    principal_id=principal.principal_id,
+                    action_id=None,
+                    capability="vdp.submission",
+                    operation="export_draft",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"finding_id={draft.finding_id};state={result.submission_record.state.value};"
+                        "auto_submit=false"
+                    ),
+                ),
+            )
+        return result
+
+    def record_vdp_submission(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        finding_id: str,
+        target_state: FindingState | str,
+        report_url: str,
+        recorded_by: str,
+        report_ref: str | None = None,
+        triage_status: Literal[
+            "not_submitted",
+            "unconfirmed",
+            "triaged",
+            "duplicate",
+            "informative",
+            "accepted",
+            "resolved",
+        ] = "unconfirmed",
+        submitted_at: datetime | None = None,
+        notes: str = "",
+    ) -> VdpSubmissionRecord:
+        """Manually record external VDP submission URL & state after operator submission."""
+        snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        if snapshot.manifest.mode != RunMode.VDP:
+            raise ScopeDeniedError(
+                f"VDP submission tracking requires run mode 'vdp', got {snapshot.manifest.mode.value!r}."
+            )
+        resolved_state = (
+            target_state
+            if isinstance(target_state, FindingState)
+            else FindingState(str(target_state).strip())
+        )
+        updated = record_manual_vdp_submission(
+            vault_root=self.vault_root,
+            run_id=run_id,
+            finding_id=finding_id,
+            target_state=resolved_state,
+            report_url=report_url,
+            recorded_by=recorded_by,
+            report_ref=report_ref,
+            triage_status=triage_status,
+            submitted_at=submitted_at,
+            notes=notes,
+            clock=self._now,
+        )
+        with self.storage.transaction() as conn:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=self._now(),
+                    run_id=run_id,
+                    principal_id=principal.principal_id,
+                    action_id=None,
+                    capability="vdp.submission",
+                    operation="record_manual_submission",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"finding_id={finding_id};state={updated.state.value};"
+                        f"triage={updated.triage_status};auto_submit=false"
+                    ),
+                ),
+            )
+        return updated
+
+    def list_vdp_submissions(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+    ) -> list[VdpSubmissionRecord]:
+        """List manually tracked VDP submission records belonging to an owned run."""
+        _ = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        all_recs = load_vdp_submissions(self.vault_root)
+        return [
+            rec
+            for _, rec in sorted(all_recs.items())
+            if rec.run_id == run_id
+        ]
 
     def import_staged_evidence(
         self,

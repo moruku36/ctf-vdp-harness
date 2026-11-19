@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 if sys.platform == "win32":
@@ -81,6 +81,24 @@ VALID_SELECTOR_ROLES: tuple[str, ...] = (
     "anomaly_repro",
     "env_check",
 )
+VALID_VDP_NETWORK_MODES: tuple[str, ...] = (
+    "none",
+    "isolated_internal_services",
+)
+VALID_VDP_SERVICE_KINDS: tuple[str, ...] = (
+    "postgres",
+    "valkey",
+    "redis",
+    "generic_internal",
+)
+VALID_VDP_RUNNER_MODES: tuple[str, ...] = (
+    "oss_scanner",
+    "direct_pytest",
+)
+MAX_VDP_SERVICES_PER_PROFILE = 4
+MAX_VDP_TOTAL_CPUS = 4
+MAX_VDP_TOTAL_MEMORY_MB = 8192
+DEFAULT_DIRECT_PYTEST_EXECUTABLE = "/opt/oss-scanner/venv/bin/pytest"
 VDP_PRODUCT_TEST_OPERATIONS: tuple[str, ...] = (
     "describe_profile",
     "check_environment",
@@ -276,6 +294,13 @@ _WEBLATE_W02_OVERLAY_SCOPE = (
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9_./:-]{3,240}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+_SERVICE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SAFE_EXEC_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,160}$")
+_SENSITIVE_MARKER_RE = re.compile(
+    r"(?:SYNTHETIC_SECRET_[A-Za-z0-9_=-]*|CTF_SENSITIVE_MARKER[A-Za-z0-9_=-]*|(?:flag|ctf)\{[^}\r\n]*\}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
 
 
 def validate_vdp_selector_format(selector: str) -> str:
@@ -305,6 +330,42 @@ class VdpOverlaySpec(StrictModel):
     allowed_files: dict[str, str] = Field(default_factory=dict)
 
 
+class VdpServiceSpec(StrictModel):
+    """Server-side pinned internal dependency service for isolated offline VDP tests."""
+
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    service_kind: Literal["postgres", "valkey", "redis", "generic_internal"] = "postgres"
+    image_ref: str = Field(min_length=1)
+    expected_image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    internal_port: int = Field(ge=1, le=65535)
+    env: dict[str, str] = Field(default_factory=dict)
+    client_env: dict[str, str] = Field(default_factory=dict)
+    entrypoint: str | None = None
+    command: tuple[str, ...] = ()
+    readiness_command: tuple[str, ...] = ()
+    readiness_timeout_seconds: int = Field(default=30, ge=2, le=60)
+    cpus: int = Field(default=1, ge=1, le=2)
+    memory_mb: int = Field(default=512, ge=128, le=2048)
+    publish_ports: Literal[False] = False
+
+    def to_public_summary(self) -> dict[str, Any]:
+        """Return sanitized service specification omitting raw env values."""
+        return {
+            "name": self.name,
+            "service_kind": self.service_kind,
+            "image_ref": self.image_ref,
+            "expected_image_digest": self.expected_image_digest,
+            "internal_port": self.internal_port,
+            "env_keys": sorted(self.env.keys()),
+            "client_env_keys": sorted(self.client_env.keys()),
+            "has_readiness_command": bool(self.readiness_command),
+            "readiness_timeout_seconds": self.readiness_timeout_seconds,
+            "cpus": self.cpus,
+            "memory_mb": self.memory_mb,
+            "publish_ports": False,
+        }
+
+
 class VdpTargetProfile(StrictModel):
     """Pinned product source/image/selector policy enforced server-side."""
 
@@ -314,6 +375,11 @@ class VdpTargetProfile(StrictModel):
     expected_image_digest: str = Field(pattern="^sha256:[0-9a-f]{64}$")
     expected_source_commit: str = Field(pattern="^[0-9a-f]{40}$")
     checkout_dir: Path | None = None
+    network_mode: Literal["none", "isolated_internal_services"] = "none"
+    services: tuple[VdpServiceSpec, ...] = ()
+    runner_mode: Literal["oss_scanner", "direct_pytest"] = "oss_scanner"
+    pytest_executable: str | None = None
+    smoke_selectors: tuple[str, ...] = ()
     allowed_test_selectors: tuple[str, ...]
     positive_selectors: tuple[str, ...] = ()
     negative_selectors: tuple[str, ...] = ()
@@ -360,7 +426,11 @@ class VdpTargetProfile(StrictModel):
             "image_ref": self.image_ref,
             "expected_image_digest": self.expected_image_digest,
             "expected_source_commit": self.expected_source_commit,
-            "network_mode": "none",
+            "network_mode": self.network_mode,
+            "runner_mode": self.runner_mode,
+            "pytest_executable": self.pytest_executable,
+            "smoke_selectors": list(self.smoke_selectors),
+            "services": [svc.to_public_summary() for svc in self.services],
             "allowed_test_selectors": list(self.allowed_test_selectors),
             "positive_selectors": list(self.positive_selectors),
             "negative_selectors": list(self.negative_selectors),
@@ -504,8 +574,130 @@ def validate_vdp_profile_registration(profile: VdpTargetProfile) -> VdpTargetPro
             allowed_files=norm_files,
         )
 
+    if profile.network_mode not in VALID_VDP_NETWORK_MODES:
+        raise ContractViolationError(
+            f"Unsupported VDP network_mode {profile.network_mode!r}; expected one of {VALID_VDP_NETWORK_MODES}."
+        )
+    if profile.runner_mode not in VALID_VDP_RUNNER_MODES:
+        raise ContractViolationError(
+            f"Unsupported VDP runner_mode {profile.runner_mode!r}; expected one of {VALID_VDP_RUNNER_MODES}."
+        )
+
+    cleaned_pytest_exec: str | None = None
+    if profile.pytest_executable is not None and profile.pytest_executable.strip():
+        cand_exec = profile.pytest_executable.strip()
+        if ".." in cand_exec or not _SAFE_EXEC_PATH_RE.fullmatch(cand_exec):
+            raise ContractViolationError(f"Unsafe pytest_executable {cand_exec!r}.")
+        cleaned_pytest_exec = cand_exec
+    elif profile.runner_mode == "direct_pytest":
+        cleaned_pytest_exec = DEFAULT_DIRECT_PYTEST_EXECUTABLE
+
+    cleaned_smoke_selectors = tuple(
+        dict.fromkeys(validate_vdp_selector_format(s) for s in profile.smoke_selectors)
+    )
+
+    if profile.network_mode == "none" and profile.services:
+        raise ContractViolationError(
+            "VdpTargetProfile with network_mode='none' cannot declare dependency services."
+        )
+
+    normalized_services: list[VdpServiceSpec] = []
+    if profile.network_mode == "isolated_internal_services":
+        if not profile.services:
+            raise ContractViolationError(
+                "VdpTargetProfile with network_mode='isolated_internal_services' requires at least one pinned service."
+            )
+        if len(profile.services) > MAX_VDP_SERVICES_PER_PROFILE:
+            raise ContractViolationError(
+                f"At most {MAX_VDP_SERVICES_PER_PROFILE} internal services may be declared per profile."
+            )
+        seen_names: set[str] = set()
+        for svc in profile.services:
+            if not _SERVICE_NAME_RE.fullmatch(svc.name):
+                raise ContractViolationError(f"Invalid VDP service name {svc.name!r}.")
+            if svc.name in seen_names:
+                raise ContractViolationError(f"Duplicate VDP service name {svc.name!r}.")
+            seen_names.add(svc.name)
+            if svc.publish_ports is not False:
+                raise ContractViolationError(
+                    f"VDP service {svc.name!r} cannot publish host ports (publish_ports must be False)."
+                )
+            for map_label, env_map in (("env", svc.env), ("client_env", svc.client_env)):
+                if len(env_map) > 16:
+                    raise ContractViolationError(
+                        f"Service {svc.name!r} {map_label} cannot exceed 16 entries."
+                    )
+                for ek, ev in env_map.items():
+                    ek_clean = str(ek).strip()
+                    ev_str = str(ev)
+                    if not _ENV_KEY_RE.fullmatch(ek_clean):
+                        raise ContractViolationError(
+                            f"Invalid {map_label} key {ek!r} for service {svc.name!r}."
+                        )
+                    if "\x00" in ev_str or len(ev_str) > 256 or _SENSITIVE_MARKER_RE.search(ev_str):
+                        raise ContractViolationError(
+                            f"Unsafe or oversized {map_label} value for key {ek_clean!r} on service {svc.name!r}."
+                        )
+            clean_ep: str | None = None
+            if svc.entrypoint is not None and svc.entrypoint.strip():
+                ep = svc.entrypoint.strip()
+                if any(ch.isspace() or ch == "\x00" for ch in ep) or not _SAFE_EXEC_PATH_RE.fullmatch(ep):
+                    raise ContractViolationError(
+                        f"Unsafe entrypoint {ep!r} for service {svc.name!r}."
+                    )
+                clean_ep = ep
+            if len(svc.command) > 32:
+                raise ContractViolationError(
+                    f"Service {svc.name!r} command exceeds 32 arguments."
+                )
+            for arg in svc.command:
+                if "\x00" in str(arg) or len(str(arg)) > 512:
+                    raise ContractViolationError(
+                        f"Unsafe argument in command for service {svc.name!r}."
+                    )
+            if len(svc.readiness_command) > 16:
+                raise ContractViolationError(
+                    f"Service {svc.name!r} readiness_command exceeds 16 arguments."
+                )
+            for arg in svc.readiness_command:
+                if "\x00" in str(arg) or len(str(arg)) > 256:
+                    raise ContractViolationError(
+                        f"Unsafe argument in readiness_command for service {svc.name!r}."
+                    )
+            normalized_services.append(
+                VdpServiceSpec(
+                    name=svc.name,
+                    service_kind=svc.service_kind,
+                    image_ref=svc.image_ref.strip(),
+                    expected_image_digest=svc.expected_image_digest.strip().lower(),
+                    internal_port=svc.internal_port,
+                    env={str(k).strip(): str(v) for k, v in svc.env.items()},
+                    client_env={str(k).strip(): str(v) for k, v in svc.client_env.items()},
+                    entrypoint=clean_ep,
+                    command=tuple(str(x) for x in svc.command),
+                    readiness_command=tuple(str(x) for x in svc.readiness_command),
+                    readiness_timeout_seconds=svc.readiness_timeout_seconds,
+                    cpus=svc.cpus,
+                    memory_mb=svc.memory_mb,
+                    publish_ports=False,
+                )
+            )
+        total_cpus = profile.max_cpus + sum(s.cpus for s in normalized_services)
+        total_mem = profile.max_memory_mb + sum(s.memory_mb for s in normalized_services)
+        if total_cpus > MAX_VDP_TOTAL_CPUS:
+            raise ContractViolationError(
+                f"Combined CPU cap ({total_cpus}) exceeds MAX_VDP_TOTAL_CPUS ({MAX_VDP_TOTAL_CPUS})."
+            )
+        if total_mem > MAX_VDP_TOTAL_MEMORY_MB:
+            raise ContractViolationError(
+                f"Combined memory cap ({total_mem} MiB) exceeds MAX_VDP_TOTAL_MEMORY_MB ({MAX_VDP_TOTAL_MEMORY_MB} MiB)."
+            )
+
     return profile.model_copy(
         update={
+            "pytest_executable": cleaned_pytest_exec,
+            "smoke_selectors": cleaned_smoke_selectors,
+            "services": tuple(normalized_services),
             "allowed_test_selectors": cleaned_allowed,
             "positive_selectors": cleaned_pos,
             "negative_selectors": cleaned_neg,
@@ -875,6 +1067,10 @@ class _ValidatedPlan(StrictModel):
     memory_mb: int
     timeout_seconds: int
     network_mode: str = "none"
+    services: tuple[VdpServiceSpec, ...] = ()
+    runner_mode: Literal["oss_scanner", "direct_pytest"] = "oss_scanner"
+    pytest_executable: str | None = None
+    smoke_selectors: tuple[str, ...] = ()
     baseline_evidence_ref: str | None = None
 
 
@@ -1093,6 +1289,9 @@ def _build_execution_context_and_conclusion(
     unverified: list[str] = []
     verdict = verdict_res.verdict
 
+    if plan.network_mode == "isolated_internal_services" and verdict not in {"not_executed", "environment_failure", "timeout"}:
+        confirmed.append("isolated_internal_service_network_no_external_egress")
+        unverified.append("isolated_internal_service_ephemeral_topology")
     if verdict_res.positive_passed >= 1:
         confirmed.append("baseline_positive_control_passed")
     if verdict == "smoke_passed":
@@ -1701,9 +1900,11 @@ def run_vdp_environment_check(
     checks: dict[str, str] = {
         "profile": "ok",
         "docker_image": "ok",
+        "service_images": "ok" if profile.services else "skipped",
         "checkout": "skipped",
         "overlays": "ok",
     }
+    checked_services: dict[str, dict[str, Any]] = {}
     issues: list[dict[str, str]] = []
 
     if profile.expires_at is not None and now >= profile.expires_at:
@@ -1770,6 +1971,64 @@ def run_vdp_environment_check(
                         ),
                     }
                 )
+
+    # 1b. Declared internal service images (when profile.services is configured)
+    for svc in profile.services:
+        if not resolved_docker:
+            checks["service_images"] = "failed"
+            checked_services[svc.name] = {"status": "failed", "code": "docker_cli_missing"}
+            continue
+        svc_insp = sub_runner.run(
+            [resolved_docker, "image", "inspect", "--format", "{{.Id}}", svc.image_ref],
+            timeout_seconds=15.0,
+            max_output_bytes=4096,
+        )
+        if svc_insp.outcome != SubprocessOutcome.COMPLETED or svc_insp.returncode != 0:
+            err_msg = svc_insp.stderr.decode("utf-8", errors="replace").strip() or "docker image inspect failed"
+            checks["service_images"] = "failed"
+            checked_services[svc.name] = {
+                "status": "failed",
+                "code": "service_image_unavailable",
+                "image_ref": svc.image_ref,
+            }
+            issues.append(
+                {
+                    "component": f"service:{svc.name}",
+                    "code": "service_image_unavailable",
+                    "cause": f"Could not inspect service image {svc.image_ref!r}: {err_msg[:200]}",
+                    "remediation": (
+                        f"Ensure service image {svc.image_ref!r} ({svc.expected_image_digest}) is built or loaded."
+                    ),
+                }
+            )
+        else:
+            obs_svc_digest = svc_insp.stdout.decode("utf-8", errors="replace").strip().lower()
+            if obs_svc_digest != svc.expected_image_digest:
+                checks["service_images"] = "failed"
+                checked_services[svc.name] = {
+                    "status": "failed",
+                    "code": "service_image_digest_mismatch",
+                    "image_ref": svc.image_ref,
+                    "observed_digest": obs_svc_digest,
+                }
+                issues.append(
+                    {
+                        "component": f"service:{svc.name}",
+                        "code": "service_image_digest_mismatch",
+                        "cause": (
+                            f"Service {svc.name!r} image {svc.image_ref!r} digest {obs_svc_digest!r} "
+                            f"mismatches pinned {svc.expected_image_digest!r}."
+                        ),
+                        "remediation": "Rebuild/tag the pinned service image or register an explicit profile revision.",
+                    }
+                )
+            else:
+                checked_services[svc.name] = {
+                    "status": "ok",
+                    "image_ref": svc.image_ref,
+                    "image_digest": obs_svc_digest,
+                    "publish_ports": False,
+                }
 
     # 2. Local checkout commit & clean tracked tree (when configured)
     resolved_git = git_bin.strip() if git_bin is not None else (shutil.which("git") or "")
@@ -1914,6 +2173,7 @@ def run_vdp_environment_check(
     healthy = (
         checks["profile"] == "ok"
         and checks["docker_image"] == "ok"
+        and checks["service_images"] in {"ok", "skipped"}
         and checks["checkout"] in {"ok", "skipped"}
         and checks["overlays"] == "ok"
     )
@@ -1923,10 +2183,13 @@ def run_vdp_environment_check(
         "checked_at": now.isoformat(),
         "profile_name": profile.profile_name,
         "profile_revision": profile.profile_revision,
+        "network_mode": profile.network_mode,
+        "runner_mode": profile.runner_mode,
         "expected_source_commit": profile.expected_source_commit,
         "expected_image_digest": profile.expected_image_digest,
         "healthy": healthy,
         "checks": checks,
+        "checked_services": checked_services,
         "checked_overlays": checked_overlays,
         "active_tests": [
             {"selector": s, "role": resolved_roles.get(s, "unassigned")}
@@ -2061,11 +2324,13 @@ class VdpProductTestAdapter(BaseAdapter):
         if operation in {"describe_profile", "check_environment"}:
             if operation == "check_environment":
                 net_arg = arguments.get("network_mode")
-                if net_arg is not None and str(net_arg).strip().lower() != "none":
-                    raise ScopeDeniedError(
-                        f"vdp.test requires network_mode='none', got {net_arg!r}.",
-                        code="network_mode_denied",
-                    )
+                if net_arg is not None:
+                    req_net = str(net_arg).strip().lower()
+                    if req_net not in VALID_VDP_NETWORK_MODES or req_net != profile.network_mode:
+                        raise ScopeDeniedError(
+                            f"vdp.test profile {profile.profile_name!r} requires network_mode={profile.network_mode!r}, got {net_arg!r}.",
+                            code="network_mode_denied",
+                        )
             overlay_arg = arguments.get("overlay_bundle")
             overlay_bundle_opt = str(overlay_arg).strip() if overlay_arg else None
             if overlay_bundle_opt is not None and overlay_bundle_opt not in profile.allowed_overlays:
@@ -2094,14 +2359,23 @@ class VdpProductTestAdapter(BaseAdapter):
                 cpus=profile.max_cpus,
                 memory_mb=profile.max_memory_mb,
                 timeout_seconds=profile.max_timeout_seconds,
-                network_mode="none",
+                network_mode=profile.network_mode,
+                services=profile.services,
+                runner_mode=profile.runner_mode,
+                pytest_executable=profile.pytest_executable,
+                smoke_selectors=profile.smoke_selectors,
                 baseline_evidence_ref=None,
             )
 
-        network_mode = str(arguments.get("network_mode") or "none").strip().lower()
-        if network_mode != "none":
+        raw_net_mode = arguments.get("network_mode")
+        network_mode = (
+            profile.network_mode
+            if raw_net_mode is None or not str(raw_net_mode).strip()
+            else str(raw_net_mode).strip().lower()
+        )
+        if network_mode not in VALID_VDP_NETWORK_MODES or network_mode != profile.network_mode:
             raise ScopeDeniedError(
-                f"vdp.test requires network_mode='none', got {network_mode!r}.",
+                f"vdp.test profile {profile.profile_name!r} requires network_mode={profile.network_mode!r}, got {network_mode!r}.",
                 code="network_mode_denied",
             )
 
@@ -2124,6 +2398,11 @@ class VdpProductTestAdapter(BaseAdapter):
             if raw_selectors:
                 raise ScopeDeniedError(
                     "run_smoke does not accept custom test_selectors.",
+                    code="selector_not_allowlisted",
+                )
+            if profile.runner_mode == "direct_pytest" and not profile.smoke_selectors:
+                raise ScopeDeniedError(
+                    "run_smoke with runner_mode='direct_pytest' requires registered smoke_selectors.",
                     code="selector_not_allowlisted",
                 )
         elif operation == "run_pytest":
@@ -2153,14 +2432,20 @@ class VdpProductTestAdapter(BaseAdapter):
                 )
             if sel.startswith(_OVERLAY_CONTAINER_PREFIX):
                 needs_overlay = True
+        if operation == "run_smoke" and profile.runner_mode == "direct_pytest":
+            if any(sel.startswith(_OVERLAY_CONTAINER_PREFIX) for sel in profile.smoke_selectors):
+                needs_overlay = True
 
         overlay_bundle_raw = arguments.get("overlay_bundle")
         overlay_bundle = str(overlay_bundle_raw).strip() if overlay_bundle_raw else None
         if needs_overlay and not overlay_bundle:
-            raise ScopeDeniedError(
-                "Selectors under /src/vdp-test-overlay/ require an allowlisted overlay_bundle.",
-                code="overlay_not_allowlisted",
-            )
+            if len(profile.allowed_overlays) == 1 and operation == "run_smoke":
+                overlay_bundle = next(iter(profile.allowed_overlays))
+            else:
+                raise ScopeDeniedError(
+                    "Selectors under /src/vdp-test-overlay/ require an allowlisted overlay_bundle.",
+                    code="overlay_not_allowlisted",
+                )
 
         overlay_host_dir: str | None = None
         overlay_container_target: str | None = None
@@ -2227,7 +2512,11 @@ class VdpProductTestAdapter(BaseAdapter):
             cpus=cpus,
             memory_mb=memory_mb,
             timeout_seconds=timeout_seconds,
-            network_mode="none",
+            network_mode=network_mode,
+            services=profile.services,
+            runner_mode=profile.runner_mode,
+            pytest_executable=profile.pytest_executable,
+            smoke_selectors=profile.smoke_selectors,
             baseline_evidence_ref=str(baseline_ref).strip() if baseline_ref else None,
         )
 
@@ -2300,9 +2589,16 @@ class VdpProductTestAdapter(BaseAdapter):
             )
         return encoded, capture_complete, omission_reason, refs
 
-    def _ensure_container_removed(self, docker_bin: str, container_name: str) -> bool:
+    def _ensure_container_removed(
+        self,
+        docker_bin: str,
+        container_name: str,
+        *,
+        remove_volumes: bool = False,
+    ) -> bool:
         """Ensure named container no longer exists, forcing removal if needed."""
-        for _ in range(2):
+        rm_argv = [docker_bin, "rm", "-f", *(["-v"] if remove_volumes else ()), container_name]
+        for _ in range(3):
             ps_res = self._runner.run(
                 [docker_bin, "ps", "-aq", "--filter", f"name=^/{container_name}$"],
                 timeout_seconds=10.0,
@@ -2312,7 +2608,7 @@ class VdpProductTestAdapter(BaseAdapter):
                 if not ps_res.stdout.decode("utf-8", errors="replace").strip():
                     return True
             self._runner.run(
-                [docker_bin, "rm", "-f", container_name],
+                rm_argv,
                 timeout_seconds=15.0,
                 max_output_bytes=8192,
             )
@@ -2327,6 +2623,55 @@ class VdpProductTestAdapter(BaseAdapter):
             and ps_final.returncode == 0
             and not ps_final.stdout.decode("utf-8", errors="replace").strip()
         )
+
+    def _ensure_network_removed(self, docker_bin: str, network_name: str) -> bool:
+        """Ensure dedicated internal Docker network is removed after execution."""
+        for _ in range(3):
+            ls_res = self._runner.run(
+                [docker_bin, "network", "ls", "-q", "--filter", f"name=^{network_name}$"],
+                timeout_seconds=10.0,
+                max_output_bytes=4096,
+            )
+            if ls_res.outcome == SubprocessOutcome.COMPLETED and ls_res.returncode == 0:
+                if not ls_res.stdout.decode("utf-8", errors="replace").strip():
+                    return True
+            self._runner.run(
+                [docker_bin, "network", "rm", network_name],
+                timeout_seconds=15.0,
+                max_output_bytes=4096,
+            )
+            time.sleep(0.1)
+        ls_final = self._runner.run(
+            [docker_bin, "network", "ls", "-q", "--filter", f"name=^{network_name}$"],
+            timeout_seconds=10.0,
+            max_output_bytes=4096,
+        )
+        return (
+            ls_final.outcome == SubprocessOutcome.COMPLETED
+            and ls_final.returncode == 0
+            and not ls_final.stdout.decode("utf-8", errors="replace").strip()
+        )
+
+    def _verify_container_no_published_ports(self, docker_bin: str, container_name: str) -> tuple[bool, int]:
+        """Inspect container PortBindings and verify zero host ports are published."""
+        insp = self._runner.run(
+            [docker_bin, "inspect", "--format", "{{json .HostConfig.PortBindings}}", container_name],
+            timeout_seconds=10.0,
+            max_output_bytes=4096,
+        )
+        if insp.outcome != SubprocessOutcome.COMPLETED or insp.returncode != 0:
+            return False, -1
+        raw = insp.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except Exception:
+            return False, -1
+        if parsed is None:
+            return True, 0
+        if isinstance(parsed, Mapping):
+            non_empty = {k: v for k, v in parsed.items() if v}
+            return len(non_empty) == 0, len(non_empty)
+        return False, -1
 
     def _build_synthetic_subprocess_result(
         self,
@@ -2389,6 +2734,7 @@ class VdpProductTestAdapter(BaseAdapter):
             parsed.get("schema") == "vdp-product-test-evidence/1"
             and parsed.get("source_commit") == plan.source_commit
             and parsed.get("image_digest") == plan.image_digest
+            and parsed.get("network_mode") == plan.network_mode
             and int(parsed.get("positive_passed") or 0) >= 1
             and int(parsed.get("positive_failed") or 0) == 0
         )
@@ -2659,56 +3005,354 @@ class VdpProductTestAdapter(BaseAdapter):
                 sub_outcome=SubprocessOutcome.FAILED,
             )
 
-        container_name = f"ctf-vdp-{action.action_id[:16]}-{uuid4().hex[:8]}"
-        argv: list[str] = [
-            docker_bin,
-            "run",
-            "--rm",
-            "--init",
-            "--name",
-            container_name,
-            "--network",
-            "none",
-            "--cpus",
-            str(plan.cpus),
-            "--memory",
-            f"{plan.memory_mb}m",
-            "--user",
-            "0",
-            "--workdir",
-            "/src",
-            "--entrypoint",
-            "bash",
-        ]
-        if overlay_mount_dir is not None and plan.overlay_container_target is not None:
-            argv.extend(
-                [
-                    "--mount",
-                    f"type=bind,source={overlay_mount_dir},target={plan.overlay_container_target},readonly",
-                ]
-            )
-        argv.append(plan.image_digest)
-        if plan.operation == "run_smoke":
-            argv.append(".oss-scanner/smoke")
-        else:
-            argv.extend([".oss-scanner/test", "-n", "0", "--maxfail=1", "-v", "-rA", *plan.test_selectors])
+        if plan.network_mode == "isolated_internal_services":
+            # Verify every pinned service image digest live before creating network or containers.
+            for svc in plan.services:
+                svc_inspect = self._runner.run(
+                    [docker_bin, "image", "inspect", "--format", "{{.Id}}", svc.image_ref],
+                    timeout_seconds=15.0,
+                    max_output_bytes=4096,
+                )
+                if svc_inspect.outcome != SubprocessOutcome.COMPLETED or svc_inspect.returncode != 0:
+                    err_msg = svc_inspect.stderr.decode("utf-8", errors="replace").strip() or "docker image inspect failed"
+                    return self._finish_with_early_outcome(
+                        action=action,
+                        plan=plan,
+                        started_at=started_at,
+                        max_bytes=max_bytes,
+                        verdict="environment_failure",
+                        verdict_reason=f"Pinned service image {svc.image_ref!r} unavailable: {err_msg[:180]}",
+                        status=EnvelopeStatus.TOOL_ERROR,
+                        error_code="BLOCKED_ENV",
+                        error_message=f"Pinned service image {svc.image_ref!r} could not be inspected: {err_msg[:180]}",
+                        sub_outcome=SubprocessOutcome.FAILED,
+                    )
+                obs_svc_digest = svc_inspect.stdout.decode("utf-8", errors="replace").strip().lower()
+                if obs_svc_digest != svc.expected_image_digest:
+                    return self._finish_with_early_outcome(
+                        action=action,
+                        plan=plan,
+                        started_at=started_at,
+                        max_bytes=max_bytes,
+                        verdict="not_executed",
+                        verdict_reason=(
+                            f"Service {svc.name!r} image {svc.image_ref!r} digest {obs_svc_digest!r} "
+                            f"mismatches pinned {svc.expected_image_digest!r}."
+                        ),
+                        status=EnvelopeStatus.DENIED,
+                        error_code="service_image_digest_mismatch",
+                        error_message=(
+                            f"Service {svc.name!r} image digest mismatch: observed {obs_svc_digest!r}, "
+                            f"expected {svc.expected_image_digest!r}."
+                        ),
+                        sub_outcome=SubprocessOutcome.FAILED,
+                    )
 
-        sub_res: SubprocessResult
+        container_name = f"ctf-vdp-{action.action_id[:16]}-{uuid4().hex[:8]}"
+        network_name: str | None = None
+        internal_flag_verified = False
+        service_containers: list[tuple[VdpServiceSpec, str]] = []
+        service_exec_records: list[dict[str, Any]] = []
+        total_published_ports = 0
+        published_ports_verified_none = True
+        pre_run_error: tuple[str, str, EnvelopeStatus, str, str] | None = None
+
+        sub_res = self._build_synthetic_subprocess_result(
+            outcome=SubprocessOutcome.FAILED,
+            returncode=125,
+            data=b"",
+            wall_ms=0,
+            capture_complete=True,
+            omission_reason=None,
+            cleanup_confirmed=True,
+        )
         container_cleanup_confirmed = True
+        service_cleanup_confirmed = True
+        network_cleanup_confirmed = True
+        main_started = False
+
         try:
-            sub_res = self._runner.run(
-                argv,
-                timeout_seconds=eff_timeout,
-                max_output_bytes=max_bytes,
-                cancel_event=cancel_event,
-            )
+            if plan.network_mode == "isolated_internal_services":
+                network_name = f"ctf-vdp-net-{action.action_id[:12]}-{uuid4().hex[:8]}"
+                net_create = self._runner.run(
+                    [
+                        docker_bin,
+                        "network",
+                        "create",
+                        "--driver",
+                        "bridge",
+                        "--internal",
+                        "--label",
+                        "ctf-vdp-harness=true",
+                        "--label",
+                        f"ctf-vdp-action={action.action_id}",
+                        network_name,
+                    ],
+                    timeout_seconds=15.0,
+                    max_output_bytes=4096,
+                )
+                if net_create.outcome != SubprocessOutcome.COMPLETED or net_create.returncode != 0:
+                    err_txt = net_create.stderr.decode("utf-8", errors="replace").strip() or "docker network create failed"
+                    pre_run_error = (
+                        "environment_failure",
+                        f"Failed to create internal Docker network: {err_txt[:180]}",
+                        EnvelopeStatus.TOOL_ERROR,
+                        "network_isolation_failed",
+                        f"Failed to create isolated internal network: {err_txt[:180]}",
+                    )
+                else:
+                    net_insp = self._runner.run(
+                        [docker_bin, "network", "inspect", "--format", "{{.Internal}}", network_name],
+                        timeout_seconds=10.0,
+                        max_output_bytes=1024,
+                    )
+                    internal_flag_verified = (
+                        net_insp.outcome == SubprocessOutcome.COMPLETED
+                        and net_insp.returncode == 0
+                        and net_insp.stdout.decode("utf-8", errors="replace").strip().lower() == "true"
+                    )
+                    if not internal_flag_verified:
+                        pre_run_error = (
+                            "environment_failure",
+                            "Dedicated Docker network failed internal=true verification; aborting before starting containers.",
+                            EnvelopeStatus.TOOL_ERROR,
+                            "network_isolation_failed",
+                            "Internal Docker network isolation check failed (Internal!=true).",
+                        )
+
+                if pre_run_error is None:
+                    deadline_mono = time.monotonic() + eff_timeout
+                    for svc in plan.services:
+                        if cancel_event is not None and cancel_event.is_set():
+                            pre_run_error = (
+                                "not_executed",
+                                "Execution was cancelled before service startup.",
+                                EnvelopeStatus.CANCELLED,
+                                "action_cancelled",
+                                "Execution cancelled before service startup.",
+                            )
+                            break
+                        svc_cname = f"ctf-vdp-svc-{svc.name[:12]}-{action.action_id[:8]}-{uuid4().hex[:6]}"
+                        service_containers.append((svc, svc_cname))
+                        svc_argv: list[str] = [
+                            docker_bin,
+                            "run",
+                            "-d",
+                            "--init",
+                            "--name",
+                            svc_cname,
+                            "--network",
+                            network_name,
+                            "--network-alias",
+                            svc.name,
+                            "--cpus",
+                            str(svc.cpus),
+                            "--memory",
+                            f"{svc.memory_mb}m",
+                            "--label",
+                            "ctf-vdp-harness=true",
+                            "--label",
+                            f"ctf-vdp-action={action.action_id}",
+                        ]
+                        for ek, ev in sorted(svc.env.items()):
+                            svc_argv.extend(["-e", f"{ek}={ev}"])
+                        if svc.entrypoint:
+                            svc_argv.extend(["--entrypoint", svc.entrypoint])
+                        svc_argv.append(svc.expected_image_digest)
+                        svc_argv.extend(svc.command)
+
+                        svc_run = self._runner.run(
+                            svc_argv,
+                            timeout_seconds=min(30.0, max(5.0, deadline_mono - time.monotonic())),
+                            max_output_bytes=8192,
+                            cancel_event=cancel_event,
+                        )
+                        if svc_run.outcome != SubprocessOutcome.COMPLETED or svc_run.returncode != 0:
+                            err_txt = (svc_run.stderr + svc_run.stdout).decode("utf-8", errors="replace").strip()
+                            service_exec_records.append(
+                                {
+                                    "service_name": svc.name,
+                                    "service_kind": svc.service_kind,
+                                    "image_ref": svc.image_ref,
+                                    "image_digest": svc.expected_image_digest,
+                                    "internal_port": svc.internal_port,
+                                    "cpus": svc.cpus,
+                                    "memory_mb": svc.memory_mb,
+                                    "published_ports_verified_none": True,
+                                    "ready_verified": False,
+                                }
+                            )
+                            pre_run_error = (
+                                "environment_failure",
+                                f"Dependency service {svc.name!r} failed to start: {err_txt[:180]}",
+                                EnvelopeStatus.TOOL_ERROR,
+                                "service_startup_failed",
+                                f"Service {svc.name!r} failed to start.",
+                            )
+                            break
+
+                        ports_ok, port_cnt = self._verify_container_no_published_ports(docker_bin, svc_cname)
+                        if not ports_ok:
+                            published_ports_verified_none = False
+                            if port_cnt > 0:
+                                total_published_ports += port_cnt
+                            service_exec_records.append(
+                                {
+                                    "service_name": svc.name,
+                                    "service_kind": svc.service_kind,
+                                    "image_ref": svc.image_ref,
+                                    "image_digest": svc.expected_image_digest,
+                                    "internal_port": svc.internal_port,
+                                    "cpus": svc.cpus,
+                                    "memory_mb": svc.memory_mb,
+                                    "published_ports_verified_none": False,
+                                    "ready_verified": False,
+                                }
+                            )
+                            pre_run_error = (
+                                "environment_failure",
+                                f"Dependency service {svc.name!r} exposed published ports or failed port inspection.",
+                                EnvelopeStatus.TOOL_ERROR,
+                                "network_isolation_failed",
+                                f"Service {svc.name!r} violated no-published-ports invariant.",
+                            )
+                            break
+
+                        ready_ok = True
+                        if svc.readiness_command:
+                            ready_ok = False
+                            ready_deadline = min(
+                                deadline_mono,
+                                time.monotonic() + float(svc.readiness_timeout_seconds),
+                            )
+                            while time.monotonic() < ready_deadline:
+                                if cancel_event is not None and cancel_event.is_set():
+                                    break
+                                r_res = self._runner.run(
+                                    [docker_bin, "exec", svc_cname, *svc.readiness_command],
+                                    timeout_seconds=min(5.0, max(1.0, ready_deadline - time.monotonic())),
+                                    max_output_bytes=4096,
+                                    cancel_event=cancel_event,
+                                )
+                                if r_res.outcome == SubprocessOutcome.COMPLETED and r_res.returncode == 0:
+                                    ready_ok = True
+                                    break
+                                st_res = self._runner.run(
+                                    [docker_bin, "inspect", "--format", "{{.State.Running}}", svc_cname],
+                                    timeout_seconds=5.0,
+                                    max_output_bytes=512,
+                                )
+                                if (
+                                    st_res.outcome == SubprocessOutcome.COMPLETED
+                                    and st_res.returncode == 0
+                                    and st_res.stdout.decode("utf-8", errors="replace").strip().lower() == "false"
+                                ):
+                                    break
+                                time.sleep(0.25)
+
+                        service_exec_records.append(
+                            {
+                                "service_name": svc.name,
+                                "service_kind": svc.service_kind,
+                                "image_ref": svc.image_ref,
+                                "image_digest": svc.expected_image_digest,
+                                "internal_port": svc.internal_port,
+                                "cpus": svc.cpus,
+                                "memory_mb": svc.memory_mb,
+                                "published_ports_verified_none": True,
+                                "ready_verified": ready_ok,
+                            }
+                        )
+                        if not ready_ok:
+                            pre_run_error = (
+                                "environment_failure",
+                                f"Dependency service {svc.name!r} did not pass readiness probe within {svc.readiness_timeout_seconds}s.",
+                                EnvelopeStatus.TOOL_ERROR,
+                                "service_readiness_failed",
+                                f"Service {svc.name!r} failed readiness check.",
+                            )
+                            break
+
+            if pre_run_error is None:
+                target_net = network_name if network_name is not None else "none"
+                argv: list[str] = [
+                    docker_bin,
+                    "run",
+                    "--rm",
+                    "--init",
+                    "--name",
+                    container_name,
+                    "--network",
+                    target_net,
+                    "--cpus",
+                    str(plan.cpus),
+                    "--memory",
+                    f"{plan.memory_mb}m",
+                    "--user",
+                    "0",
+                    "--workdir",
+                    "/src",
+                ]
+                for svc in plan.services:
+                    for ek, ev in sorted(svc.client_env.items()):
+                        argv.extend(["-e", f"{ek}={ev}"])
+                if overlay_mount_dir is not None and plan.overlay_container_target is not None:
+                    argv.extend(
+                        [
+                            "--mount",
+                            f"type=bind,source={overlay_mount_dir},target={plan.overlay_container_target},readonly",
+                        ]
+                    )
+                if plan.runner_mode == "direct_pytest":
+                    pytest_bin = plan.pytest_executable or DEFAULT_DIRECT_PYTEST_EXECUTABLE
+                    argv.extend(["--entrypoint", pytest_bin, plan.image_digest])
+                    if plan.operation == "run_smoke":
+                        argv.extend(["-v", "-rA", "--maxfail=1", *plan.smoke_selectors])
+                    else:
+                        argv.extend(["-v", "-rA", "--maxfail=1", *plan.test_selectors])
+                else:
+                    argv.extend(["--entrypoint", "bash", plan.image_digest])
+                    if plan.operation == "run_smoke":
+                        argv.append(".oss-scanner/smoke")
+                    else:
+                        argv.extend([".oss-scanner/test", "-n", "0", "--maxfail=1", "-v", "-rA", *plan.test_selectors])
+
+                main_started = True
+                sub_res = self._runner.run(
+                    argv,
+                    timeout_seconds=eff_timeout,
+                    max_output_bytes=max_bytes,
+                    cancel_event=cancel_event,
+                )
         finally:
-            container_cleanup_confirmed = self._ensure_container_removed(docker_bin, container_name)
+            if main_started or plan.network_mode == "none":
+                container_cleanup_confirmed = self._ensure_container_removed(
+                    docker_bin,
+                    container_name,
+                    remove_volumes=(plan.network_mode == "isolated_internal_services"),
+                )
+            for idx, (_, svc_cname) in enumerate(reversed(service_containers)):
+                svc_clean = self._ensure_container_removed(docker_bin, svc_cname, remove_volumes=True)
+                service_cleanup_confirmed = service_cleanup_confirmed and svc_clean
+                rec_idx = len(service_containers) - 1 - idx
+                if rec_idx < len(service_exec_records):
+                    service_exec_records[rec_idx]["container_cleanup_confirmed"] = svc_clean
+            if network_name is not None:
+                network_cleanup_confirmed = self._ensure_network_removed(docker_bin, network_name)
 
         finished_at = self._clock().isoformat()
-        combined_raw = (sub_res.stdout + sub_res.stderr).decode("utf-8", errors="replace")
+        combined_raw = (
+            pre_run_error[4]
+            if pre_run_error is not None
+            else (sub_res.stdout + sub_res.stderr).decode("utf-8", errors="replace")
+        )
         combined_redacted = redact_sensitive_text(combined_raw)
-        overall_cleanup = bool(sub_res.cleanup_confirmed and container_cleanup_confirmed)
+        overall_cleanup = bool(
+            sub_res.cleanup_confirmed
+            and container_cleanup_confirmed
+            and service_cleanup_confirmed
+            and network_cleanup_confirmed
+        )
 
         parsed = _parse_pytest_output(
             combined_redacted,
@@ -2717,18 +3361,28 @@ class VdpProductTestAdapter(BaseAdapter):
         )
         marker_data = _extract_evidence_markers(combined_redacted) if plan.operation == "run_pytest" else {}
         has_valid_baseline_ref = self._has_valid_baseline_evidence(action=action, plan=plan)
-        verdict_res = _classify_verdict(
-            operation=plan.operation,
-            outcome=sub_res.outcome,
-            exit_code=sub_res.returncode,
-            cleanup_confirmed=overall_cleanup,
-            parsed=parsed,
-            positive_selectors=plan.positive_selectors,
-            negative_selectors=plan.negative_selectors,
-            anomaly_repro_selectors=plan.anomaly_repro_selectors,
-            env_check_selectors=plan.env_check_selectors,
-            has_valid_baseline_ref=has_valid_baseline_ref,
-        )
+        if pre_run_error is not None:
+            verdict_res = _VerdictResult(
+                verdict=pre_run_error[0] if overall_cleanup else "environment_failure",
+                verdict_reason=(
+                    pre_run_error[1]
+                    if overall_cleanup
+                    else f"{pre_run_error[1]} Cleanup verification failed."
+                ),
+            )
+        else:
+            verdict_res = _classify_verdict(
+                operation=plan.operation,
+                outcome=sub_res.outcome,
+                exit_code=sub_res.returncode,
+                cleanup_confirmed=overall_cleanup,
+                parsed=parsed,
+                positive_selectors=plan.positive_selectors,
+                negative_selectors=plan.negative_selectors,
+                anomaly_repro_selectors=plan.anomaly_repro_selectors,
+                env_check_selectors=plan.env_check_selectors,
+                has_valid_baseline_ref=has_valid_baseline_ref,
+            )
         verdict = verdict_res.verdict
         verdict_reason = verdict_res.verdict_reason
         execution_context, conclusion_status = _build_execution_context_and_conclusion(
@@ -2752,6 +3406,27 @@ class VdpProductTestAdapter(BaseAdapter):
             "image_digest": plan.image_digest,
             "source_commit": plan.source_commit,
             "network_mode": plan.network_mode,
+            "runner_mode": plan.runner_mode,
+            "network_isolation": (
+                {
+                    "mode": "isolated_internal_services",
+                    "network_name": network_name,
+                    "internal_flag_verified": internal_flag_verified,
+                    "external_egress_blocked": internal_flag_verified,
+                    "published_ports_count": total_published_ports,
+                    "published_ports_verified_none": published_ports_verified_none,
+                }
+                if plan.network_mode == "isolated_internal_services"
+                else {
+                    "mode": "none",
+                    "network_name": None,
+                    "internal_flag_verified": True,
+                    "external_egress_blocked": True,
+                    "published_ports_count": 0,
+                    "published_ports_verified_none": True,
+                }
+            ),
+            "services_executed": service_exec_records,
             "cpus": plan.cpus,
             "memory_mb": plan.memory_mb,
             "timeout_seconds": int(eff_timeout),
@@ -2786,6 +3461,8 @@ class VdpProductTestAdapter(BaseAdapter):
             "execution_context": execution_context,
             "conclusion_status": conclusion_status,
             "container_cleanup_confirmed": container_cleanup_confirmed,
+            "service_cleanup_confirmed": service_cleanup_confirmed,
+            "network_cleanup_confirmed": network_cleanup_confirmed,
             "process_cleanup_confirmed": sub_res.cleanup_confirmed,
             "log_truncated": raw_truncated,
             "log_excerpt": combined_redacted,
@@ -2838,6 +3515,14 @@ class VdpProductTestAdapter(BaseAdapter):
                 retryable=False,
             )
             truncated = True
+        elif pre_run_error is not None:
+            env_status = pre_run_error[2]
+            err = ErrorDetail(
+                code=pre_run_error[3],
+                message=verdict_reason,
+                retryable=False,
+            )
+            truncated = not capture_complete
         elif verdict == "environment_failure":
             env_status = EnvelopeStatus.TOOL_ERROR
             err = ErrorDetail(
@@ -2937,6 +3622,16 @@ class VdpProductTestAdapter(BaseAdapter):
             "image_digest": plan.image_digest,
             "source_commit": plan.source_commit,
             "network_mode": plan.network_mode,
+            "runner_mode": plan.runner_mode,
+            "network_isolation": {
+                "mode": plan.network_mode,
+                "network_name": None,
+                "internal_flag_verified": plan.network_mode == "none",
+                "external_egress_blocked": plan.network_mode == "none",
+                "published_ports_count": 0,
+                "published_ports_verified_none": True,
+            },
+            "services_executed": [],
             "cpus": plan.cpus,
             "memory_mb": plan.memory_mb,
             "timeout_seconds": plan.timeout_seconds,
@@ -2971,6 +3666,8 @@ class VdpProductTestAdapter(BaseAdapter):
             "execution_context": execution_context,
             "conclusion_status": conclusion_status,
             "container_cleanup_confirmed": True,
+            "service_cleanup_confirmed": True,
+            "network_cleanup_confirmed": True,
             "process_cleanup_confirmed": True,
             "log_truncated": False,
             "log_excerpt": redact_sensitive_text(error_message),
@@ -3021,7 +3718,14 @@ __all__ = [
     "DEFAULT_VDP_TEST_MAX_MEMORY_MB",
     "DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES",
     "DEFAULT_VDP_TEST_TIMEOUT_SECONDS",
+    "DEFAULT_DIRECT_PYTEST_EXECUTABLE",
+    "MAX_VDP_SERVICES_PER_PROFILE",
+    "MAX_VDP_TOTAL_CPUS",
+    "MAX_VDP_TOTAL_MEMORY_MB",
     "VALID_SELECTOR_ROLES",
+    "VALID_VDP_NETWORK_MODES",
+    "VALID_VDP_RUNNER_MODES",
+    "VALID_VDP_SERVICE_KINDS",
     "VDP_PROFILES_RELPATH",
     "VDP_PRODUCT_TEST_ADAPTER_COMMIT",
     "VDP_PRODUCT_TEST_ADAPTER_ID",
@@ -3039,6 +3743,7 @@ __all__ = [
     "WEBLATE_W02_TEST_FILE_SHA256",
     "VdpOverlaySpec",
     "VdpProductTestAdapter",
+    "VdpServiceSpec",
     "VdpTargetProfile",
     "build_default_weblate_profile",
     "compute_vdp_profile_digest",

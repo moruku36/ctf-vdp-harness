@@ -368,11 +368,12 @@ def _normalize_config_diffs(
                     f"allowed keys: {sorted(ALLOWED_CONFIG_DIFF_KEYS)}."
                 )
             if key == "network_mode":
-                if str(raw_val).strip() != "none":
+                net_val = str(raw_val).strip()
+                if net_val not in {"none", "isolated_internal_services"}:
                     raise ContractViolationError(
-                        f"network_mode must remain 'none' for isolated VDP tests, got {raw_val!r}."
+                        f"network_mode must remain 'none' or 'isolated_internal_services', got {raw_val!r}."
                     )
-                requested["network_mode"] = "none"
+                requested["network_mode"] = net_val
             elif key in _INT_CONFIG_KEYS:
                 requested[key] = raw_val
             elif key == "checkout_dir":
@@ -394,8 +395,8 @@ def _normalize_config_diffs(
             )
         merged[key] = val
 
-    if merged.get("network_mode", "none") != "none":
-        raise ContractViolationError("network_mode must remain 'none'.")
+    if merged.get("network_mode", "none") not in {"none", "isolated_internal_services"}:
+        raise ContractViolationError("network_mode must remain 'none' or 'isolated_internal_services'.")
 
     return merged, requested
 
@@ -511,7 +512,7 @@ def _compute_registration_diff(
             serialized_requested[k] = v
 
     config_diffs_summary: dict[str, Any] = {
-        "network_mode": "none",
+        "network_mode": candidate.network_mode,
         "resource_caps": {
             "max_cpus": candidate.max_cpus,
             "max_memory_mb": candidate.max_memory_mb,
@@ -873,6 +874,14 @@ def generate_overlay_registration_plan(
             expected_image_digest=str(eff_image_digest).strip().lower(),
             expected_source_commit=str(eff_source_commit).strip().lower(),
             checkout_dir=eff_checkout_dir,
+            network_mode=(
+                merged_cfg.get("network_mode")
+                or (reference.network_mode if reference is not None else "none")
+            ),
+            services=reference.services if reference is not None else (),
+            runner_mode=reference.runner_mode if reference is not None else "oss_scanner",
+            pytest_executable=reference.pytest_executable if reference is not None else None,
+            smoke_selectors=reference.smoke_selectors if reference is not None else (),
             allowed_test_selectors=allowed_selectors,
             positive_selectors=pos_selectors,
             negative_selectors=neg_selectors,

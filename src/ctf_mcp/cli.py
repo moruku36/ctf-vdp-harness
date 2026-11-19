@@ -29,8 +29,11 @@ from ctf_mcp.adapters.vdp_product_test import (
     DEFAULT_VDP_TEST_MAX_OUTPUT_BYTES,
     DEFAULT_VDP_TEST_TIMEOUT_SECONDS,
     VALID_SELECTOR_ROLES,
+    VALID_VDP_NETWORK_MODES,
+    VALID_VDP_RUNNER_MODES,
     WEBLATE_2026_11_2_PROFILE_NAME,
     VdpOverlaySpec,
+    VdpServiceSpec,
     VdpTargetProfile,
     build_default_weblate_profile,
     load_registered_vdp_profiles,
@@ -51,6 +54,7 @@ from ctf_mcp.contracts import (
     ContractViolationError,
     ErrorDetail,
     ExecutionClass,
+    FindingState,
     HarnessError,
     PrincipalContext,
     RunMode,
@@ -63,7 +67,13 @@ from ctf_mcp.controller import (
     create_default_controller,
     save_verifier_expectation,
 )
+from ctf_mcp.evidence import (
+    ManualObservationRecord,
+    VdpDraftSpec,
+    hash_manual_test_file,
+)
 from ctf_mcp.gateway import sanitize_audit_text
+from ctf_mcp.mcp_diagnostics import collect_mcp_diagnostics
 from ctf_mcp.server import build_server_from_env
 from ctf_mcp.storage import Storage
 from ctf_mcp.vdp_boundary_map import (
@@ -735,6 +745,10 @@ def _compute_vdp_profile_diff(
         "image_ref",
         "expected_image_digest",
         "expected_source_commit",
+        "network_mode",
+        "runner_mode",
+        "pytest_executable",
+        "smoke_selectors",
         "max_cpus",
         "max_memory_mb",
         "max_timeout_seconds",
@@ -748,6 +762,10 @@ def _compute_vdp_profile_diff(
     after_exp = candidate.expires_at.isoformat() if candidate.expires_at else None
     if before_exp != after_exp:
         pinned_changes["expires_at"] = {"before": before_exp, "after": after_exp}
+    before_svcs = [s.to_public_summary() for s in base.services]
+    after_svcs = [s.to_public_summary() for s in candidate.services]
+    if before_svcs != after_svcs:
+        pinned_changes["services"] = {"before": before_svcs, "after": after_svcs}
 
     return {
         "is_new_profile": False,
@@ -812,6 +830,32 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
         if args.checkout_dir is not None
         else (base.checkout_dir if base is not None else None)
     )
+    network_mode = (
+        args.network_mode
+        if getattr(args, "network_mode", None) is not None
+        else (base.network_mode if base is not None else "none")
+    )
+    runner_mode = (
+        args.runner_mode
+        if getattr(args, "runner_mode", None) is not None
+        else (base.runner_mode if base is not None else "oss_scanner")
+    )
+    pytest_executable = (
+        args.pytest_executable
+        if getattr(args, "pytest_executable", None) is not None
+        else (base.pytest_executable if base is not None else None)
+    )
+    smoke_selectors = (
+        _parse_csv_values(getattr(args, "smoke_selector", None), default=())
+        if getattr(args, "smoke_selector", None)
+        else (base.smoke_selectors if base is not None else ())
+    )
+    if getattr(args, "service_json", None) is not None:
+        raw_svc_payload = json.loads(Path(args.service_json).read_text(encoding="utf-8"))
+        raw_svc_list = raw_svc_payload if isinstance(raw_svc_payload, list) else [raw_svc_payload]
+        services = tuple(VdpServiceSpec.model_validate(item) for item in raw_svc_list)
+    else:
+        services = base.services if base is not None else ()
 
     extra_allowed = _parse_csv_values(args.allow_selector, default=())
     extra_pos = _parse_csv_values(args.positive_selector, default=())
@@ -981,6 +1025,11 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
         expected_image_digest=image_digest.strip().lower(),
         expected_source_commit=source_commit.strip().lower(),
         checkout_dir=checkout_dir,
+        network_mode=network_mode,
+        services=services,
+        runner_mode=runner_mode,
+        pytest_executable=pytest_executable,
+        smoke_selectors=smoke_selectors,
         allowed_test_selectors=allowed_selectors,
         positive_selectors=positive_selectors,
         negative_selectors=negative_selectors,
@@ -1038,7 +1087,9 @@ def _handle_register_vdp_profile(args: argparse.Namespace, env: Mapping[str, str
             "max_memory_mb": validated.max_memory_mb,
             "max_timeout_seconds": validated.max_timeout_seconds,
             "max_output_bytes": validated.max_output_bytes,
-            "network_mode": "none",
+            "network_mode": validated.network_mode,
+            "runner_mode": validated.runner_mode,
+            "service_count": len(validated.services),
         },
         "diff": diff,
         "overlay_verified_on_disk": overlay_verified_on_disk,
@@ -1084,6 +1135,134 @@ def _handle_check_vdp_env(args: argparse.Namespace, env: Mapping[str, str] | Non
     _emit_json(report)
     return 0 if report["healthy"] else 1
 
+
+
+
+def _handle_import_manual_observation(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+
+    raw_payload = json.loads(Path(args.manifest_json).read_text(encoding="utf-8"))
+    if not isinstance(raw_payload, dict):
+        raise ContractViolationError("--manifest-json must contain a JSON object.")
+
+    file_hashes = dict(raw_payload.get("test_code_hashes") or {})
+    for tf in getattr(args, "test_file", None) or ():
+        fname, fhash = hash_manual_test_file(Path(tf))
+        if fname in file_hashes and str(file_hashes[fname]).strip().lower() != fhash:
+            raise ContractViolationError(
+                f"Hash mismatch for manual test file {fname!r}: manifest={file_hashes[fname]!r}, disk={fhash!r}."
+            )
+        file_hashes[fname] = fhash
+    raw_payload["test_code_hashes"] = file_hashes
+
+    if getattr(args, "raw_log_file", None) is not None:
+        _, log_hash = hash_manual_test_file(Path(args.raw_log_file), max_bytes=10_485_760)
+        raw_payload["raw_log_sha256"] = log_hash
+
+    observation = ManualObservationRecord.model_validate(raw_payload)
+    receipt = controller.import_manual_observation(
+        principal=owner,
+        run_id=args.run_id,
+        observation=observation,
+    )
+    _emit_json(
+        {
+            "run_id": receipt.run_id,
+            "action_id": receipt.action_id,
+            "evidence_id": receipt.evidence_id,
+            "observation_id": observation.observation_id,
+            "execution_provenance": observation.execution_provenance,
+            "verification_tier": observation.verification_tier,
+            "promoted_to_vdp_product_test": False,
+            "verified_sha256": receipt.verified_sha256,
+            "test_code_hashes": observation.test_code_hashes,
+            "cleanup_confirmation": observation.cleanup_confirmation.model_dump(mode="json"),
+        }
+    )
+    return 0
+
+
+def _handle_export_vdp_draft(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    draft_raw = json.loads(Path(args.draft_json).read_text(encoding="utf-8"))
+    draft = VdpDraftSpec.model_validate(draft_raw)
+    result = controller.export_vdp_submission_draft(
+        principal=owner,
+        run_id=args.run_id,
+        draft=draft,
+        language=args.language,
+        output_relpath=args.output_relpath,
+        overwrite=bool(args.overwrite),
+    )
+    _emit_json(
+        {
+            "run_id": result.run_id,
+            "finding_id": result.finding_id,
+            "language": result.language,
+            "draft_sha256": result.draft_sha256,
+            "output_path": result.output_path,
+            "state": result.submission_record.state.value,
+            "automatic_submission": False,
+            "evidence_ids": list(result.submission_record.evidence_ids),
+        }
+    )
+    return 0
+
+
+def _handle_record_vdp_submission(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    updated = controller.record_vdp_submission(
+        principal=owner,
+        run_id=args.run_id,
+        finding_id=args.finding_id,
+        target_state=FindingState(args.status),
+        report_url=args.report_url,
+        recorded_by=args.recorded_by,
+        report_ref=args.report_ref,
+        triage_status=args.triage_status,
+        submitted_at=_parse_iso_datetime(args.submitted_at),
+        notes=args.note or "",
+    )
+    _emit_json(updated.model_dump(mode="json"))
+    return 0
+
+
+def _handle_list_vdp_submissions(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    items = controller.list_vdp_submissions(principal=owner, run_id=args.run_id)
+    _emit_json(
+        {
+            "run_id": args.run_id,
+            "automatic_submission": False,
+            "submissions": [item.model_dump(mode="json") for item in items],
+        }
+    )
+    return 0
+
+
+def _handle_diagnose_mcp(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    eff_env = _merge_runtime_env(
+        env=env,
+        db_path=getattr(args, "db_path", None),
+        vault_root=getattr(args, "vault_root", None),
+    )
+    report = collect_mcp_diagnostics(
+        env=eff_env,
+        config_path=getattr(args, "config", None),
+        active_run_id=getattr(args, "active_run", None),
+        check_docker=bool(getattr(args, "check_docker", False)),
+        docker_bin=getattr(args, "docker_bin", "docker"),
+    )
+    _emit_json(report)
+    return 0 if report["healthy"] else 1
 
 def build_admin_parser() -> argparse.ArgumentParser:
     """Build argument parser for ``ctf-mcp-admin`` local operator commands."""
@@ -1238,6 +1417,26 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_vdp_reg.add_argument("--image-digest", default=None)
     p_vdp_reg.add_argument("--source-commit", default=None)
     p_vdp_reg.add_argument("--checkout-dir", type=Path, default=None)
+    p_vdp_reg.add_argument(
+        "--network-mode",
+        choices=list(VALID_VDP_NETWORK_MODES),
+        default=None,
+        help="Network isolation mode ('none' or 'isolated_internal_services').",
+    )
+    p_vdp_reg.add_argument(
+        "--service-json",
+        type=Path,
+        default=None,
+        help="Path to JSON defining pinned internal VdpServiceSpec object(s).",
+    )
+    p_vdp_reg.add_argument(
+        "--runner-mode",
+        choices=list(VALID_VDP_RUNNER_MODES),
+        default=None,
+        help="Container test runner mode ('oss_scanner' or 'direct_pytest').",
+    )
+    p_vdp_reg.add_argument("--pytest-executable", default=None)
+    p_vdp_reg.add_argument("--smoke-selector", action="append", default=None)
     p_vdp_reg.add_argument("--allow-selector", action="append", default=None)
     p_vdp_reg.add_argument("--positive-selector", action="append", default=None)
     p_vdp_reg.add_argument("--negative-selector", action="append", default=None)
@@ -1287,6 +1486,62 @@ def build_admin_parser() -> argparse.ArgumentParser:
         add_common_flags=lambda p: _add_common_admin_flags(p, suppress_defaults=True),
     )
 
+    p_man = subparsers.add_parser(
+        "import-manual-observation",
+        help="Import an out-of-harness manual isolated observation with pinned test hashes (never promoted to vdp.product_test).",
+    )
+    _add_common_admin_flags(p_man, suppress_defaults=True)
+    p_man.add_argument("--run-id", required=True)
+    p_man.add_argument("--manifest-json", type=Path, required=True)
+    p_man.add_argument("--test-file", action="append", type=Path, default=None)
+    p_man.add_argument("--raw-log-file", type=Path, default=None)
+
+    p_draft = subparsers.add_parser(
+        "export-vdp-draft",
+        help="Render and validate a human-reviewable VDP submission draft (never auto-submits).",
+    )
+    _add_common_admin_flags(p_draft, suppress_defaults=True)
+    p_draft.add_argument("--run-id", required=True)
+    p_draft.add_argument("--draft-json", type=Path, required=True)
+    p_draft.add_argument("--output-relpath", default=None)
+    p_draft.add_argument("--language", choices=["ja", "en"], default="ja")
+    p_draft.add_argument("--overwrite", action="store_true", default=False)
+
+    p_sub_rec = subparsers.add_parser(
+        "record-vdp-submission",
+        help="Manually record report URL and submission status after operator disclosure (no auto-submit).",
+    )
+    _add_common_admin_flags(p_sub_rec, suppress_defaults=True)
+    p_sub_rec.add_argument("--run-id", required=True)
+    p_sub_rec.add_argument("--finding-id", required=True)
+    p_sub_rec.add_argument("--status", choices=["submitted", "accepted"], default="submitted")
+    p_sub_rec.add_argument("--report-url", required=True)
+    p_sub_rec.add_argument("--recorded-by", required=True)
+    p_sub_rec.add_argument("--report-ref", default=None)
+    p_sub_rec.add_argument(
+        "--triage-status",
+        choices=["not_submitted", "unconfirmed", "triaged", "duplicate", "informative", "accepted", "resolved"],
+        default="unconfirmed",
+    )
+    p_sub_rec.add_argument("--submitted-at", default=None)
+    p_sub_rec.add_argument("--note", default="")
+
+    p_sub_list = subparsers.add_parser(
+        "list-vdp-submissions",
+        help="List manually tracked VDP submission records for a run.",
+    )
+    _add_common_admin_flags(p_sub_list, suppress_defaults=True)
+    p_sub_list.add_argument("--run-id", required=True)
+
+    p_diag = subparsers.add_parser(
+        "diagnose-mcp",
+        help="Run read-only MCP config, tool schema fingerprint, run-state, and optional Docker hygiene diagnostics.",
+    )
+    _add_common_admin_flags(p_diag, suppress_defaults=True)
+    p_diag.add_argument("--active-run", default=None)
+    p_diag.add_argument("--check-docker", action="store_true", default=False)
+    p_diag.add_argument("--docker-bin", default="docker")
+
     return parser
 
 
@@ -1312,6 +1567,11 @@ def admin_main(
         "check-vdp-env": _handle_check_vdp_env,
         BOUNDARY_MAP_SUBCOMMAND: handle_boundary_map_cli,
         OVERLAY_ASSISTANT_COMMAND: handle_overlay_assistant,
+        "import-manual-observation": _handle_import_manual_observation,
+        "export-vdp-draft": _handle_export_vdp_draft,
+        "record-vdp-submission": _handle_record_vdp_submission,
+        "list-vdp-submissions": _handle_list_vdp_submissions,
+        "diagnose-mcp": _handle_diagnose_mcp,
     }
     try:
         return handlers[args.command](args, env)

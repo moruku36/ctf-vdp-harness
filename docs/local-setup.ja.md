@@ -53,6 +53,44 @@ ctf-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
 
 HTTPには仮値でないトークンとクライアント認証が必要です。ローカルstdioはローカルプロセスの信頼境界に依存します。どちらのコマンドも、公開トンネル、OAuth、隔離ゲストのネットワーク、全ChatGPT／Codexクライアントとの接続を構築するものではありません。配置計画は[接続設計](04-connectivity.ja.md)、特定環境の過去の結果は[WSL2／Codex記録](../records/p0-p6-wsl2-codex-environment-acceptance.md)を参照してください。
 
+## Windows Codex → Linux Dockerホスト（Intel NUC）MCP接続と診断
+
+旧WSL2環境から所有者のIntel NUC等のLinux DockerホストへMCP実行環境を移した場合、Windows側`%USERPROFILE%\.codex\config.toml`にOpenSSH（`ssh.exe -T`）経由の`[mcp_servers.ctf_vdp_harness]`定義が必要です（単一引用符`'...'`内のバックスラッシュは二重化しない）。以下はプレースホルダ例であり、秘密鍵や接続先・認証情報をGitに転記しないでください。
+
+```toml
+[mcp_servers.ctf_vdp_harness]
+command = 'C:\WINDOWS\System32\OpenSSH\ssh.exe'
+args = [
+  "-T",
+  "-i", 'C:\Users\<USER>\.ssh\<KEY_FILE>',
+  "-o", "BatchMode=yes",
+  "-o", "StrictHostKeyChecking=yes",
+  "-o", "IdentitiesOnly=yes",
+  "-o", "ServerAliveInterval=30",
+  "-o", "ServerAliveCountMax=3",
+  "-o", "ConnectTimeout=10",
+  "<NUC_USER>@<NUC_HOST>",
+  "/home/<NUC_USER>/ctf-vdp-harness-runtime/launch-mcp-stdio.sh",
+  "--config", "/home/<NUC_USER>/ctf-vdp-harness-runtime/config.vdp-weblate.json",
+  "--allow-dynamic",
+]
+startup_timeout_sec = 30
+tool_timeout_sec = 360
+```
+
+- **起動・設定検証・ツール定義更新**：設定追加後にCodexから`codex.exe mcp list`および`codex.exe mcp get ctf_vdp_harness`で登録を確認し、NUC側のコード更新や`config.toml`変更時は必ず新しいCodexセッションを開始してMCPツール定義（`tools/list`）を再取得します（`--strict-config`は`codex exec`等のルート起動時に有効）。
+- **段階診断と切り分け**：
+  - リモート（NUC）側：`ctf-mcp-admin diagnose-mcp --config <CONFIG_JSON> [--active-run <RUN_ID>] [--check-docker]`
+  - Windows側（読み取り専用診断）：
+    ```powershell
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\diagnose-nuc-mcp.ps1 `
+      -SshTarget "<NUC_USER>@<NUC_HOST>" `
+      -IdentityFile "C:\Users\<USER>\.ssh\<KEY_FILE>" `
+      -RunId "<RUN_ID>" -CheckDocker
+    ```
+  - 診断結果コードで原因を分離します：`codex_config_missing`（設定欠落）／`codex_config_legacy_wsl`（旧`wsl.exe`設定残存）／`stdout_pollution`（`.bashrc`やMOTDのstdout出力汚染）／`transport_closed_on_initialize`・`transport_closed_on_tools_list`（起動時異常終了）／`schema_mismatch_or_extra_forbidden`（`additionalProperties: false`を含むクライアント・サーバー間のツール引数スキーマ不一致）。
+- **移行と復旧（ロールバック）**：変更前に`config.toml`をバックアップ（例：`config.toml.before-nuc-mcp.bak`）してから編集し、不調時はバックアップ復元＋NUC側で`git switch main`を実行して基準状態へ戻します。
+
 ## 状態確認と復旧
 
 ```powershell
@@ -89,6 +127,9 @@ ctf-mcp-admin reconcile
   - `anomaly_repro`のPASSは`anomaly_observed`（指定挙動を観測した）となり、`hypothesis_falsified`とは混同せず、脆弱性の成立や影響判定とも分離します（自動提出は行いません）。
   - アサーション失敗／セットアップ失敗は原因確認まで`inconclusive`（`VerificationStatus.INCONCLUSIVE`）とし、脆弱性の証拠に数えません。SKIP・収集0件・タイムアウト・環境エラーは防御成功にも異常再現にも数えません。
 - **ローカル段階検証fixtureと結論条件の証跡化**: 外部通信遮断（`--network=none`）環境で実際の同期まで検証するため、`ctf_mcp.vdp_fixtures`にループバック限定（`127.0.0.1`）のGit HTTP fixture（`LocalGitHttpFixture`）と段階比較レコーダ（`StageComparisonRecorder`）を備えており、`update_scheduled`（更新予約）・`sync_completed`（同期完了）・`data_changed`（データ変更）を別々に記録できます。証跡には伏字化済みの`execution_context`と`conclusion_status`（`confirmed_conditions`・`unverified_conditions`）および固定コミット・イメージダイジェスト・オーバーレイSHA-256が紐付き、未確認条件（合成データ、Celery eager設定による`celery_eager_test_settings_async_unverified`等）が`VerificationRecord.limitations`へ転記されます。
+- **依存サービス（PostgreSQL等）を伴う限定内部ネットワーク試験（`isolated_internal_services`）**：既存の`network_mode="none"`と`VdpProductTestVerifier`の条件は緩めません。別コンテナのPostgreSQL等が必要な場合のみ、プロファイル登録時に`--network-mode isolated_internal_services --service-json <JSON> --runner-mode direct_pytest [--pytest-executable <PATH>] [--smoke-selector <SEL>]`を明示指定します。実行時は`docker network create --driver bridge --internal`で専用内部ネットワークを作成して`Internal==true`を検証し、サービス側`publish_ports=False`および`HostConfig.PortBindings`公開ポート0件を検査し、全サービスイメージダイジェスト固定・合算資源上限（CPU合計`<=4`、メモリ合計`<=8192MB`）・準備完了プローブ・異常終了を含む全コンテナ／DB／ネットワーク削除（`service_cleanup_confirmed`／`network_cleanup_confirmed`）を`VdpProductTestAdapter`と`VdpProductTestVerifier`が一体で検証します。
+- **ハーネス外の手動・隔離観測の来歴取込（`import-manual-observation`）**：例外的にハーネス外（手動隔離コンテナ等）で実施した検証は`ctf-mcp-admin import-manual-observation --run-id <RUN_ID> --manifest-json <JSON> [--test-file <PATH> ...] [--raw-log-file <LOG>]`で証拠vaultへ取り込めます。テストコードSHA-256、固定コミット／イメージダイジェスト、成功・失敗対照、未確認条件、後片付け確認を記録しますが、常に`execution_provenance="manual_isolated_observation"`・`promoted_to_vdp_product_test=False`として区別され、`VdpProductTestVerifier`（`vdp.product_test`）へ渡しても`manual_observation_cannot_escalate_to_vdp_product_test`で拒否されます（ハーネス検証済みへ昇格しません）。
+- **VDP提出用下書き出力と手動提出状態の記録（`export-vdp-draft` / `record-vdp-submission`）**：[汎用調査レポート雛形](../templates/run-report.ja.md)に加え、[VDP提出用下書き雛形](../templates/vdp-submission-draft.ja.md)（[English](../templates/vdp-submission-draft.md)）に沿った提出下書きを`ctf-mcp-admin export-vdp-draft --run-id <RUN_ID> --draft-json <JSON> [--language ja|en] [--output-relpath <REL>]`で生成できます（ハーネス検証済み証拠と手動隔離観測の来歴を分離表示し、`assert_report_clean`で秘匿検査を実施、自動提出は常に無効`automatic_submission=False`）。所有者が手動提出した後のみ、`ctf-mcp-admin record-vdp-submission --run-id <RUN_ID> --finding-id <ID> --status submitted|accepted --report-url https://... --recorded-by <ACTOR> [--report-ref <REF>] [--triage-status ...]`および`list-vdp-submissions`で`_vdp/submissions.json`へ状態記録できます。
 - **ツール公開面と静的文字列抽出の既定上限**: `StaticArtifactInspectorAdapter`は`analysis.query`のみで登録され、`artifact.inspect`向けの既定アダプタが未接続のため、`artifact.inspect`はMCP一覧へ公開されません。`analysis.query(operation="extract_strings")`で`max_matches`を省略した場合は安全上限（`--max-matches 40`＋`--soft-byte-budget`）を自動適用し、`output_limit_exceeded`ではなく`status="ok"`, `truncated=True`, `recommended_max_matches`, `next_offset`を返却します（大きな`max_matches`を明示指定した場合は従来通り`partial`／`output_limit_exceeded`となります）。
 
 ランタイムにはSQLite正本のrun状態、リクエスト冪等性、クラッシュ照合・fencing、セッションlease、限定搬入、ページ付き・秘匿化済み証拠、出力処理があります。これらの仕組みと受入の限界は[ハーネス設計](08-analysis-harness.ja.md)、[契約](11-contracts-and-acceptance.ja.md)、[日付付き記録](README.ja.md#受入記録)に記載しており、包括的な安全性認証ではありません。

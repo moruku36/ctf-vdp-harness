@@ -477,4 +477,4 @@ class StageComparisonRecorder:
 def emit_vdp_evidence_marker(payload: dict[str, Any]) -> None:
     """Print a single-line redacted ``VDP_EVIDENCE_MARKER`` JSON record to stdout."""
     clean = redact_structure(payload)
-    print(f"VDP_EVIDENCE_MARKER:{json.dumps(clean, ensure_ascii=False, sort_keys=True)}")
+    print(f"\nVDP_EVIDENCE_MARKER:{json.dumps(clean, ensure_ascii=False, sort_keys=True)}")

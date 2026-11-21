@@ -82,6 +82,11 @@ from ctf_mcp.vdp_boundary_map import (
     handle_boundary_map_cli,
     register_boundary_map_subparser,
 )
+from ctf_mcp.vdp_auth_matrix import (
+    AUTH_MATRIX_COMMAND,
+    handle_auth_matrix_cli,
+    register_auth_matrix_subparser,
+)
 from ctf_mcp.vdp_overlay_assistant import (
     OVERLAY_ASSISTANT_COMMAND,
     handle_overlay_assistant,
@@ -1485,6 +1490,9 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_boundary = register_boundary_map_subparser(subparsers)
     _add_common_admin_flags(p_boundary, suppress_defaults=True)
 
+    p_auth_mat = register_auth_matrix_subparser(subparsers)
+    _add_common_admin_flags(p_auth_mat, suppress_defaults=True)
+
     register_overlay_assistant_subparser(
         subparsers,
         add_common_flags=lambda p: _add_common_admin_flags(p, suppress_defaults=True),
@@ -1571,6 +1579,7 @@ def admin_main(
         "register-vdp-profile": _handle_register_vdp_profile,
         "check-vdp-env": _handle_check_vdp_env,
         BOUNDARY_MAP_SUBCOMMAND: handle_boundary_map_cli,
+        AUTH_MATRIX_COMMAND: handle_auth_matrix_cli,
         OVERLAY_ASSISTANT_COMMAND: handle_overlay_assistant,
         "import-manual-observation": _handle_import_manual_observation,
         "export-vdp-draft": _handle_export_vdp_draft,

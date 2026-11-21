@@ -1220,7 +1220,7 @@ def _extract_evidence_markers(text: str) -> dict[str, Any]:
         if not isinstance(obj, dict):
             continue
         clean_obj = redact_structure(obj)
-        for key in ("sender_auth_state", "config_creation_path", "target_component", "stage_verification", "state_diff"):
+        for key in ("sender_auth_state", "config_creation_path", "target_component", "stage_verification", "state_diff", "auth_matrix_summary"):
             if key in clean_obj and clean_obj[key] is not None:
                 merged[key] = clean_obj[key]
         if isinstance(clean_obj.get("scenario_comparisons"), list):
@@ -1284,6 +1284,10 @@ def _build_execution_context_and_conclusion(
         "scenario_comparisons": list(marker_data.get("scenario_comparisons") or []),
         "state_diff": dict(marker_data.get("state_diff") or {}),
     }
+    if marker_data.get("auth_matrix_summary") is not None:
+        execution_context["auth_matrix_summary"] = redact_structure(
+            dict(marker_data["auth_matrix_summary"])
+        )
 
     confirmed: list[str] = []
     unverified: list[str] = []

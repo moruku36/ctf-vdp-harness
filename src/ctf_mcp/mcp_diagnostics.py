@@ -36,6 +36,22 @@ from ctf_mcp.server import create_mcp_server
 from ctf_mcp.storage import Storage
 
 
+def _nested_strict_objects_closed(node: Any) -> bool:
+    """Return True if every structured object schema node (with properties) sets additionalProperties=False."""
+    if isinstance(node, dict):
+        if node.get("type") == "object" and "properties" in node:
+            if node.get("additionalProperties", True) is not False:
+                return False
+        for child in node.values():
+            if not _nested_strict_objects_closed(child):
+                return False
+    elif isinstance(node, list):
+        for item in node:
+            if not _nested_strict_objects_closed(item):
+                return False
+    return True
+
+
 def _inspect_tool_schemas(
     *,
     config: HarnessConfig | None,
@@ -58,6 +74,7 @@ def _inspect_tool_schemas(
             initialize=True,
             enable_local_verifier=True,
         )
+        controller.default_mode = mode
         server = create_mcp_server(controller)
         raw_tools = asyncio.run(server.mcp.list_tools())
         schemas: dict[str, dict[str, Any]] = {}
@@ -69,6 +86,7 @@ def _inspect_tool_schemas(
                 "properties": sorted((params.get("properties") or {}).keys()),
                 "required": list(params.get("required") or ()),
                 "additional_properties": params.get("additionalProperties", True),
+                "nested_strict_objects_closed": _nested_strict_objects_closed(params),
             }
         return schemas
 
@@ -319,6 +337,25 @@ def collect_mcp_diagnostics(
             "allow_dynamic_env": env_allow_dynamic,
         },
         "tool_schemas": tool_schemas,
+        "surface_summary": {
+            "mode": eff_mode.value,
+            "mcp_exposed_tools": sorted(tool_schemas.keys()),
+            "vdp_manual_observation_mcp_exposed": "evidence.import_manual_observation" in tool_schemas,
+            "manual_observation_intakes": [
+                "cli:import-manual-observation",
+                "mcp:evidence.import_manual_observation",
+            ],
+            "cli_admin_only_commands": [
+                "export-vdp-draft",
+                "record-vdp-submission",
+                "list-vdp-submissions",
+                "vdp-boundary-map",
+                "register-vdp-overlay",
+                "register-vdp-profile",
+                "check-vdp-env",
+                "diagnose-mcp",
+            ],
+        },
         "runs": runs_summary,
         "active_run": active_run_diag,
         "docker": docker_diag,

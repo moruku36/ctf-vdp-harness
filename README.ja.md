@@ -6,10 +6,11 @@
 
 ## 利用できるもの
 
-- ローカルPythonランタイム：静的な成果物検査、run・仮説の状態管理、証拠のページ取得、ダイジェスト照合によるCTF検証、レポート出力。
-- 任意の限定変換ヘルパー、対話セッション、対象限定HTTPプローブ、ピン留め済みコンテナによるVDP製品テスト（役割認識対応の`vdp.test`／`vdp.product_test`検証器、事前環境チェック`check_environment`／`check-vdp-env`、`--dry-run`付き安全なプロファイル登録、`vdp-boundary-map`による静的境界差分マップ、`register-vdp-overlay`によるオーバーレイ登録補助、`LocalGitHttpFixture`による段階検証、`isolated_internal_services`による内部ネットワーク分離付き依存サービス試験、`import-manual-observation`によるハーネス外手動観測の来歴取込、`export-vdp-draft`／`record-vdp-submission`による人レビュー前提のVDP提出下書き・手動提出状態記録）。動的実行・ネットワーク・VDP製品テストは既定で無効で、別途の有効化と認可が必要です。
-- Windows上のCodexからOpenSSH経由でLinux（Intel NUC）Docker実行ホスト上のMCPサーバーへ接続・診断するための`ctf-mcp-admin diagnose-mcp`と`scripts/diagnose-nuc-mcp.ps1`。
-- 合成課題によるオフラインA/B/C/D評価。VDP指標はCTFの成績と分けて集計します。
+- **MCP公開済みの基本・解析ツール**：`run.describe`、`evidence.read`、`hypothesis.update`、`run.verify`、`run.close`、および設定と有効スコープに応じて公開される `analysis.query`、`helper.transform`、`session.control`、`net.probe`、ピン留め済みコンテナによるVDP製品テスト `vdp.test`（`--network=none` および `--internal` Dockerネットワーク分離付き `isolated_internal_services`、役割認識対応 `vdp.product_test` 検証器、`check_environment` を含む）。動的実行・ネットワーク・`vdp.test` は既定で無効で、別途の有効化と認可が必要です。
+- **MCP公開済みのVDP手動隔離観測取込（`evidence.import_manual_observation`）**：オープンかつ有効・期限内スコープの `vdp` run でのみ MCP 公開。実行者・実行方法・正常／防御対照・観測前後状態・未確認条件・後片付け確認・不透明な非公開証拠ハッシュ参照を必須検証し、外部URLやローカルファイルは一切取得せず、`vdp.product_test` への昇格も行いません。
+- **CLI専用管理・静的ツール（`ctf-mcp-admin`）**：`vdp-boundary-map`、`register-vdp-overlay`、`register-vdp-profile`、`check-vdp-env`、CLI側手動観測取込 `import-manual-observation`（共通検証・保存ロジック）、人レビュー前提の `export-vdp-draft`／`record-vdp-submission`／`list-vdp-submissions`（自動提出なし）、`diagnose-mcp`、および Windows 側 `scripts/diagnose-nuc-mcp.ps1`。
+- **仕様書のみ（未実装）**：[`docs/vdp-next-stage-plan.md`](docs/vdp-next-stage-plan.md) に記載の「テスト設定と通常設定の差の自動記録」「限定差分・mutation試験」、認可マトリクス連携、候補の既知問題・成立条件チェックポイント（今後のPR対象）。
+- **合成課題によるオフラインA/B/C/D評価**：VDP指標はCTFの成績と分けて集計します。
 
 **実装状況：** バージョン`0.1.0`にはランタイムと[日付付きの受入記録](docs/README.ja.md#受入記録)があり、環境限定のWSL2／Codex接続記録も含まれます。実VDPでの安全性、本番運用、全クライアントとの互換性、実課題での正答率向上を保証するものではありません。古い設計文書の配置図は計画であり、構築済みインフラを示しません。
 

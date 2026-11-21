@@ -71,6 +71,7 @@ from ctf_mcp.evidence import (
     ManualObservationRecord,
     VdpDraftSpec,
     hash_manual_test_file,
+    read_bounded_manual_json_file,
 )
 from ctf_mcp.gateway import sanitize_audit_text
 from ctf_mcp.mcp_diagnostics import collect_mcp_diagnostics
@@ -1143,9 +1144,7 @@ def _handle_import_manual_observation(args: argparse.Namespace, env: Mapping[str
     snapshot = controller.runs.get_run_snapshot(args.run_id)
     owner = _owner_principal(snapshot, principal)
 
-    raw_payload = json.loads(Path(args.manifest_json).read_text(encoding="utf-8"))
-    if not isinstance(raw_payload, dict):
-        raise ContractViolationError("--manifest-json must contain a JSON object.")
+    raw_payload = read_bounded_manual_json_file(Path(args.manifest_json))
 
     file_hashes = dict(raw_payload.get("test_code_hashes") or {})
     for tf in getattr(args, "test_file", None) or ():
@@ -1161,11 +1160,15 @@ def _handle_import_manual_observation(args: argparse.Namespace, env: Mapping[str
         _, log_hash = hash_manual_test_file(Path(args.raw_log_file), max_bytes=10_485_760)
         raw_payload["raw_log_sha256"] = log_hash
 
+    strict_mode = bool(getattr(args, "strict", False))
+    raw_payload.setdefault("intake_channel", "cli")
     observation = ManualObservationRecord.model_validate(raw_payload)
     receipt = controller.import_manual_observation(
         principal=owner,
         run_id=args.run_id,
         observation=observation,
+        strict_intake=strict_mode,
+        intake_channel="cli",
     )
     _emit_json(
         {
@@ -1176,6 +1179,7 @@ def _handle_import_manual_observation(args: argparse.Namespace, env: Mapping[str
             "execution_provenance": observation.execution_provenance,
             "verification_tier": observation.verification_tier,
             "promoted_to_vdp_product_test": False,
+            "intake_channel": "cli",
             "verified_sha256": receipt.verified_sha256,
             "test_code_hashes": observation.test_code_hashes,
             "cleanup_confirmation": observation.cleanup_confirmation.model_dump(mode="json"),
@@ -1495,6 +1499,7 @@ def build_admin_parser() -> argparse.ArgumentParser:
     p_man.add_argument("--manifest-json", type=Path, required=True)
     p_man.add_argument("--test-file", action="append", type=Path, default=None)
     p_man.add_argument("--raw-log-file", type=Path, default=None)
+    p_man.add_argument("--strict", action="store_true", default=False)
 
     p_draft = subparsers.add_parser(
         "export-vdp-draft",

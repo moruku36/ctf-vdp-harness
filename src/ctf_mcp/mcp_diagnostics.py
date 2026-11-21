@@ -350,6 +350,7 @@ def collect_mcp_diagnostics(
                 "record-vdp-submission",
                 "list-vdp-submissions",
                 "vdp-boundary-map",
+                "vdp-auth-matrix",
                 "register-vdp-overlay",
                 "register-vdp-profile",
                 "check-vdp-env",

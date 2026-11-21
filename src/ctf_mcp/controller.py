@@ -106,6 +106,7 @@ from ctf_mcp.evidence import (
     record_manual_vdp_submission,
     scan_sensitive_markers,
     serialize_manual_observation,
+    validate_manual_observation_for_intake,
 )
 from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
 from ctf_mcp.gateway import (
@@ -165,6 +166,7 @@ ACTION_DISPATCH_TOOLS: tuple[str, ...] = (
     "net.probe",
     "vdp.test",
 )
+VDP_PROVENANCE_TOOLS: tuple[str, ...] = ("evidence.import_manual_observation",)
 ALWAYS_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
     {
         "exec_shell",
@@ -934,7 +936,36 @@ class HarnessController:
                 with self._lock:
                     if cap.name in self._adapters:
                         visible_tools.add(group)
+        if self._is_vdp_provenance_tool_visible(
+            principal=principal,
+            run_id=run_id,
+            mode=mode,
+        ):
+            visible_tools.update(VDP_PROVENANCE_TOOLS)
         return visible_tools
+
+    def _is_vdp_provenance_tool_visible(
+        self,
+        *,
+        principal: PrincipalContext | None = None,
+        run_id: str | None = None,
+        mode: RunMode | None = None,
+    ) -> bool:
+        """Return True only for open, active-scope VDP runs (or VDP server default mode)."""
+        if run_id is not None:
+            if principal is None:
+                return False
+            snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+            effective_mode = mode or snapshot.manifest.mode
+            if effective_mode != RunMode.VDP or snapshot.manifest.closed_at is not None:
+                return False
+            try:
+                self.scope_validator.get_active_scope(run_id, now=self._now())
+            except ScopeDeniedError:
+                return False
+            return True
+        effective_mode = mode or self.default_mode
+        return effective_mode == RunMode.VDP
 
     def resolve_capability_for_tool_group(
         self,
@@ -2676,6 +2707,12 @@ class HarnessController:
                     "target_name": parsed.get("target_name"),
                     "target_version": parsed.get("target_version"),
                     "pinned_source_commit": parsed.get("pinned_source_commit"),
+                    "intake_channel": parsed.get("intake_channel", "cli"),
+                    "executed_by": parsed.get("executed_by"),
+                    "execution_method": parsed.get("execution_method"),
+                    "before_state": parsed.get("before_state"),
+                    "after_state": parsed.get("after_state"),
+                    "private_evidence_ref_count": len(parsed.get("private_evidence_refs") or ()),
                     "test_code_hashes": parsed.get("test_code_hashes") or {},
                     "unverified_conditions": parsed.get("unverified_conditions") or [],
                     "cleanup_confirmed": bool(
@@ -2694,6 +2731,10 @@ class HarnessController:
         principal: PrincipalContext,
         run_id: str,
         observation: ManualObservationRecord,
+        strict_intake: bool = False,
+        intake_channel: Literal["cli", "mcp"] = "cli",
+        request_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> ImportReceipt:
         """Import an out-of-harness manual isolated observation with provenance (never promoted to vdp.test)."""
         snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
@@ -2703,10 +2744,113 @@ class HarnessController:
             )
         if snapshot.manifest.closed_at is not None:
             raise ScopeDeniedError(f"Cannot import manual observation into closed run {run_id!r}.")
+        active_scope = self.scope_validator.get_active_scope(run_id, now=self._now())
 
-        payload_bytes = serialize_manual_observation(observation)
+        validated = validate_manual_observation_for_intake(
+            observation,
+            strict_intake=strict_intake,
+            intake_channel=intake_channel,
+        )
+        payload_bytes = serialize_manual_observation(validated)
         payload_sha256 = sha256_bytes(payload_bytes)
-        object_id = f"manual-obs-{observation.observation_id[:48]}-{uuid4().hex[:8]}"
+
+        eff_request_id: str
+        explicit_request_id = False
+        if request_id is not None:
+            clean_req = request_id.strip()
+            if not clean_req or len(clean_req) > 128:
+                raise ContractViolationError("request_id must be a non-empty string (<= 128 chars).")
+            eff_request_id = clean_req
+            explicit_request_id = True
+        else:
+            eff_request_id = f"manual-obs-{validated.observation_id[:48]}-{uuid4().hex[:8]}"
+
+        sanitized_args = {
+            "observation_id": validated.observation_id,
+            "target_name": validated.target_name,
+            "target_version": validated.target_version,
+            "pinned_source_commit": validated.pinned_source_commit,
+            "intake_channel": validated.intake_channel,
+            "payload_sha256": payload_sha256,
+            "execution_provenance": MANUAL_OBSERVATION_PROVENANCE,
+            "promoted_to_vdp_product_test": False,
+        }
+        args_sha256 = canonical_digest(sanitized_args)
+
+        def _replay_receipt_if_present(conn: sqlite3.Connection) -> ImportReceipt | None:
+            existing = conn.execute(
+                """
+                SELECT action_id, capability_name, canonical_args_sha256, sanitized_args_json
+                FROM actions
+                WHERE principal_id = ? AND run_id = ? AND request_id = ?
+                """,
+                (principal.principal_id, run_id, eff_request_id),
+            ).fetchone()
+            if existing is None:
+                return None
+            if (
+                str(existing["capability_name"]) != "vdp.manual_observation"
+                or str(existing["canonical_args_sha256"]) != args_sha256
+            ):
+                raise ActionConflictError(
+                    f"Idempotency conflict for request_id={eff_request_id!r} with differing manual observation payload."
+                )
+            eo_row = conn.execute(
+                """
+                SELECT evidence_id, created_at
+                FROM evidence_objects
+                WHERE action_id = ? AND run_id = ? AND owner_principal_id = ?
+                """,
+                (str(existing["action_id"]), run_id, principal.principal_id),
+            ).fetchone()
+            if eo_row is None:
+                raise ContractViolationError(
+                    f"Idempotent manual observation action {existing['action_id']!r} is missing its evidence object."
+                )
+            manifest = self.evidence_vault.get_manifest(
+                run_id=run_id,
+                principal_id=principal.principal_id,
+                evidence_id=str(eo_row["evidence_id"]),
+                conn=conn,
+            )
+            recorded_obj_id = manifest.evidence_id
+            try:
+                parsed_args = json.loads(str(existing["sanitized_args_json"]))
+                if isinstance(parsed_args, dict) and parsed_args.get("object_id"):
+                    recorded_obj_id = str(parsed_args["object_id"])
+            except Exception:
+                pass
+            return ImportReceipt(
+                evidence_id=manifest.evidence_id,
+                run_id=manifest.run_id,
+                owner_principal_id=manifest.owner_principal_id,
+                action_id=manifest.action_id,
+                object_id=recorded_obj_id,
+                verified_sha256=manifest.view_sha256,
+                verified_bytes=manifest.byte_length,
+                media_type=manifest.media_type,
+                importer_identity=self.bounded_importer.importer_identity,
+                imported_at=datetime.fromisoformat(str(eo_row["created_at"])),
+                manifest=manifest,
+            )
+
+        if explicit_request_id:
+            with self.storage.read_connection() as conn:
+                replay = _replay_receipt_if_present(conn)
+                if replay is not None:
+                    return replay
+
+        if expected_revision is not None and snapshot.revision != expected_revision:
+            raise ActionConflictError(
+                f"Run revision mismatch for {run_id!r}: expected {expected_revision}, actual {snapshot.revision}.",
+                details={
+                    "run_id": run_id,
+                    "expected_revision": expected_revision,
+                    "actual_revision": snapshot.revision,
+                },
+            )
+
+        object_id = f"manual-obs-{validated.observation_id[:48]}-{uuid4().hex[:8]}"
         staging_relpath = f"manual_observations/{object_id}.json"
 
         self.staging_root.mkdir(parents=True, exist_ok=True)
@@ -2721,20 +2865,15 @@ class HarnessController:
         ts = self._now()
         ts_iso = ts.isoformat()
         action_id = f"act-man-{uuid4().hex[:16]}"
-        request_id = f"manual-obs-{observation.observation_id[:48]}-{uuid4().hex[:8]}"
-        sanitized_args = {
-            "observation_id": observation.observation_id,
-            "target_name": observation.target_name,
-            "target_version": observation.target_version,
-            "pinned_source_commit": observation.pinned_source_commit,
-            "execution_provenance": MANUAL_OBSERVATION_PROVENANCE,
-            "promoted_to_vdp_product_test": False,
-        }
-        args_sha256 = canonical_digest(sanitized_args)
-        source_hashes = tuple(sorted(set(observation.test_code_hashes.values())))
+        source_hashes = tuple(sorted(set(validated.test_code_hashes.values())))
 
         try:
             with self.storage.transaction() as conn:
+                if explicit_request_id:
+                    replay_tx = _replay_receipt_if_present(conn)
+                    if replay_tx is not None:
+                        return replay_tx
+
                 conn.execute(
                     """
                     INSERT INTO actions (
@@ -2750,14 +2889,14 @@ class HarnessController:
                         action_id,
                         principal.principal_id,
                         run_id,
-                        request_id,
-                        snapshot.revision,
+                        eff_request_id,
+                        expected_revision if expected_revision is not None else snapshot.revision,
                         "vdp.manual_observation",
                         "import_manual_observation",
                         "manual-observation-import/1",
                         args_sha256,
-                        json.dumps(sanitized_args, sort_keys=True, ensure_ascii=False),
-                        snapshot.manifest.scope_revision,
+                        json.dumps({**sanitized_args, "object_id": object_id}, sort_keys=True, ensure_ascii=False),
+                        active_scope.scope_revision,
                         ActionLifecycleState.COMPLETED.value,
                         len(payload_bytes),
                         ts_iso,
@@ -2785,8 +2924,8 @@ class HarnessController:
                     action_id=action_id,
                     status=EnvelopeStatus.OK,
                     summary=(
-                        f"Imported manual isolated observation {observation.observation_id!r} "
-                        "(not harness vdp.product_test verified)."
+                        f"Imported manual isolated observation {validated.observation_id!r} "
+                        f"via {validated.intake_channel} (not harness vdp.product_test verified)."
                     ),
                     evidence=(
                         EvidenceRef(
@@ -2798,7 +2937,7 @@ class HarnessController:
                     usage=UsageMetrics(wall_ms=0, output_bytes=len(payload_bytes)),
                     provenance=ProvenanceInfo(
                         adapter_revision="manual-observation-import/1",
-                        scope_revision=snapshot.manifest.scope_revision,
+                        scope_revision=active_scope.scope_revision,
                     ),
                 )
                 conn.execute(
@@ -2817,10 +2956,11 @@ class HarnessController:
                         operation="import_manual_observation",
                         outcome=EnvelopeStatus.OK.value,
                         usage=UsageMetrics(wall_ms=0, output_bytes=len(payload_bytes)),
-                        scope_revision=snapshot.manifest.scope_revision,
+                        scope_revision=active_scope.scope_revision,
                         destination_summary=(
-                            f"observation_id={observation.observation_id};"
+                            f"observation_id={validated.observation_id};"
                             f"evidence_id={receipt.evidence_id};"
+                            f"channel={validated.intake_channel};"
                             f"provenance={MANUAL_OBSERVATION_PROVENANCE}"
                         ),
                     ),

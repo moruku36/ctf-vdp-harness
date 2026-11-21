@@ -250,10 +250,18 @@ try {
             $report.issues += "schema_mismatch_or_extra_forbidden: $($schemaDiffs -join '; ')"
         }
     }
+    $hasManualObsTool = ($toolNames -contains "evidence.import_manual_observation")
+    $reconnectNote = if ($hasManualObsTool) {
+        "Start a fresh Codex/MCP client session after remote server updates so cached tools/list schemas include evidence.import_manual_observation."
+    } else {
+        "evidence.import_manual_observation is exposed only in VDP mode / open active-scope VDP runs; start a fresh Codex session if server code or config recently changed."
+    }
     $report.mcp_handshake = [ordered]@{
         ok = $true
         server_info = $initObj.result.serverInfo
         tools = $toolNames
+        has_manual_observation_tool = $hasManualObsTool
+        reconnect_note = $reconnectNote
         tool_schemas = $liveSchemas
         schema_match = $schemaMatch
         schema_diffs = $schemaDiffs

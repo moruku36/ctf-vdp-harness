@@ -14,11 +14,13 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import anyio
 from fastmcp import FastMCP
+from pydantic import ValidationError
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -50,11 +52,23 @@ from ctf_mcp.contracts import (
 from ctf_mcp.controller import (
     ALWAYS_FORBIDDEN_TOOLS,
     ACTION_DISPATCH_TOOLS,
+    VDP_PROVENANCE_TOOLS,
     HarnessController,
     create_default_controller,
     register_default_verifier,
 )
-from ctf_mcp.evidence import ReportMetadata
+from ctf_mcp.evidence import (
+    MANUAL_OBSERVATION_PROVENANCE,
+    MANUAL_OBSERVATION_VERIFICATION_TIER,
+    NOT_EXECUTED_VIA_HARNESS_CONDITION,
+    ManualCleanupConfirmation,
+    ManualControlRecord,
+    ManualIsolationDeclaration,
+    ManualObservationRecord,
+    ManualPrivateEvidenceRef,
+    ReportMetadata,
+    normalize_manual_observation,
+)
 from ctf_mcp.gateway import sanitize_audit_text
 from ctf_mcp.storage import Storage
 
@@ -67,6 +81,7 @@ SUPPORTED_TOOL_NAMES: tuple[str, ...] = (
     "net.probe",
     "vdp.test",
     "evidence.read",
+    "evidence.import_manual_observation",
     "hypothesis.update",
     "run.verify",
     "run.close",
@@ -227,7 +242,9 @@ class HarnessGateMiddleware(Middleware):
         # active/owned run's scope expired ONLY if the tool itself is enabled in the
         # run's mode catalog; otherwise pre-deny hidden tools directly here.
         if tool_name not in visible:
-            if tool_name in ACTION_DISPATCH_TOOLS and scope_run_id is not None:
+            if (
+                tool_name in ACTION_DISPATCH_TOOLS or tool_name in VDP_PROVENANCE_TOOLS
+            ) and scope_run_id is not None:
                 reason = await anyio.to_thread.run_sync(
                     lambda: self._server.describe_hidden_reason(
                         principal=principal,
@@ -386,7 +403,15 @@ class HarnessMcpServer:
         run_id: str,
         tool_name: str,
     ) -> str:
-        """Build a safe denial explanation when a hidden dispatch tool is called directly."""
+        """Build a safe denial explanation when a hidden dispatch or provenance tool is called directly."""
+        try:
+            snapshot = self.controller.runs.get_run_snapshot(run_id)
+        except HarnessError as exc:
+            return sanitize_audit_text(str(exc)) or f"Scope denied for tool {tool_name!r}."
+        if snapshot.manifest.closed_at is not None:
+            return f"Cannot invoke {tool_name!r} on closed run {run_id!r}."
+        if tool_name in VDP_PROVENANCE_TOOLS and snapshot.manifest.mode.value != "vdp":
+            return f"Tool {tool_name!r} requires run mode 'vdp', got {snapshot.manifest.mode.value!r}."
         try:
             self.controller.scope_validator.get_active_scope(
                 run_id, now=self.controller._now()
@@ -399,7 +424,7 @@ class HarnessMcpServer:
         )
 
     async def _run_guarded(self, fn: Callable[[], dict[str, Any]]) -> ToolResult:
-        """Run a synchronous controller call off the event loop and convert HarnessErrors."""
+        """Run a synchronous controller call off the event loop and convert domain/validation errors."""
         try:
             payload = await anyio.to_thread.run_sync(fn)
         except HarnessError as exc:
@@ -407,6 +432,16 @@ class HarnessMcpServer:
                 status=_error_status_for_exception(exc),
                 code=exc.code,
                 message=str(exc),
+            )
+        except ValidationError as exc:
+            field_msgs = [
+                f"{'.'.join(str(part) for part in err.get('loc', ()))}: {sanitize_audit_text(str(err.get('msg', 'invalid value')))}"
+                for err in exc.errors()[:5]
+            ]
+            return _error_tool_result(
+                status="tool_error",
+                code="contract_violation",
+                message="; ".join(field_msgs) or "Schema validation failed.",
             )
         return _tool_json_result(payload, is_error=False)
 
@@ -623,7 +658,8 @@ class HarnessMcpServer:
             name="vdp.test",
             description=(
                 "Execute bounded VDP product tests against a pinned target source commit, "
-                "exact scanner image digest, allowlisted selectors/overlays, and --network=none."
+                "exact scanner image digest, allowlisted selectors/overlays, under --network=none "
+                "or bounded isolated_internal_services profiles."
             ),
             annotations=mutating_hint,
         )
@@ -672,6 +708,101 @@ class HarnessMcpServer:
                     max_decode_bytes=max_decode_bytes,
                 ).model_dump(mode="json")
             )
+
+        @self.mcp.tool(
+            name="evidence.import_manual_observation",
+            description=(
+                "Record an out-of-harness manual isolated VDP observation with pinned digests, "
+                "executor/method metadata, positive and defense controls, before/after state, "
+                "unverified conditions, cleanup confirmation, and opaque private evidence refs "
+                "(never fetches URLs/files and never promotes to vdp.product_test)."
+            ),
+            annotations=mutating_hint,
+        )
+        async def evidence_import_manual_observation(
+            run_id: str,
+            observation_id: str,
+            observed_at: datetime,
+            target_name: str,
+            target_version: str,
+            pinned_source_commit: str,
+            pinned_image_digests: dict[str, str],
+            environment_summary: str,
+            isolation_declared: ManualIsolationDeclaration,
+            test_code_hashes: dict[str, str],
+            executed_by: str,
+            execution_method: str,
+            execution_summary: str,
+            before_state: str,
+            after_state: str,
+            controls: list[ManualControlRecord],
+            unverified_conditions: list[str],
+            cleanup_confirmation: ManualCleanupConfirmation,
+            private_evidence_refs: list[ManualPrivateEvidenceRef],
+            impact_boundaries: list[str] | None = None,
+            exit_code: int | None = None,
+            raw_log_sha256: str | None = None,
+            notes: str = "",
+            expected_revision: int | None = None,
+            request_id: str | None = None,
+        ) -> ToolResult:
+            principal = self.resolve_principal()
+
+            def _import_manual() -> dict[str, Any]:
+                record = ManualObservationRecord(
+                    observation_id=observation_id,
+                    observed_at=observed_at,
+                    target_name=target_name,
+                    target_version=target_version,
+                    pinned_source_commit=pinned_source_commit,
+                    pinned_image_digests=pinned_image_digests,
+                    environment_summary=environment_summary,
+                    isolation_declared=isolation_declared,
+                    test_code_hashes=test_code_hashes,
+                    executed_by=executed_by,
+                    execution_method=execution_method,
+                    execution_summary=execution_summary,
+                    before_state=before_state,
+                    after_state=after_state,
+                    exit_code=exit_code,
+                    controls=tuple(controls),
+                    impact_boundaries=tuple(impact_boundaries or ()),
+                    unverified_conditions=tuple(unverified_conditions),
+                    cleanup_confirmation=cleanup_confirmation,
+                    private_evidence_refs=tuple(private_evidence_refs),
+                    raw_log_sha256=raw_log_sha256,
+                    notes=notes,
+                    intake_channel="mcp",
+                )
+                receipt = self.controller.import_manual_observation(
+                    principal=principal,
+                    run_id=run_id,
+                    observation=record,
+                    strict_intake=True,
+                    intake_channel="mcp",
+                    request_id=request_id,
+                    expected_revision=expected_revision,
+                )
+                normalized = normalize_manual_observation(record)
+                return {
+                    "status": "ok",
+                    "run_id": receipt.run_id,
+                    "action_id": receipt.action_id,
+                    "evidence_id": receipt.evidence_id,
+                    "observation_id": normalized.observation_id,
+                    "execution_provenance": MANUAL_OBSERVATION_PROVENANCE,
+                    "verification_tier": MANUAL_OBSERVATION_VERIFICATION_TIER,
+                    "promoted_to_vdp_product_test": False,
+                    "intake_channel": "mcp",
+                    "verified_sha256": receipt.verified_sha256,
+                    "test_code_hashes": normalized.test_code_hashes,
+                    "private_evidence_ref_count": len(normalized.private_evidence_refs),
+                    "unverified_conditions": list(normalized.unverified_conditions),
+                    "cleanup_confirmation": normalized.cleanup_confirmation.model_dump(mode="json"),
+                    "not_harness_verified_tag": NOT_EXECUTED_VIA_HARNESS_CONDITION,
+                }
+
+            return await self._run_guarded(_import_manual)
 
         @self.mcp.tool(
             name="hypothesis.update",

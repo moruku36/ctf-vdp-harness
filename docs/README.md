@@ -34,6 +34,7 @@ These are historical reports for their recorded commits and environments, not ch
 - [P7 VDP Weblate product-test adapter](../records/p7-vdp-weblate-product-test-acceptance.md)
 - [P8 VDP daily-workflow and W-02 live acceptance](../records/p8-vdp-daily-workflow-acceptance-2026-11-14.md)
 - [P9 Windows->NUC MCP, isolated internal services, manual provenance & draft acceptance (2026-11-19)](../records/p9-nuc-mcp-isolated-services-provenance-acceptance-2026-11-19.md)
+- [P10 PR-A MCP typed intake for manual isolated observations acceptance (2026-11-22)](../records/p10-pr-a-manual-observation-mcp-acceptance-2026-11-22.md)
 
 The P5 evaluation compares A (no MCP), B (one stateless inspection), C (stateful harness) and D (C with frozen development guidance), using 10 development and 20 disjoint synthetic holdout tasks. It separates first-attempt `pass@1` from `best_of_k`, keeps VDP vulnerable/fixed pairs outside CTF denominators, and reports regressions and unmeasured API costs. It does not establish real-model or live-target performance gains.
 

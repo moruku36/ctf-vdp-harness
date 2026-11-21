@@ -185,7 +185,11 @@ def test_collect_mcp_diagnostics_healthy_and_secret_free(tmp_path: Path) -> None
     assert report["active_run"]["scope_active"] is True
     assert "vdp.test" in report["tool_schemas"]
     assert "run.describe" in report["tool_schemas"]
+    assert "evidence.import_manual_observation" in report["tool_schemas"]
     assert report["tool_schemas"]["vdp.test"]["additional_properties"] is False
+    assert report["tool_schemas"]["evidence.import_manual_observation"]["additional_properties"] is False
+    assert report["tool_schemas"]["evidence.import_manual_observation"]["nested_strict_objects_closed"] is True
+    assert report["surface_summary"]["vdp_manual_observation_mcp_exposed"] is True
     assert len(report["tool_schemas"]["vdp.test"]["schema_sha256"]) == 64
 
     serialized = json.dumps(report, ensure_ascii=False)
@@ -266,3 +270,22 @@ def test_cli_diagnose_mcp_exit_codes(tmp_path: Path, capsys) -> None:
     out_bad = json.loads(capsys.readouterr().out)
     assert rc_bad == 1
     assert out_bad["healthy"] is False
+
+
+
+def test_collect_mcp_diagnostics_hides_vdp_manual_tool_in_offline_ctf(tmp_path: Path) -> None:
+    hmac_secret = "offline-diag-hmac-secret-value-1234567890abcdef"
+    db_path, vault_root = _seed_vdp_run(tmp_path, hmac_key=hmac_secret.encode("utf-8"))
+    report = collect_mcp_diagnostics(
+        env={
+            "CTF_MCP_DB_PATH": str(db_path),
+            "CTF_MCP_VAULT_ROOT": str(vault_root),
+            "CTF_MCP_CURSOR_HMAC_KEY": hmac_secret,
+            "CTF_MCP_PROFILE": "offline_ctf",
+        },
+        check_docker=False,
+    )
+    assert report["healthy"] is True
+    assert "evidence.import_manual_observation" not in report["tool_schemas"]
+    assert report["surface_summary"]["mode"] == "offline_ctf"
+    assert report["surface_summary"]["vdp_manual_observation_mcp_exposed"] is False

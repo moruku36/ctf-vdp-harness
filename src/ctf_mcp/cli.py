@@ -68,10 +68,16 @@ from ctf_mcp.controller import (
     save_verifier_expectation,
 )
 from ctf_mcp.evidence import (
+    VALID_CHECKPOINT_GATES,
+    CandidatePreconditions,
+    KnownIssueCheckpoint,
     ManualObservationRecord,
     VdpDraftSpec,
+    evaluate_candidate_gate,
     hash_manual_test_file,
+    read_bounded_candidate_json_file,
     read_bounded_manual_json_file,
+    summarize_vdp_candidate_metrics,
 )
 from ctf_mcp.gateway import sanitize_audit_text
 from ctf_mcp.mcp_diagnostics import collect_mcp_diagnostics
@@ -1257,6 +1263,110 @@ def _handle_list_vdp_submissions(args: argparse.Namespace, env: Mapping[str, str
     return 0
 
 
+_CANDIDATE_JSON_ALLOWED_KEYS = frozenset(
+    {
+        "candidate_id",
+        "title",
+        "target_name",
+        "target_version",
+        "pinned_source_commit",
+        "status",
+        "preconditions",
+        "checkpoint",
+        "evidence_ids",
+        "first_candidate_observed_at",
+    }
+)
+
+
+def _handle_record_vdp_candidate(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    raw = read_bounded_candidate_json_file(Path(args.candidate_json))
+    unknown_keys = sorted(set(raw.keys()) - _CANDIDATE_JSON_ALLOWED_KEYS)
+    if unknown_keys:
+        raise ContractViolationError(
+            f"Candidate JSON contains unknown field(s): {unknown_keys}."
+        )
+    preconditions = CandidatePreconditions.model_validate(raw.get("preconditions"))
+    raw_cp = raw.get("checkpoint")
+    checkpoint = KnownIssueCheckpoint.model_validate(raw_cp) if raw_cp is not None else None
+    raw_first = raw.get("first_candidate_observed_at")
+    first_obs = _parse_iso_datetime(str(raw_first)) if raw_first is not None else None
+    raw_eids = raw.get("evidence_ids") or ()
+    if not isinstance(raw_eids, list):
+        raise ContractViolationError("evidence_ids in candidate JSON must be a list of strings.")
+    record = controller.record_vdp_candidate_checkpoint(
+        principal=owner,
+        run_id=args.run_id,
+        candidate_id=str(raw.get("candidate_id") or ""),
+        title=str(raw.get("title") or ""),
+        target_name=str(raw.get("target_name") or ""),
+        target_version=str(raw.get("target_version") or ""),
+        pinned_source_commit=str(raw.get("pinned_source_commit") or ""),
+        preconditions=preconditions,
+        checkpoint=checkpoint,
+        status=raw.get("status", "investigation_candidate"),
+        evidence_ids=tuple(str(x) for x in raw_eids),
+        first_candidate_observed_at=first_obs,
+    )
+    now = controller._now()
+    _emit_json(
+        {
+            "run_id": args.run_id,
+            "external_search_performed_by_harness": False,
+            "auto_promoted_to_confirmed_vulnerability": False,
+            "record": record.model_dump(mode="json"),
+            "gates": {
+                "pre_heavy_test": evaluate_candidate_gate(
+                    record, gate="pre_heavy_test", now=now
+                ).model_dump(mode="json"),
+                "pre_submission": evaluate_candidate_gate(
+                    record, gate="pre_submission", now=now
+                ).model_dump(mode="json"),
+            },
+        }
+    )
+    return 0
+
+
+def _handle_check_vdp_candidate_gate(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    evaluation = controller.evaluate_vdp_candidate_gate(
+        principal=owner,
+        run_id=args.run_id,
+        candidate_id=args.candidate_id,
+        gate=args.gate,
+    )
+    _emit_json(evaluation.model_dump(mode="json"))
+    return 0 if evaluation.ready else 1
+
+
+def _handle_list_vdp_candidates(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
+    controller, principal, _ = _resolve_admin_context(args, env=env)
+    snapshot = controller.runs.get_run_snapshot(args.run_id)
+    owner = _owner_principal(snapshot, principal)
+    items = controller.list_vdp_candidate_checkpoints(principal=owner, run_id=args.run_id)
+    metrics = summarize_vdp_candidate_metrics(
+        items,
+        run_created_at=snapshot.manifest.created_at,
+        now=controller._now(),
+    )
+    _emit_json(
+        {
+            "run_id": args.run_id,
+            "external_search_performed_by_harness": False,
+            "auto_promoted_to_confirmed_vulnerability": False,
+            "candidates": [item.model_dump(mode="json") for item in items],
+            "metrics": metrics,
+        }
+    )
+    return 0
+
+
 def _handle_diagnose_mcp(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
     eff_env = _merge_runtime_env(
         env=env,
@@ -1546,6 +1656,30 @@ def build_admin_parser() -> argparse.ArgumentParser:
     _add_common_admin_flags(p_sub_list, suppress_defaults=True)
     p_sub_list.add_argument("--run-id", required=True)
 
+    p_cand_rec = subparsers.add_parser(
+        "record-vdp-candidate",
+        help="Record or update a VDP candidate's preconditions and known-issue gate checkpoint.",
+    )
+    _add_common_admin_flags(p_cand_rec, suppress_defaults=True)
+    p_cand_rec.add_argument("--run-id", required=True)
+    p_cand_rec.add_argument("--candidate-json", type=Path, required=True)
+
+    p_cand_gate = subparsers.add_parser(
+        "check-vdp-candidate-gate",
+        help="Evaluate a VDP candidate's pre_heavy_test or pre_submission known-issue gate.",
+    )
+    _add_common_admin_flags(p_cand_gate, suppress_defaults=True)
+    p_cand_gate.add_argument("--run-id", required=True)
+    p_cand_gate.add_argument("--candidate-id", required=True)
+    p_cand_gate.add_argument("--gate", choices=list(VALID_CHECKPOINT_GATES), required=True)
+
+    p_cand_list = subparsers.add_parser(
+        "list-vdp-candidates",
+        help="List VDP candidate known-issue/precondition checkpoints and metrics for a run.",
+    )
+    _add_common_admin_flags(p_cand_list, suppress_defaults=True)
+    p_cand_list.add_argument("--run-id", required=True)
+
     p_diag = subparsers.add_parser(
         "diagnose-mcp",
         help="Run read-only MCP config, tool schema fingerprint, run-state, and optional Docker hygiene diagnostics.",
@@ -1585,6 +1719,9 @@ def admin_main(
         "export-vdp-draft": _handle_export_vdp_draft,
         "record-vdp-submission": _handle_record_vdp_submission,
         "list-vdp-submissions": _handle_list_vdp_submissions,
+        "record-vdp-candidate": _handle_record_vdp_candidate,
+        "check-vdp-candidate-gate": _handle_check_vdp_candidate_gate,
+        "list-vdp-candidates": _handle_list_vdp_candidates,
         "diagnose-mcp": _handle_diagnose_mcp,
     }
     try:

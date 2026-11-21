@@ -63,6 +63,8 @@ from ctf_mcp.contracts import (
     ContractViolationError,
     EnvelopeStatus,
     ErrorDetail,
+    EvidenceAccessDeniedError,
+    EvidenceNotFoundError,
     EvidencePage,
     EvidenceRef,
     ExecutionClass,
@@ -90,22 +92,31 @@ from ctf_mcp.evidence import (
     MANUAL_OBSERVATION_PROVENANCE,
     MANUAL_OBSERVATION_SCHEMA,
     BoundedEvidenceImporter,
+    CandidateGateEvaluation,
+    CandidatePreconditions,
     EvidenceRedactor,
     EvidenceVault,
     ExportResult,
     ImportReceipt,
+    KnownIssueCheckpoint,
     ManualObservationRecord,
     RedactedViewOutcome,
     ReportMetadata,
     RunReportExporter,
+    VdpCandidateCheckpointRecord,
     VdpDraftExportResult,
     VdpDraftSpec,
     VdpSubmissionRecord,
+    evaluate_candidate_gate,
     export_vdp_submission_draft,
+    get_vdp_candidate_checkpoint,
+    list_vdp_candidate_checkpoints,
     load_vdp_submissions,
     record_manual_vdp_submission,
+    save_vdp_candidate_checkpoint,
     scan_sensitive_markers,
     serialize_manual_observation,
+    summarize_vdp_candidate_metrics,
     validate_manual_observation_for_intake,
 )
 from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
@@ -1681,6 +1692,15 @@ class HarnessController:
                 rec.model_dump(mode="json")
                 for rec in self.list_vdp_submissions(principal=principal, run_id=run_id)
             ]
+            candidates = list_vdp_candidate_checkpoints(self.vault_root, run_id=run_id)
+            summary["vdp_candidate_checkpoints"] = [
+                rec.model_dump(mode="json") for rec in candidates
+            ]
+            summary["vdp_candidate_metrics"] = summarize_vdp_candidate_metrics(
+                candidates,
+                run_created_at=snapshot.manifest.created_at,
+                now=self._now(),
+            )
         return summary
 
     # ------------------------------------------------------------------
@@ -3107,6 +3127,218 @@ class HarnessController:
             for _, rec in sorted(all_recs.items())
             if rec.run_id == run_id
         ]
+
+    def record_vdp_candidate_checkpoint(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        candidate_id: str,
+        title: str,
+        target_name: str,
+        target_version: str,
+        pinned_source_commit: str,
+        preconditions: CandidatePreconditions,
+        checkpoint: KnownIssueCheckpoint | None = None,
+        status: Literal[
+            "investigation_candidate",
+            "blocked_known_issue",
+            "closed_falsified",
+            "ready_for_human_draft_review",
+        ] = "investigation_candidate",
+        evidence_ids: Sequence[str] = (),
+        first_candidate_observed_at: datetime | None = None,
+    ) -> VdpCandidateCheckpointRecord:
+        """Create or update a VDP candidate record and known-issue gate checkpoint."""
+        snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        if snapshot.manifest.mode != RunMode.VDP:
+            raise ScopeDeniedError(
+                f"VDP candidate checkpoints require run mode 'vdp', got {snapshot.manifest.mode.value!r}."
+            )
+        if snapshot.manifest.closed_at is not None:
+            raise ScopeDeniedError(
+                f"Cannot record VDP candidate checkpoint on closed run {run_id!r}."
+            )
+
+        existing = get_vdp_candidate_checkpoint(
+            self.vault_root,
+            run_id=run_id,
+            candidate_id=candidate_id,
+        )
+        merged_eids = tuple(
+            dict.fromkeys(
+                [
+                    *(existing.evidence_ids if existing is not None else ()),
+                    *(str(eid).strip() for eid in evidence_ids if str(eid).strip()),
+                ]
+            )
+        )
+        with self.storage.read_connection() as conn:
+            for eid in merged_eids:
+                obj_row = conn.execute(
+                    "SELECT evidence_id, run_id, owner_principal_id FROM evidence_objects WHERE evidence_id = ?",
+                    (eid,),
+                ).fetchone()
+                if obj_row is None:
+                    raise EvidenceNotFoundError(f"Referenced evidence {eid!r} was not found.")
+                if str(obj_row["run_id"]) != run_id or str(obj_row["owner_principal_id"]) != principal.principal_id:
+                    raise EvidenceAccessDeniedError(
+                        f"Evidence {eid!r} is not owned by run {run_id!r} and principal {principal.principal_id!r}."
+                    )
+
+        now = self._now()
+        pre_heavy = existing.pre_heavy_test_checkpoint if existing is not None else None
+        pre_sub = existing.pre_submission_checkpoint if existing is not None else None
+        if checkpoint is not None:
+            if checkpoint.gate == "pre_heavy_test":
+                pre_heavy = checkpoint
+            else:
+                pre_sub = checkpoint
+
+        blocking_dispositions = {"blocked_likely_duplicate", "blocked_already_fixed"}
+        has_blocking = any(
+            cp is not None and cp.duplicate_disposition in blocking_dispositions
+            for cp in (pre_heavy, pre_sub)
+        )
+        if has_blocking and status != "closed_falsified":
+            eff_status: Literal[
+                "investigation_candidate",
+                "blocked_known_issue",
+                "closed_falsified",
+                "ready_for_human_draft_review",
+            ] = "blocked_known_issue"
+        else:
+            eff_status = status
+
+        if eff_status == "ready_for_human_draft_review":
+            if pre_heavy is None or pre_sub is None:
+                raise ContractViolationError(
+                    "Cannot mark candidate 'ready_for_human_draft_review' before both "
+                    "'pre_heavy_test' and 'pre_submission' checkpoints are recorded."
+                )
+            gate_eval_candidate = VdpCandidateCheckpointRecord(
+                candidate_id=candidate_id,
+                run_id=run_id,
+                title=title,
+                target_name=target_name,
+                target_version=target_version,
+                pinned_source_commit=pinned_source_commit,
+                status=eff_status,
+                preconditions=preconditions,
+                pre_heavy_test_checkpoint=pre_heavy,
+                pre_submission_checkpoint=pre_sub,
+                evidence_ids=merged_eids,
+                first_candidate_observed_at=(
+                    first_candidate_observed_at
+                    if first_candidate_observed_at is not None
+                    else (existing.first_candidate_observed_at if existing is not None else None)
+                ),
+                created_at=existing.created_at if existing is not None else now,
+                updated_at=now,
+                history=existing.history if existing is not None else (),
+            )
+            sub_eval = evaluate_candidate_gate(
+                gate_eval_candidate,
+                gate="pre_submission",
+                now=now,
+            )
+            if not sub_eval.ready:
+                raise ContractViolationError(
+                    "Cannot mark candidate 'ready_for_human_draft_review' while pre_submission gate is not ready.",
+                    details=sub_eval.model_dump(mode="json"),
+                )
+
+        eff_first_obs = (
+            first_candidate_observed_at
+            if first_candidate_observed_at is not None
+            else (existing.first_candidate_observed_at if existing is not None else None)
+        )
+        history = list(existing.history) if existing is not None else []
+        history.append(
+            {
+                "event": "checkpoint_recorded" if checkpoint is not None else "candidate_upserted",
+                "gate": checkpoint.gate if checkpoint is not None else None,
+                "duplicate_disposition": checkpoint.duplicate_disposition if checkpoint is not None else None,
+                "zero_hits_observed": checkpoint.zero_hits_observed if checkpoint is not None else None,
+                "status": eff_status,
+                "at": now.isoformat(),
+            }
+        )
+        record = VdpCandidateCheckpointRecord(
+            candidate_id=candidate_id,
+            run_id=run_id,
+            title=title,
+            target_name=target_name,
+            target_version=target_version,
+            pinned_source_commit=pinned_source_commit,
+            status=eff_status,
+            preconditions=preconditions,
+            pre_heavy_test_checkpoint=pre_heavy,
+            pre_submission_checkpoint=pre_sub,
+            evidence_ids=merged_eids,
+            first_candidate_observed_at=eff_first_obs,
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+            history=tuple(history),
+        )
+        save_vdp_candidate_checkpoint(self.vault_root, record)
+        with self.storage.transaction() as conn:
+            self.audit.record_sanitized_in_tx(
+                conn,
+                AuditEvent(
+                    event_id=f"aud-{uuid4().hex}",
+                    timestamp=now,
+                    run_id=run_id,
+                    principal_id=principal.principal_id,
+                    action_id=None,
+                    capability="vdp.candidate_checkpoint",
+                    operation=checkpoint.gate if checkpoint is not None else "upsert_candidate",
+                    outcome=EnvelopeStatus.OK.value,
+                    usage=None,
+                    scope_revision=snapshot.manifest.scope_revision,
+                    destination_summary=(
+                        f"candidate_id={record.candidate_id};status={record.status};"
+                        f"pre_heavy={record.pre_heavy_test_checkpoint is not None};"
+                        f"pre_sub={record.pre_submission_checkpoint is not None}"
+                    ),
+                ),
+            )
+        return record
+
+    def list_vdp_candidate_checkpoints(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+    ) -> list[VdpCandidateCheckpointRecord]:
+        """List persisted VDP candidate checkpoint records belonging to an owned run."""
+        _ = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        return list_vdp_candidate_checkpoints(self.vault_root, run_id=run_id)
+
+    def evaluate_vdp_candidate_gate(
+        self,
+        *,
+        principal: PrincipalContext,
+        run_id: str,
+        candidate_id: str,
+        gate: Literal["pre_heavy_test", "pre_submission"],
+    ) -> CandidateGateEvaluation:
+        """Evaluate whether an owned run's candidate passes a known-issue checkpoint gate."""
+        snapshot = self._get_owned_snapshot(principal=principal, run_id=run_id)
+        if snapshot.manifest.mode != RunMode.VDP:
+            raise ScopeDeniedError(
+                f"VDP candidate gates require run mode 'vdp', got {snapshot.manifest.mode.value!r}."
+            )
+        record = get_vdp_candidate_checkpoint(
+            self.vault_root,
+            run_id=run_id,
+            candidate_id=candidate_id,
+        )
+        if record is None:
+            raise EvidenceNotFoundError(
+                f"VDP candidate checkpoint {candidate_id!r} for run {run_id!r} was not found."
+            )
+        return evaluate_candidate_gate(record, gate=gate, now=self._now())
 
     def import_staged_evidence(
         self,

@@ -36,6 +36,7 @@ These are historical reports for their recorded commits and environments, not ch
 - [P9 Windows->NUC MCP, isolated internal services, manual provenance & draft acceptance (2026-11-19)](../records/p9-nuc-mcp-isolated-services-provenance-acceptance-2026-11-19.md)
 - [P10 PR-A MCP typed intake for manual isolated observations acceptance (2026-11-22)](../records/p10-pr-a-manual-observation-mcp-acceptance-2026-11-22.md)
 - [P11 PR-B Authorization matrix and vdp.test overlay integration acceptance (2026-11-22)](../records/p11-pr-b-auth-matrix-acceptance-2026-11-22.md)
+- [P12 PR-C Candidate known-issue & precondition checkpoints acceptance (2026-11-22)](../records/p12-pr-c-candidate-checkpoints-acceptance-2026-11-22.md)
 
 The P5 evaluation compares A (no MCP), B (one stateless inspection), C (stateful harness) and D (C with frozen development guidance), using 10 development and 20 disjoint synthetic holdout tasks. It separates first-attempt `pass@1` from `best_of_k`, keeps VDP vulnerable/fixed pairs outside CTF denominators, and reports regressions and unmeasured API costs. It does not establish real-model or live-target performance gains.
 

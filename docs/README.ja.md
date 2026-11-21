@@ -36,6 +36,7 @@
 - [P9 Windows→NUC MCP・内部サービス隔離試験・手動来歴・提出下書き受入記録 (2026-11-19)](../records/p9-nuc-mcp-isolated-services-provenance-acceptance-2026-11-19.md)
 - [P10 PR-A 手動隔離観測の MCP 型付き取込受入記録 (2026-11-22)](../records/p10-pr-a-manual-observation-mcp-acceptance-2026-11-22.md)
 - [P11 PR-B 認可マトリクスおよび vdp.test オーバーレイ連携受入記録 (2026-11-22)](../records/p11-pr-b-auth-matrix-acceptance-2026-11-22.md)
+- [P12 PR-C 候補の既知問題・成立条件チェックポイント台帳受入記録 (2026-11-22)](../records/p12-pr-c-candidate-checkpoints-acceptance-2026-11-22.md)
 
 P5はA（MCPなし）、B（単発の静的検査）、C（状態を保持するハーネス）、D（開発課題由来の凍結ガイドを加えたC）を、開発用10件・重複しない合成ホールドアウト20件で比較します。初回`pass@1`と`best_of_k`を区別し、VDPの脆弱版／修正版ペアをCTFの分母から分離し、悪化やAPI料金未計測も記録します。実モデルや実対象での性能向上を示すものではありません。
 

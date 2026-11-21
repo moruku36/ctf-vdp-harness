@@ -11,32 +11,14 @@ Generates human-reviewable VDP disclosure drafts aligned with
 
 from __future__ import annotations
 
-import errno
 import hmac
 import json
-import os
 import re
 import sqlite3
-import stat
-import sys
-import threading
-import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    msvcrt = None  # type: ignore[assignment]
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None  # type: ignore[assignment]
 
 from pydantic import Field, model_validator
 
@@ -59,7 +41,16 @@ from ctf_mcp.evidence.manual_observation import (
 )
 from ctf_mcp.evidence.redaction import scan_sensitive_markers
 from ctf_mcp.evidence.vault import EvidenceVault
-from ctf_mcp.fs_guard import _is_reparse_or_symlink, safe_read_bounded, safe_write_atomic
+from ctf_mcp.evidence.vdp_candidate_ledger import (
+    ZERO_HITS_DISCLAIMER,
+    CandidateGateEvaluation,
+    VdpCandidateCheckpointRecord,
+    _vdp_vault_lock,
+    evaluate_candidate_gate,
+    get_vdp_candidate_checkpoint,
+    validate_https_url,
+)
+from ctf_mcp.fs_guard import safe_read_bounded, safe_write_atomic
 from ctf_mcp.storage import Storage
 
 VDP_SUBMISSIONS_RELPATH = "_vdp/submissions.json"
@@ -74,30 +65,12 @@ VALID_TRIAGE_STATUSES: tuple[str, ...] = (
     "resolved",
 )
 
-_SUBMISSIONS_THREAD_LOCKS_GUARD = threading.Lock()
-_SUBMISSIONS_THREAD_LOCKS: dict[Path, threading.Lock] = {}
 _FINDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,64}$")
 
 
 def validate_report_url(url: str) -> str:
     """Validate an HTTPS report URL with zero embedded credentials or control chars."""
-    cleaned = str(url).strip()
-    if not cleaned or len(cleaned) > 512:
-        raise ContractViolationError("report_url must be 1..512 characters.")
-    if any(ch.isspace() or ch == "\x00" for ch in cleaned):
-        raise ContractViolationError("report_url must not contain whitespace or NUL bytes.")
-    parsed = urlsplit(cleaned)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        raise ContractViolationError("report_url must use https:// with a valid host.")
-    if parsed.username or parsed.password or "@" in parsed.netloc:
-        raise ContractViolationError("report_url must not embed credentials.")
-    matched = scan_sensitive_markers(cleaned)
-    if matched:
-        raise ContractViolationError(
-            "report_url contains forbidden sensitive markers.",
-            details={"matched_rules": list(matched)},
-        )
-    return cleaned
+    return validate_https_url(url, field_name="report_url")
 
 
 class VdpAiDisclosure(StrictModel):
@@ -129,6 +102,7 @@ class VdpDraftSpec(StrictModel):
     evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=30)
     ai_disclosure: VdpAiDisclosure
     duplicate_check_note: str = Field(default="operator-check-required", max_length=300)
+    candidate_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
     @model_validator(mode="after")
     def _validate_clean(self) -> VdpDraftSpec:
@@ -162,6 +136,7 @@ class VdpSubmissionRecord(StrictModel):
         "resolved",
     ] = "not_submitted"
     automatic_submission: Literal[False] = False
+    candidate_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     evidence_provenance_summary: tuple[dict[str, Any], ...] = ()
     draft_relpath: str | None = None
@@ -206,88 +181,8 @@ class VdpDraftExportResult(StrictModel):
     exported_at: datetime
 
 
-def _get_submissions_thread_lock(lock_path: Path) -> threading.Lock:
-    with _SUBMISSIONS_THREAD_LOCKS_GUARD:
-        lock = _SUBMISSIONS_THREAD_LOCKS.get(lock_path)
-        if lock is None:
-            lock = threading.Lock()
-            _SUBMISSIONS_THREAD_LOCKS[lock_path] = lock
-        return lock
-
-
-def _acquire_file_lock(fd: int, *, timeout_seconds: float = 30.0) -> None:
-    if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return
-    if sys.platform == "win32" and msvcrt is not None:
-        if os.fstat(fd).st_size == 0:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, b"\0")
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            try:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                return
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Timed out acquiring lock for VDP submissions store.") from exc
-                time.sleep(0.01)
-
-
-def _release_file_lock(fd: int) -> None:
-    if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return
-    if sys.platform == "win32" and msvcrt is not None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-
-
-@contextmanager
-def _vdp_submissions_lock(vault_path: Path) -> Iterator[None]:
-    try:
-        root_st = os.lstat(vault_path)
-    except OSError as exc:
-        raise PathSecurityError(f"Vault root is inaccessible: {exc}") from exc
-    if _is_reparse_or_symlink(root_st) or not stat.S_ISDIR(root_st.st_mode):
-        raise PathSecurityError("Vault root must be a non-symlink directory.")
-    real_vault = Path(os.path.realpath(vault_path, strict=True))
-    vdp_dir = real_vault / "_vdp"
-    try:
-        vdp_st = os.lstat(vdp_dir)
-    except FileNotFoundError:
-        try:
-            os.mkdir(vdp_dir, 0o750)
-        except FileExistsError:
-            pass
-        vdp_st = os.lstat(vdp_dir)
-    if _is_reparse_or_symlink(vdp_st) or not stat.S_ISDIR(vdp_st.st_mode):
-        raise PathSecurityError("Vault _vdp directory must be a non-symlink directory.")
-
-    lock_path = Path(os.path.realpath(vdp_dir, strict=True)) / "submissions.json.lock"
-    thread_lock = _get_submissions_thread_lock(lock_path)
-    with thread_lock:
-        try:
-            existing_lock_st = os.lstat(lock_path)
-        except FileNotFoundError:
-            existing_lock_st = None
-        if existing_lock_st is not None and (
-            _is_reparse_or_symlink(existing_lock_st) or not stat.S_ISREG(existing_lock_st.st_mode)
-        ):
-            raise PathSecurityError("VDP submissions lockfile cannot be a symlink or special file.")
-        open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(lock_path, open_flags, 0o600)
-        try:
-            _acquire_file_lock(fd)
-            try:
-                yield
-            finally:
-                _release_file_lock(fd)
-        finally:
-            os.close(fd)
+def _vdp_submissions_lock(vault_path: Path):
+    return _vdp_vault_lock(vault_path, "submissions.json.lock")
 
 
 def _load_vdp_submissions_unlocked(vault_path: Path) -> dict[str, VdpSubmissionRecord]:
@@ -347,6 +242,103 @@ def save_vdp_submission(vault_root: str | Path, record: VdpSubmissionRecord) -> 
 
 def _clean_cell(val: str) -> str:
     return str(val).replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+
+
+def _render_candidate_checkpoint_section(
+    *,
+    candidate: VdpCandidateCheckpointRecord | None,
+    gate_eval: CandidateGateEvaluation | None,
+    language: Literal["ja", "en"],
+) -> list[str]:
+    if candidate is None:
+        return []
+    pre = candidate.preconditions
+    checkpoints = [
+        ("pre_heavy_test", candidate.pre_heavy_test_checkpoint),
+        ("pre_submission", candidate.pre_submission_checkpoint),
+    ]
+    ref_rows: list[str] = []
+    cp_lines: list[str] = []
+    has_zero_hits = False
+    for gate_name, cp in checkpoints:
+        if cp is None:
+            cp_lines.append(f"- `{gate_name}`: missing")
+            continue
+        if cp.zero_hits_observed:
+            has_zero_hits = True
+        queries_str = ", ".join(f"`{q}`" for q in cp.search_queries)
+        cp_lines.append(
+            f"- `{gate_name}`: `checked_at={cp.checked_at.isoformat()}`, "
+            f"`checked_by={cp.checked_by}`, `source={cp.search_source}`, "
+            f"`queries=[{queries_str}]`, `disposition={cp.duplicate_disposition}`, "
+            f"`zero_hits_observed={cp.zero_hits_observed}`"
+        )
+        for ref in cp.references_reviewed:
+            ref_rows.append(
+                f"| {_clean_cell(gate_name)} | {_clean_cell(ref.ref_kind)} | {_clean_cell(ref.ref_id)} | "
+                f"{_clean_cell(ref.target_version_relation)} | {_clean_cell(ref.same_root_cause_judgment)} | "
+                f"{_clean_cell(ref.human_rationale)} | {_clean_cell(ref.ref_url)} |"
+            )
+
+    warnings_str = ", ".join(gate_eval.warnings) if gate_eval and gate_eval.warnings else "none"
+    basis_str = ", ".join(f"`{b}`" for b in pre.basis_refs) if pre.basis_refs else "none"
+
+    if language == "ja":
+        if not ref_rows:
+            ref_rows = ["| - | - | (参照なし / 検索結果0件) | - | - | 重複なしを自動断定しない | - |"]
+        lines = [
+            "",
+            "## 既知問題チェックポイントと成立条件",
+            f"- 候補ID / 状態：`candidate_id={candidate.candidate_id}`, `status={candidate.status}`, `auto_promoted_to_confirmed_vulnerability=False`, `external_search_performed_by_harness=False`",
+            f"- 事前設定の作成主体：`preconfig_created_by={pre.preconfig_created_by}`",
+            f"- 攻撃者が制御する入力：{pre.attacker_controls}",
+            f"- 実運用での一般的成立性：`real_world_prevalence={pre.real_world_prevalence}`",
+            f"- 観測された影響上限：{pre.observed_impact_cap}",
+            f"- 根拠参照：{basis_str}",
+            f"- ゲート警告：`{warnings_str}`",
+            *cp_lines,
+        ]
+        if has_zero_hits:
+            lines.append(
+                f"- 検索結果0件に関する注記：`{ZERO_HITS_DISCLAIMER}`（検索結果0件は「重複なし」「未修正」を自動証明しません）"
+            )
+        lines.extend(
+            [
+                "",
+                "| ゲート | 種別 | 参照ID | 対象版との関係 | 同一原因／影響の人間判断 | 判断根拠 | 参照URL |",
+                "|---|---|---|---|---|---|---|",
+                *ref_rows,
+            ]
+        )
+        return lines
+
+    if not ref_rows:
+        ref_rows = ["| - | - | (no hits recorded) | - | - | zero hits do not prove no duplicate | - |"]
+    lines = [
+        "",
+        "## Known-Issue Checkpoints & Preconditions",
+        f"- Candidate ID / Status: `candidate_id={candidate.candidate_id}`, `status={candidate.status}`, `auto_promoted_to_confirmed_vulnerability=False`, `external_search_performed_by_harness=False`",
+        f"- Preconfiguration creator: `preconfig_created_by={pre.preconfig_created_by}`",
+        f"- Attacker-controlled input: {pre.attacker_controls}",
+        f"- Real-world prevalence: `real_world_prevalence={pre.real_world_prevalence}`",
+        f"- Observed impact cap: {pre.observed_impact_cap}",
+        f"- Basis references: {basis_str}",
+        f"- Gate warnings: `{warnings_str}`",
+        *cp_lines,
+    ]
+    if has_zero_hits:
+        lines.append(
+            f"- Zero-hits limitation: `{ZERO_HITS_DISCLAIMER}` (zero search hits never auto-prove no duplicate or unpatched state)."
+        )
+    lines.extend(
+        [
+            "",
+            "| Gate | Kind | Ref ID | Version Relation | Human Root-Cause Judgment | Rationale | URL |",
+            "|---|---|---|---|---|---|---|",
+            *ref_rows,
+        ]
+    )
+    return lines
 
 
 def _summarize_evidence_for_draft(
@@ -551,6 +543,61 @@ def export_vdp_submission_draft(
             evidence_ids=draft.evidence_ids,
         )
 
+    candidate_record: VdpCandidateCheckpointRecord | None = None
+    candidate_gate_eval: CandidateGateEvaluation | None = None
+    candidate_unverified: list[str] = []
+    if draft.candidate_id is not None:
+        candidate_record = get_vdp_candidate_checkpoint(
+            vault_root,
+            run_id=run_id,
+            candidate_id=draft.candidate_id,
+        )
+        if candidate_record is None:
+            raise EvidenceNotFoundError(
+                f"VDP candidate checkpoint {draft.candidate_id!r} for run {run_id!r} was not found."
+            )
+        if candidate_record.target_name != draft.target_name:
+            raise ContractViolationError(
+                f"Candidate {draft.candidate_id!r} target_name {candidate_record.target_name!r} "
+                f"does not match draft target_name {draft.target_name!r}."
+            )
+        if (
+            len(candidate_record.pinned_source_commit) == 40
+            and candidate_record.pinned_source_commit != draft.pinned_source_commit.lower()
+        ):
+            raise ContractViolationError(
+                f"Candidate {draft.candidate_id!r} pinned_source_commit "
+                f"{candidate_record.pinned_source_commit!r} does not match draft commit "
+                f"{draft.pinned_source_commit.lower()!r}."
+            )
+        candidate_gate_eval = evaluate_candidate_gate(
+            candidate_record,
+            gate="pre_submission",
+            now=now,
+        )
+        if not candidate_gate_eval.ready:
+            details_parts = []
+            if candidate_gate_eval.blocked_reason:
+                details_parts.append(f"blocked={candidate_gate_eval.blocked_reason}")
+            if candidate_gate_eval.missing_items:
+                details_parts.append(f"missing={list(candidate_gate_eval.missing_items)}")
+            if candidate_gate_eval.recheck_prompt:
+                details_parts.append(candidate_gate_eval.recheck_prompt)
+            raise ContractViolationError(
+                f"Candidate {draft.candidate_id!r} failed pre_submission known-issue gate: "
+                + "; ".join(details_parts),
+                details=candidate_gate_eval.model_dump(mode="json"),
+            )
+        if (
+            candidate_record.pre_submission_checkpoint is not None
+            and candidate_record.pre_submission_checkpoint.zero_hits_observed
+        ):
+            candidate_unverified.append(ZERO_HITS_DISCLAIMER)
+        if candidate_record.preconditions.real_world_prevalence == "unverified":
+            candidate_unverified.append("real_world_prevalence_unverified")
+        if candidate_record.preconditions.preconfig_created_by == "unknown":
+            candidate_unverified.append("preconfig_creator_unknown")
+
     existing_map = load_vdp_submissions(vault_root)
     prior = existing_map.get(draft.finding_id)
     if prior is not None and prior.state in {FindingState.SUBMITTED, FindingState.ACCEPTED}:
@@ -560,7 +607,11 @@ def export_vdp_submission_draft(
 
     merged_unverified = list(
         dict.fromkeys(
-            [*(str(x).strip() for x in draft.unverified_conditions if str(x).strip()), *ev_unverified]
+            [
+                *(str(x).strip() for x in draft.unverified_conditions if str(x).strip()),
+                *ev_unverified,
+                *candidate_unverified,
+            ]
         )
     )
     steps_md = [f"{idx}. {step}" for idx, step in enumerate(draft.reproduction_steps, start=1)]
@@ -700,6 +751,13 @@ def export_vdp_submission_draft(
             *prov_md,
         ]
 
+    lines.extend(
+        _render_candidate_checkpoint_section(
+            candidate=candidate_record,
+            gate_eval=candidate_gate_eval,
+            language=language,
+        )
+    )
     rendered = "\n".join(lines) + "\n"
     assert_report_clean(rendered, forbidden_literals=forbidden_literals)
     draft_sha = sha256_bytes(rendered.encode("utf-8"))
@@ -729,6 +787,7 @@ def export_vdp_submission_draft(
     record = VdpSubmissionRecord(
         finding_id=draft.finding_id,
         run_id=run_id,
+        candidate_id=draft.candidate_id,
         title=draft.title,
         target_name=draft.target_name,
         affected_version=draft.affected_version,

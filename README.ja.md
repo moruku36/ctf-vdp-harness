@@ -10,7 +10,7 @@
 - **MCP公開済みのVDP手動隔離観測取込（`evidence.import_manual_observation`）**：オープンかつ有効・期限内スコープの `vdp` run でのみ MCP 公開。実行者・実行方法・正常／防御対照・観測前後状態・未確認条件・後片付け確認・不透明な非公開証拠ハッシュ参照を必須検証し、外部URLやローカルファイルは一切取得せず、`vdp.product_test` への昇格も行いません。
 - **CLI専用管理・静的ツール（`ctf-mcp-admin`）**：`vdp-boundary-map`、`vdp-auth-matrix`（人間定義の正常／拒否ペア認可マトリクス検証と `vdp-boundary-map` 候補取込、`vdp.test` オーバーレイ連携）、`register-vdp-overlay`、`register-vdp-profile`、`check-vdp-env`、CLI側手動観測取込 `import-manual-observation`（共通検証・保存ロジック）、`record-vdp-candidate`／`check-vdp-candidate-gate`／`list-vdp-candidates`（`pre_heavy_test`／`pre_submission` 二段階の既知問題・成立条件チェックポイント台帳、`run.describe` の可視化・比較指標、`candidate_id` 紐付け下書き出力での提出直前ゲート強制）、人レビュー前提の `export-vdp-draft`／`record-vdp-submission`／`list-vdp-submissions`（自動提出なし）、`diagnose-mcp`、および Windows 側 `scripts/diagnose-nuc-mcp.ps1`。
 - **テスト設定と通常設定の差の自動記録（`ctf_mcp.vdp_setting_diff`）**：Celery eager・ループバック fixture・テスト CA／プライベート allowlist・認証ショートカット・一時 DB 等の本番との差を伏字付きで `vdp.test` 証跡へ自動記録し、`VdpProductTestVerifier` で `limitations` への転記と `claim="production_parity_confirmed"` のフェイルクローズ検査を実施。
-- **仕様書のみ（未実装）**：[`docs/vdp-next-stage-plan.md`](docs/vdp-next-stage-plan.md) に記載の「限定差分・mutation試験」（`vdp_mutation.py`、今後のPR対象）。
+- **隔離・限定差分・mutation 試験（`ctf_mcp.vdp_mutation`）**：明示選択した 1〜3 フィールドと入口ペア（`ui`/`api`/`webhook`/`async`）に対する決定論的シード再現可能な限定変異試験。反復・時間・縮小・出力上限、正常対照必須、ループバック限定 egress 遮断（`--network=none`）、および `anomaly_observed` と脆弱性確定の厳密分離を実施。
 - **合成課題によるオフラインA/B/C/D評価**：VDP指標はCTFの成績と分けて集計します。
 
 **実装状況：** バージョン`0.1.0`にはランタイムと[日付付きの受入記録](docs/README.ja.md#受入記録)があり、環境限定のWSL2／Codex接続記録も含まれます。実VDPでの安全性、本番運用、全クライアントとの互換性、実課題での正答率向上を保証するものではありません。古い設計文書の配置図は計画であり、構築済みインフラを示しません。

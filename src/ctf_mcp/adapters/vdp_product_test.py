@@ -71,6 +71,7 @@ from ctf_mcp.contracts import (
 )
 from ctf_mcp.fs_guard import _is_reparse_or_symlink, safe_read_bounded, safe_write_atomic
 from ctf_mcp.vdp_fixtures.local_git_http import redact_sensitive_text, redact_structure
+from ctf_mcp.vdp_setting_diff import MAX_SETTING_DIFF_ENTRIES, normalize_setting_diff_entries
 
 VDP_PRODUCT_TEST_CAPABILITY_NAME = "vdp.test"
 VDP_PRODUCT_TEST_ADAPTER_ID = "ctf-vdp-product-test"
@@ -1212,6 +1213,7 @@ def _extract_evidence_markers(text: str) -> dict[str, Any]:
     scenarios: list[Any] = []
     confirmed: list[str] = []
     unverified: list[str] = []
+    raw_setting_diffs: list[Any] = []
     for raw_json in _EVIDENCE_MARKER_RE.findall(text):
         try:
             obj = json.loads(raw_json)
@@ -1225,12 +1227,20 @@ def _extract_evidence_markers(text: str) -> dict[str, Any]:
                 merged[key] = clean_obj[key]
         if isinstance(clean_obj.get("scenario_comparisons"), list):
             scenarios.extend(clean_obj["scenario_comparisons"])
+        if isinstance(clean_obj.get("setting_diffs"), list):
+            raw_setting_diffs.extend(clean_obj["setting_diffs"])
         if isinstance(clean_obj.get("confirmed_conditions"), list):
             confirmed.extend(str(x) for x in clean_obj["confirmed_conditions"] if x)
         if isinstance(clean_obj.get("unverified_conditions"), list):
             unverified.extend(str(x) for x in clean_obj["unverified_conditions"] if x)
     if scenarios:
         merged["scenario_comparisons"] = scenarios
+    norm_diffs = normalize_setting_diff_entries(
+        raw_setting_diffs,
+        max_entries=MAX_SETTING_DIFF_ENTRIES,
+    )
+    if norm_diffs:
+        merged["setting_diffs"] = norm_diffs
     if confirmed:
         merged["confirmed_conditions"] = list(dict.fromkeys(confirmed))
     if unverified:
@@ -1288,6 +1298,15 @@ def _build_execution_context_and_conclusion(
         execution_context["auth_matrix_summary"] = redact_structure(
             dict(marker_data["auth_matrix_summary"])
         )
+    combined_diffs = normalize_setting_diff_entries(
+        [
+            *(marker_data.get("setting_diffs") or ()),
+            *(ctx_arg.get("setting_diffs") or () if isinstance(ctx_arg.get("setting_diffs"), list) else ()),
+        ],
+        max_entries=MAX_SETTING_DIFF_ENTRIES,
+    )
+    if combined_diffs:
+        execution_context["setting_diffs"] = combined_diffs
 
     confirmed: list[str] = []
     unverified: list[str] = []
@@ -1337,6 +1356,14 @@ def _build_execution_context_and_conclusion(
         unverified.append(str(item))
     for item in ctx_arg.get("unverified_conditions") or ():
         unverified.append(str(item))
+    for diff in combined_diffs:
+        tag = str(diff.get("condition_tag") or "").strip()
+        if not tag:
+            continue
+        if diff.get("verification_status") == "confirmed":
+            confirmed.append(tag)
+        else:
+            unverified.append(tag)
 
     confirmed = list(dict.fromkeys(confirmed))
     unverified = list(dict.fromkeys(unverified))
@@ -1748,6 +1775,20 @@ def _encode_bounded_evidence_json(payload: dict[str, Any], max_bytes: int) -> tu
         candidate = json.dumps(bounded, indent=2, ensure_ascii=False).encode("utf-8")
         if len(candidate) <= max_bytes:
             return candidate, True
+        if isinstance(bounded["execution_context"].get("setting_diffs"), list):
+            bounded["execution_context"]["setting_diffs"] = [
+                {
+                    "condition_tag": d.get("condition_tag"),
+                    "verification_status": d.get("verification_status"),
+                    "category": d.get("category"),
+                    "setting_name": d.get("setting_name"),
+                }
+                for d in bounded["execution_context"]["setting_diffs"]
+                if isinstance(d, dict)
+            ]
+            candidate = json.dumps(bounded, indent=2, ensure_ascii=False).encode("utf-8")
+            if len(candidate) <= max_bytes:
+                return candidate, True
     bounded["selector_outcomes"] = {}
     return json.dumps(bounded, ensure_ascii=False).encode("utf-8")[:max_bytes], True
 

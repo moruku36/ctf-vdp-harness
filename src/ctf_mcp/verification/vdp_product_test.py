@@ -422,6 +422,7 @@ class VdpProductTestVerifier:
         pytest_payloads = [p for p in payloads if p.get("operation") == "run_pytest"]
         verdicts = [str(p.get("verdict") or "") for p in payloads]
 
+        all_setting_diffs: list[dict[str, Any]] = []
         for p in payloads:
             conc = p.get("conclusion_status")
             if isinstance(conc, dict):
@@ -429,6 +430,19 @@ class VdpProductTestVerifier:
                     cond_str = str(cond).strip()
                     if cond_str and cond_str not in limitations:
                         limitations.append(cond_str)
+            exec_ctx = p.get("execution_context")
+            if isinstance(exec_ctx, dict) and isinstance(exec_ctx.get("setting_diffs"), list):
+                for diff in exec_ctx["setting_diffs"]:
+                    if isinstance(diff, dict):
+                        all_setting_diffs.append(diff)
+                        if str(diff.get("verification_status") or "").lower() == "unverified":
+                            tag = str(diff.get("condition_tag") or "").strip()
+                            if tag and tag not in limitations:
+                                limitations.append(tag)
+        if all_setting_diffs:
+            checks.append("setting_diff_audit:recorded")
+        else:
+            checks.append("setting_diff_audit:legacy_absent")
 
         if "timeout" in verdicts:
             checks.append("outcome_state:timeout")
@@ -670,7 +684,44 @@ class VdpProductTestVerifier:
             )
 
         anomaly_aliases = {"anomaly_observed", "deviation_reproduced"}
-        if normalized_claim is not None:
+        if normalized_claim == "production_parity_confirmed":
+            if not all_setting_diffs:
+                checks.append("production_parity:setting_diff_audit_missing")
+                _append_limitation(
+                    "Production parity claim failed because no setting-diff parity audit was recorded."
+                )
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
+            if any(
+                str(d.get("verification_status") or "").lower() != "confirmed"
+                for d in all_setting_diffs
+            ):
+                checks.append("production_parity:unverified_setting_diff_present")
+                _append_limitation(
+                    "Production parity claim failed because unverified test-vs-production setting differences exist."
+                )
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
+            checks.append("production_parity:all_audited_diffs_confirmed")
+        elif normalized_claim is not None:
             claim_matches = (
                 normalized_claim == final_verdict
                 or (normalized_claim in anomaly_aliases and final_verdict in anomaly_aliases)

@@ -71,6 +71,7 @@ from ctf_mcp.contracts import (
 )
 from ctf_mcp.fs_guard import _is_reparse_or_symlink, safe_read_bounded, safe_write_atomic
 from ctf_mcp.vdp_fixtures.local_git_http import redact_sensitive_text, redact_structure
+from ctf_mcp.vdp_mutation import MUTATION_OPERATORS, VALID_ENTRYPOINT_KINDS, MutationPolicySpec
 from ctf_mcp.vdp_setting_diff import MAX_SETTING_DIFF_ENTRIES, normalize_setting_diff_entries
 
 VDP_PRODUCT_TEST_CAPABILITY_NAME = "vdp.test"
@@ -247,6 +248,44 @@ VDP_PRODUCT_TEST_ARG_SCHEMA: dict[str, Any] = {
         "network_mode": {
             "type": "string",
             "pattern": "^[a-z0-9_-]{1,32}$",
+        },
+        "mutation_policy": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["seed", "target_fields", "entrypoint_pair"],
+            "properties": {
+                "seed": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+                "max_iterations": {"type": "integer", "minimum": 1, "maximum": 256},
+                "wall_time_cap_seconds": {"type": "integer", "minimum": 5, "maximum": 300},
+                "per_iteration_timeout_ms": {"type": "integer", "minimum": 10, "maximum": 2000},
+                "max_shrink_steps": {"type": "integer", "minimum": 0, "maximum": 64},
+                "max_anomalies": {"type": "integer", "minimum": 1, "maximum": 3},
+                "target_fields": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "items": {"type": "string", "maxLength": 64},
+                },
+                "entrypoint_pair": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["baseline_entrypoint", "candidate_entrypoint"],
+                    "properties": {
+                        "baseline_entrypoint": {"type": "string", "enum": list(VALID_ENTRYPOINT_KINDS)},
+                        "candidate_entrypoint": {"type": "string", "enum": list(VALID_ENTRYPOINT_KINDS)},
+                        "feature_name": {"type": "string", "minLength": 1, "maxLength": 120},
+                    },
+                },
+                "allowed_operators": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": len(MUTATION_OPERATORS),
+                    "items": {"type": "string", "enum": list(MUTATION_OPERATORS)},
+                },
+                "allow_loopback_only": {"type": "boolean", "enum": [True]},
+                "allow_external_egress": {"type": "boolean", "enum": [False]},
+                "max_output_bytes": {"type": "integer", "minimum": 1024, "maximum": 262144},
+            },
         },
     },
 }
@@ -1073,6 +1112,7 @@ class _ValidatedPlan(StrictModel):
     pytest_executable: str | None = None
     smoke_selectors: tuple[str, ...] = ()
     baseline_evidence_ref: str | None = None
+    mutation_policy: dict[str, Any] | None = None
 
 
 def _hash_regular_file(path: Path) -> str:
@@ -1222,7 +1262,7 @@ def _extract_evidence_markers(text: str) -> dict[str, Any]:
         if not isinstance(obj, dict):
             continue
         clean_obj = redact_structure(obj)
-        for key in ("sender_auth_state", "config_creation_path", "target_component", "stage_verification", "state_diff", "auth_matrix_summary"):
+        for key in ("sender_auth_state", "config_creation_path", "target_component", "stage_verification", "state_diff", "auth_matrix_summary", "mutation_summary"):
             if key in clean_obj and clean_obj[key] is not None:
                 merged[key] = clean_obj[key]
         if isinstance(clean_obj.get("scenario_comparisons"), list):
@@ -1297,6 +1337,10 @@ def _build_execution_context_and_conclusion(
     if marker_data.get("auth_matrix_summary") is not None:
         execution_context["auth_matrix_summary"] = redact_structure(
             dict(marker_data["auth_matrix_summary"])
+        )
+    if marker_data.get("mutation_summary") is not None:
+        execution_context["mutation_summary"] = redact_structure(
+            dict(marker_data["mutation_summary"])
         )
     combined_diffs = normalize_setting_diff_entries(
         [
@@ -2536,6 +2580,32 @@ class VdpProductTestAdapter(BaseAdapter):
         )
         baseline_ref = arguments.get("baseline_evidence_ref")
 
+        mutation_policy_dict: dict[str, Any] | None = None
+        raw_mut = arguments.get("mutation_policy")
+        if raw_mut is not None:
+            if operation != "run_pytest":
+                raise ScopeDeniedError(
+                    "mutation_policy is supported only for operation='run_pytest'.",
+                    code="capability_denied",
+                )
+            if network_mode != "none":
+                raise ScopeDeniedError(
+                    "Bounded mutation runs require network_mode='none' strictly.",
+                    code="network_mode_denied",
+                )
+            try:
+                validated_mut = MutationPolicySpec.model_validate(raw_mut)
+            except Exception as exc:
+                raise ScopeDeniedError(
+                    f"Invalid mutation_policy: {exc}",
+                    code="invalid_mutation_policy",
+                ) from exc
+            if validated_mut.wall_time_cap_seconds > timeout_seconds:
+                validated_mut = validated_mut.model_copy(
+                    update={"wall_time_cap_seconds": max(5, timeout_seconds)}
+                )
+            mutation_policy_dict = validated_mut.model_dump(mode="json")
+
         return _ValidatedPlan(
             profile_name=profile.profile_name,
             profile_revision=profile.profile_revision,
@@ -2563,6 +2633,7 @@ class VdpProductTestAdapter(BaseAdapter):
             pytest_executable=profile.pytest_executable,
             smoke_selectors=profile.smoke_selectors,
             baseline_evidence_ref=str(baseline_ref).strip() if baseline_ref else None,
+            mutation_policy=mutation_policy_dict,
         )
 
     def preflight_request(
@@ -3341,6 +3412,14 @@ class VdpProductTestAdapter(BaseAdapter):
                 for svc in plan.services:
                     for ek, ev in sorted(svc.client_env.items()):
                         argv.extend(["-e", f"{ek}={ev}"])
+                if plan.mutation_policy is not None:
+                    argv.extend(
+                        [
+                            "-e",
+                            "CTF_VDP_MUTATION_POLICY_JSON="
+                            + json.dumps(plan.mutation_policy, separators=(",", ":"), sort_keys=True),
+                        ]
+                    )
                 if overlay_mount_dir is not None and plan.overlay_container_target is not None:
                     argv.extend(
                         [
@@ -3428,6 +3507,76 @@ class VdpProductTestAdapter(BaseAdapter):
                 env_check_selectors=plan.env_check_selectors,
                 has_valid_baseline_ref=has_valid_baseline_ref,
             )
+        raw_mut_sum = marker_data.get("mutation_summary")
+        if isinstance(raw_mut_sum, Mapping):
+            mut_verdict = str(raw_mut_sum.get("verdict") or "")
+            mut_stop = str(raw_mut_sum.get("stop_reason") or "")
+            if raw_mut_sum.get("egress_violation_detected") is True or mut_stop == "egress_blocked":
+                verdict_res = _VerdictResult(
+                    verdict="environment_failure",
+                    verdict_reason="Bounded mutation egress guard detected non-loopback or outbound attempt.",
+                    positive_passed=verdict_res.positive_passed,
+                    positive_failed=verdict_res.positive_failed,
+                    negative_passed=verdict_res.negative_passed,
+                    negative_failed=verdict_res.negative_failed,
+                    anomaly_repro_passed=verdict_res.anomaly_repro_passed,
+                    anomaly_repro_failed=verdict_res.anomaly_repro_failed,
+                    env_check_passed=verdict_res.env_check_passed,
+                    env_check_failed=verdict_res.env_check_failed,
+                )
+            elif raw_mut_sum.get("positive_control_passed") is False or mut_stop == "baseline_failed":
+                verdict_res = _VerdictResult(
+                    verdict="baseline_failed",
+                    verdict_reason="Bounded mutation positive baseline failed.",
+                    positive_passed=verdict_res.positive_passed,
+                    positive_failed=verdict_res.positive_failed,
+                    negative_passed=verdict_res.negative_passed,
+                    negative_failed=verdict_res.negative_failed,
+                    anomaly_repro_passed=verdict_res.anomaly_repro_passed,
+                    anomaly_repro_failed=verdict_res.anomaly_repro_failed,
+                    env_check_passed=verdict_res.env_check_passed,
+                    env_check_failed=verdict_res.env_check_failed,
+                )
+            elif (
+                mut_verdict == "hypothesis_falsified"
+                and not raw_mut_sum.get("minimal_repro_cases")
+                and verdict_res.positive_failed == 0
+                and verdict_res.negative_failed == 0
+                and verdict_res.anomaly_repro_failed == 0
+                and verdict_res.positive_passed >= 1
+            ):
+                verdict_res = _VerdictResult(
+                    verdict="hypothesis_falsified",
+                    verdict_reason="Bounded mutation completed with passing baseline and zero reproducing divergences.",
+                    positive_passed=verdict_res.positive_passed,
+                    positive_failed=verdict_res.positive_failed,
+                    negative_passed=max(1, verdict_res.negative_passed, verdict_res.anomaly_repro_passed),
+                    negative_failed=0,
+                    anomaly_repro_passed=verdict_res.anomaly_repro_passed,
+                    anomaly_repro_failed=0,
+                    env_check_passed=verdict_res.env_check_passed,
+                    env_check_failed=verdict_res.env_check_failed,
+                )
+            elif (
+                mut_verdict == "anomaly_observed"
+                and bool(raw_mut_sum.get("minimal_repro_cases"))
+                and verdict_res.positive_failed == 0
+                and verdict_res.negative_failed == 0
+                and verdict_res.anomaly_repro_failed == 0
+                and verdict_res.positive_passed >= 1
+            ):
+                verdict_res = _VerdictResult(
+                    verdict="anomaly_observed",
+                    verdict_reason="Bounded mutation reproduced differential divergence against paired control.",
+                    positive_passed=verdict_res.positive_passed,
+                    positive_failed=verdict_res.positive_failed,
+                    negative_passed=verdict_res.negative_passed,
+                    negative_failed=verdict_res.negative_failed,
+                    anomaly_repro_passed=max(1, verdict_res.anomaly_repro_passed, verdict_res.negative_passed),
+                    anomaly_repro_failed=0,
+                    env_check_passed=verdict_res.env_check_passed,
+                    env_check_failed=verdict_res.env_check_failed,
+                )
         verdict = verdict_res.verdict
         verdict_reason = verdict_res.verdict_reason
         execution_context, conclusion_status = _build_execution_context_and_conclusion(

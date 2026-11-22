@@ -38,6 +38,7 @@ These are historical reports for their recorded commits and environments, not ch
 - [P11 PR-B Authorization matrix and vdp.test overlay integration acceptance (2026-11-22)](../records/p11-pr-b-auth-matrix-acceptance-2026-11-22.md)
 - [P12 PR-C Candidate known-issue & precondition checkpoints acceptance (2026-11-22)](../records/p12-pr-c-candidate-checkpoints-acceptance-2026-11-22.md)
 - [P13 PR-2A Test-vs-production setting diff auto-recorder acceptance (2026-11-22)](../records/p13-pr2a-setting-diff-recorder-acceptance-2026-11-22.md)
+- [P14 PR-2B Bounded differential/mutation testing acceptance (2026-11-22)](../records/p14-pr2b-bounded-mutation-acceptance-2026-11-22.md)
 
 The P5 evaluation compares A (no MCP), B (one stateless inspection), C (stateful harness) and D (C with frozen development guidance), using 10 development and 20 disjoint synthetic holdout tasks. It separates first-attempt `pass@1` from `best_of_k`, keeps VDP vulnerable/fixed pairs outside CTF denominators, and reports regressions and unmeasured API costs. It does not establish real-model or live-target performance gains.
 

@@ -423,6 +423,7 @@ class VdpProductTestVerifier:
         verdicts = [str(p.get("verdict") or "") for p in payloads]
 
         all_setting_diffs: list[dict[str, Any]] = []
+        mutation_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for p in payloads:
             conc = p.get("conclusion_status")
             if isinstance(conc, dict):
@@ -431,6 +432,8 @@ class VdpProductTestVerifier:
                     if cond_str and cond_str not in limitations:
                         limitations.append(cond_str)
             exec_ctx = p.get("execution_context")
+            if isinstance(exec_ctx, dict) and isinstance(exec_ctx.get("mutation_summary"), dict):
+                mutation_entries.append((p, exec_ctx["mutation_summary"]))
             if isinstance(exec_ctx, dict) and isinstance(exec_ctx.get("setting_diffs"), list):
                 for diff in exec_ctx["setting_diffs"]:
                     if isinstance(diff, dict):
@@ -443,6 +446,54 @@ class VdpProductTestVerifier:
             checks.append("setting_diff_audit:recorded")
         else:
             checks.append("setting_diff_audit:legacy_absent")
+
+        for mut_payload, ms in mutation_entries:
+            if mut_payload.get("network_mode") != "none":
+                _append_check("network_isolation:violated")
+                _append_limitation("Bounded mutation verification strictly requires network_mode='none'.")
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
+            if ms.get("egress_violation_detected") is True or ms.get("stop_reason") == "egress_blocked":
+                _append_check("mutation_egress_guard:triggered")
+                _append_check("network_isolation:violated")
+                _append_limitation("Bounded mutation detected forbidden outbound/non-loopback egress attempt.")
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
+            if ms.get("positive_control_passed") is not True:
+                _append_check("outcome_state:baseline_failed")
+                _append_limitation("Bounded mutation positive control did not pass.")
+                return VerificationRecord(
+                    verification_id=f"ver-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    verifier_id=self.verifier_id,
+                    verifier_revision=self.verifier_revision,
+                    status=VerificationStatus.FAILED,
+                    checks_performed=tuple(checks),
+                    limitations=tuple(limitations),
+                    evidence_ids=eid_tuple,
+                    verified_at=self._clock(),
+                )
+        if mutation_entries:
+            _append_check("bounded_mutation:verified")
+            _append_limitation("bounded_mutation_scope_not_exhaustive")
 
         if "timeout" in verdicts:
             checks.append("outcome_state:timeout")
